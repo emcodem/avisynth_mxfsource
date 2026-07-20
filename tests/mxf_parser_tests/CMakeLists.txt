@@ -1,0 +1,27 @@
+add_executable(mxf_parser_tests
+  smoke_test.cpp
+)
+target_link_libraries(mxf_parser_tests PRIVATE mxf_core)
+add_test(NAME mxf_parser_smoke_test COMMAND mxf_parser_tests)
+
+add_executable(mxf_header_parser_tests
+  header_parser_test.cpp
+)
+target_compile_features(mxf_header_parser_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_header_parser_tests PRIVATE mxf_core)
+add_test(NAME mxf_header_parser_tests COMMAND mxf_header_parser_tests)
+
+add_executable(mxf_essence_walker_tests
+  essence_walker_test.cpp
+)
+target_compile_features(mxf_essence_walker_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_essence_walker_tests PRIVATE mxf_core)
+add_test(NAME mxf_essence_walker_tests COMMAND mxf_essence_walker_tests)
+
+add_executable(mxf_decoder_tests
+  decoder_test.cpp
+)
+target_compile_features(mxf_decoder_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_decoder_tests PRIVATE mxf_core)
+mxfsrc_deploy_ffmpeg_runtime(mxf_decoder_tests)
+add_test(NAME mxf_decoder_tests COMMAND mxf_decoder_tests)
