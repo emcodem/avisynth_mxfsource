@@ -25,3 +25,25 @@ target_compile_features(mxf_decoder_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_decoder_tests PRIVATE mxf_core)
 mxfsrc_deploy_ffmpeg_runtime(mxf_decoder_tests)
 add_test(NAME mxf_decoder_tests COMMAND mxf_decoder_tests)
+
+add_executable(mxf_source_engine_tests
+  source_engine_test.cpp
+)
+target_compile_features(mxf_source_engine_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_source_engine_tests PRIVATE mxf_core)
+mxfsrc_deploy_ffmpeg_runtime(mxf_source_engine_tests)
+add_test(NAME mxf_source_engine_tests COMMAND mxf_source_engine_tests)
+
+# Manual verification tools (not part of ctest) -- see gen_test_mxf.cpp / read_test_mxf.cpp.
+add_executable(gen_test_mxf EXCLUDE_FROM_ALL
+  gen_test_mxf.cpp
+)
+target_compile_features(gen_test_mxf PRIVATE cxx_std_17)
+target_link_libraries(gen_test_mxf PRIVATE mxf_core)
+
+add_executable(read_test_mxf EXCLUDE_FROM_ALL
+  read_test_mxf.cpp
+)
+target_compile_features(read_test_mxf PRIVATE cxx_std_17)
+target_link_libraries(read_test_mxf PRIVATE mxf_core)
+mxfsrc_deploy_ffmpeg_runtime(read_test_mxf)

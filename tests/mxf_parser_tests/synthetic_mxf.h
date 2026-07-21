@@ -35,12 +35,28 @@ inline void AppendI64BE(std::vector<uint8_t>& buf, int64_t v) { AppendU64BE(buf,
 
 inline void AppendUl(std::vector<uint8_t>& buf, const Ul& ul) { buf.insert(buf.end(), ul.begin(), ul.end()); }
 
-// Short-form BER length only (every length used by these synthetic files is < 0x80).
-inline void AppendBerLenShort(std::vector<uint8_t>& buf, uint8_t len) { buf.push_back(len); }
+// Full BER length (SMPTE 336 short/long form) -- essence payloads routinely
+// exceed the 0x80 short-form limit (e.g. a single UYVY frame), so this must
+// switch to long form rather than silently truncating a uint8_t length.
+inline void AppendBerLength(std::vector<uint8_t>& buf, uint64_t length) {
+  if (length < 0x80) {
+    buf.push_back(static_cast<uint8_t>(length));
+    return;
+  }
+  uint8_t bytes[8];
+  int n = 0;
+  uint64_t v = length;
+  do {
+    bytes[n++] = static_cast<uint8_t>(v & 0xFF);
+    v >>= 8;
+  } while (v != 0);
+  buf.push_back(static_cast<uint8_t>(0x80 | n));
+  for (int i = n - 1; i >= 0; --i) buf.push_back(bytes[i]);
+}
 
-inline void AppendKlvHeader(std::vector<uint8_t>& buf, const Ul& key, uint8_t shortLen) {
+inline void AppendKlvHeader(std::vector<uint8_t>& buf, const Ul& key, uint64_t length) {
   AppendUl(buf, key);
-  AppendBerLenShort(buf, shortLen);
+  AppendBerLength(buf, length);
 }
 
 inline Ul MakeUid(uint8_t marker) {
@@ -54,7 +70,7 @@ inline void AppendLocalSet(std::vector<uint8_t>& buf, uint8_t typeHighByte, uint
                             const std::vector<uint8_t>& entries) {
   Ul key = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01,
             0x0d, 0x01, 0x01, 0x01, 0x01, 0x01, typeHighByte, typeLowByte};
-  AppendKlvHeader(buf, key, static_cast<uint8_t>(entries.size()));
+  AppendKlvHeader(buf, key, entries.size());
   buf.insert(buf.end(), entries.begin(), entries.end());
 }
 
@@ -102,6 +118,9 @@ struct SyntheticFile {
   int64_t sequenceDuration = 10;
   bool includeFooterPartitionOffset = true;
   uint32_t videoTrackNumber = 0x01010100;  // arbitrary but must be nonzero/distinct for essence key matching
+  uint32_t width = 320;
+  uint32_t height = 240;
+  Ul pictureEssenceCoding = kRawVideoCoding;
 };
 
 // Builds a minimal OP1a-shaped Header Partition + Header Metadata:
@@ -159,9 +178,9 @@ inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
   {
     std::vector<uint8_t> entries;
     AppendTagUl(entries, 0x3C0A, uidDescriptor);
-    AppendTagU32(entries, 0x3203, 320);
-    AppendTagU32(entries, 0x3202, 240);
-    AppendTagUl(entries, 0x3201, kRawVideoCoding);
+    AppendTagU32(entries, 0x3203, cfg.width);
+    AppendTagU32(entries, 0x3202, cfg.height);
+    AppendTagUl(entries, 0x3201, cfg.pictureEssenceCoding);
     AppendLocalSet(metadata, 0x28, 0x00, entries);
   }
 
@@ -233,7 +252,7 @@ inline Ul MakeEssenceElementKey(uint32_t trackNumber) {
 
 inline void AppendEssenceElement(std::vector<uint8_t>& buf, uint32_t trackNumber,
                                   const std::vector<uint8_t>& payload) {
-  AppendKlvHeader(buf, MakeEssenceElementKey(trackNumber), static_cast<uint8_t>(payload.size()));
+  AppendKlvHeader(buf, MakeEssenceElementKey(trackNumber), payload.size());
   buf.insert(buf.end(), payload.begin(), payload.end());
 }
 

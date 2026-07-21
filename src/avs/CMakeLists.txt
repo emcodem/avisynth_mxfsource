@@ -6,6 +6,7 @@ target_link_libraries(mxfsource_avs PRIVATE mxf_core)
 target_include_directories(mxfsource_avs PRIVATE
   ${CMAKE_SOURCE_DIR}/third_party/avisynth
 )
+mxfsrc_deploy_ffmpeg_runtime(mxfsource_avs)
 
 set_target_properties(mxfsource_avs PROPERTIES
   PREFIX ""
