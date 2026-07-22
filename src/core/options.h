@@ -37,6 +37,14 @@ struct OpenOptions {
   // that don't surface a console. Empty (the default) skips file logging
   // entirely.
   std::string logfile;
+
+  // Raw "Name: value\r\nName2: value2" header block sent with every request
+  // when the path given to SourceEngine::Open() is an http:// or https://
+  // URL (ignored for local file paths). S3 presigned URLs need none of this
+  // -- their auth is embedded in the URL's query string -- but a private
+  // HTTP server behind e.g. an Authorization: Bearer token needs it.
+  // Exposed to scripts as MxfSource(..., httpheaders="...").
+  std::string http_headers;
 };
 
 } // namespace mxfsrc

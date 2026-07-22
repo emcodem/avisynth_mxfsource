@@ -34,6 +34,27 @@ target_link_libraries(mxf_source_engine_tests PRIVATE mxf_core)
 mxfsrc_deploy_ffmpeg_runtime(mxf_source_engine_tests)
 add_test(NAME mxf_source_engine_tests COMMAND mxf_source_engine_tests)
 
+add_executable(mxf_http_byte_source_tests
+  http_byte_source_test.cpp
+)
+target_compile_features(mxf_http_byte_source_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_http_byte_source_tests PRIVATE mxf_core)
+if(WIN32)
+  target_link_libraries(mxf_http_byte_source_tests PRIVATE ws2_32)
+endif()
+add_test(NAME mxf_http_byte_source_tests COMMAND mxf_http_byte_source_tests)
+
+add_executable(mxf_http_source_engine_tests
+  http_source_engine_test.cpp
+)
+target_compile_features(mxf_http_source_engine_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_http_source_engine_tests PRIVATE mxf_core)
+if(WIN32)
+  target_link_libraries(mxf_http_source_engine_tests PRIVATE ws2_32)
+endif()
+mxfsrc_deploy_ffmpeg_runtime(mxf_http_source_engine_tests)
+add_test(NAME mxf_http_source_engine_tests COMMAND mxf_http_source_engine_tests)
+
 # Manual verification tools (not part of ctest) -- see gen_test_mxf.cpp / read_test_mxf.cpp.
 add_executable(gen_test_mxf EXCLUDE_FROM_ALL
   gen_test_mxf.cpp

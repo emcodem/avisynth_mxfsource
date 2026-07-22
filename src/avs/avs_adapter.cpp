@@ -166,12 +166,14 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const int eagerdecode = args[2].AsInt(32);
   if (eagerdecode <= 0) env->ThrowError("MxfSource: eagerdecode must be positive");
   const char* logFile = args[3].AsString("");
+  const char* httpHeaders = args[4].AsString("");
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
   options.logfile = logFile;
+  options.http_headers = httpHeaders;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -193,6 +195,7 @@ const AVS_Linkage* AVS_linkage = nullptr;
 extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
     IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
-  env->AddFunction("MxfSource", "[file]s[buffer_frames]i[eagerdecode]i[logfile]s", CreateMxfSource, nullptr);
+  env->AddFunction("MxfSource", "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s", CreateMxfSource,
+                   nullptr);
   return "MXF forward-only source plugin";
 }

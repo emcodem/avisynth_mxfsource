@@ -168,12 +168,15 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   }
   int logFileErr = 0;
   const char* logFile = vsapi->mapGetData(in, "logfile", 0, &logFileErr);
+  int httpHeadersErr = 0;
+  const char* httpHeaders = vsapi->mapGetData(in, "httpheaders", 0, &httpHeadersErr);
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
   options.logfile = logFileErr ? "" : logFile;
+  options.http_headers = httpHeadersErr ? "" : httpHeaders;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -213,7 +216,8 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
   vspapi->configPlugin("com.ffastrans.mxfsource", "mxfsource", "Forward-only MXF source",
                         VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
-  vspapi->registerFunction("MxfSource",
-                            "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;",
-                            "clip:vnode;", CreateMxfSource, nullptr, plugin);
+  vspapi->registerFunction(
+      "MxfSource",
+      "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;",
+      "clip:vnode;", CreateMxfSource, nullptr, plugin);
 }

@@ -101,12 +101,22 @@ SourceEngine::~SourceEngine() {
 OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& options) {
   path_ = path;
   logFile_ = options.logfile;
-  reader_ = std::make_unique<MxfReader>(path);
-  if (!reader_->IsOpen()) return {OpenStatus::kFileError, "failed to open file: " + path};
+  httpHeaders_ = options.http_headers;
+  reader_ = std::make_unique<MxfReader>(path, httpHeaders_);
+  if (!reader_->IsOpen()) {
+    std::string error = "failed to open file: " + path;
+    const std::string detail = reader_->LastError();
+    if (!detail.empty()) error += " (" + detail + ")";
+    return {OpenStatus::kFileError, error};
+  }
 
   std::string parseError;
   auto info = ParseMxfHeader(*reader_, &parseError);
-  if (!info) return {OpenStatus::kParseError, parseError};
+  if (!info) {
+    const std::string detail = reader_->LastError();
+    if (!detail.empty()) parseError += " (" + detail + ")";
+    return {OpenStatus::kParseError, parseError};
+  }
   streamInfo_ = *info;
 
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
@@ -163,7 +173,7 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
 }
 
 std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
-  MxfReader freshReader(path_);
+  MxfReader freshReader(path_, httpHeaders_);
   if (!freshReader.IsOpen()) return nullptr;
 
   auto freshDecoder = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),

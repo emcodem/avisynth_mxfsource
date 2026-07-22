@@ -128,6 +128,7 @@ class SourceEngine {
 
   std::string path_;
   std::string logFile_;
+  std::string httpHeaders_;
   std::unique_ptr<MxfReader> reader_;
   MxfStreamInfo streamInfo_;
   std::unique_ptr<EssenceWalker> walker_;

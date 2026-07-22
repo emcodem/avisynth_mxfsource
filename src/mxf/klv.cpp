@@ -1,18 +1,26 @@
 #include "mxf/klv.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
-#if defined(_WIN32)
-#define MXFSRC_FSEEK _fseeki64
-#define MXFSRC_FTELL _ftelli64
-using mxfsrc_off_t = int64_t;
-#else
-#define MXFSRC_FSEEK fseeko
-#define MXFSRC_FTELL ftello
-using mxfsrc_off_t = off_t;
-#endif
+#include "mxf/file_byte_source.h"
+#include "net/http_byte_source.h"
 
 namespace mxfsrc {
+
+namespace {
+
+bool HasSchemePrefix(const std::string& path, const char* scheme) {
+  const size_t len = std::strlen(scheme);
+  if (path.size() < len) return false;
+  return std::equal(path.begin(), path.begin() + static_cast<std::ptrdiff_t>(len), scheme,
+                     [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; });
+}
+
+bool IsHttpUrl(const std::string& path) { return HasSchemePrefix(path, "http://") || HasSchemePrefix(path, "https://"); }
+
+}  // namespace
 
 bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen) {
   if (prefixLen > key.size()) return false;
@@ -21,39 +29,25 @@ bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen) {
 
 bool UlEquals(const Ul& a, const Ul& b) { return a == b; }
 
-MxfReader::MxfReader(const std::string& path) {
-#if defined(_WIN32)
-  file_ = fopen(path.c_str(), "rb");
-#else
-  file_ = fopen(path.c_str(), "rb");
-#endif
-  if (file_) {
-    MXFSRC_FSEEK(file_, 0, SEEK_END);
-    mxfsrc_off_t end = MXFSRC_FTELL(file_);
-    size_ = end > 0 ? static_cast<uint64_t>(end) : 0;
-    MXFSRC_FSEEK(file_, 0, SEEK_SET);
+MxfReader::MxfReader(const std::string& path, const std::string& httpHeaders) {
+  if (IsHttpUrl(path)) {
+    source_ = std::make_unique<HttpByteSource>(path, httpHeaders);
+  } else {
+    source_ = std::make_unique<FileByteSource>(path);
   }
 }
 
-MxfReader::~MxfReader() {
-  if (file_) fclose(file_);
-}
+MxfReader::~MxfReader() = default;
 
-uint64_t MxfReader::Tell() const {
-  if (!file_) return 0;
-  mxfsrc_off_t pos = MXFSRC_FTELL(file_);
-  return pos > 0 ? static_cast<uint64_t>(pos) : 0;
-}
+uint64_t MxfReader::Tell() const { return source_ ? source_->Tell() : 0; }
 
-bool MxfReader::Seek(uint64_t pos) {
-  if (!file_) return false;
-  return MXFSRC_FSEEK(file_, static_cast<mxfsrc_off_t>(pos), SEEK_SET) == 0;
-}
+bool MxfReader::Seek(uint64_t pos) { return source_ && source_->Seek(pos); }
 
-bool MxfReader::ReadBytes(void* dst, size_t n) {
-  if (!file_ || n == 0) return n == 0;
-  return fread(dst, 1, n, file_) == n;
-}
+uint64_t MxfReader::Size() const { return source_ ? source_->Size() : 0; }
+
+std::string MxfReader::LastError() const { return source_ ? source_->LastError() : std::string(); }
+
+bool MxfReader::ReadBytes(void* dst, size_t n) { return source_ && source_->ReadBytes(dst, n); }
 
 bool MxfReader::ReadU8(uint8_t& v) { return ReadBytes(&v, 1); }
 
@@ -82,10 +76,7 @@ bool MxfReader::ReadU64BE(uint64_t& v) {
 
 bool MxfReader::ReadUl(Ul& v) { return ReadBytes(v.data(), v.size()); }
 
-bool MxfReader::Skip(uint64_t n) {
-  if (!file_) return false;
-  return MXFSRC_FSEEK(file_, static_cast<mxfsrc_off_t>(n), SEEK_CUR) == 0;
-}
+bool MxfReader::Skip(uint64_t n) { return source_ && source_->Skip(n); }
 
 bool MxfReader::ReadBerLength(uint64_t& length) {
   uint8_t first = 0;

@@ -39,12 +39,17 @@ else()
 endif()
 
 include(cmake/FetchFFmpeg.cmake)
+include(cmake/FetchCurl.cmake)
 find_package(Threads REQUIRED)
 
 # --- shared host-agnostic core (mxf parser, codec decode, ring buffer engine) ---
 add_library(mxf_core STATIC
   src/mxf/klv.cpp
   src/mxf/klv.h
+  src/mxf/file_byte_source.cpp
+  src/mxf/file_byte_source.h
+  src/net/http_byte_source.cpp
+  src/net/http_byte_source.h
   src/mxf/partition.cpp
   src/mxf/partition.h
   src/mxf/metadata_sets.cpp
@@ -67,7 +72,7 @@ add_library(mxf_core STATIC
   src/core/source_engine.h
 )
 target_include_directories(mxf_core PUBLIC src)
-target_link_libraries(mxf_core PUBLIC FFmpeg_avcodec Threads::Threads)
+target_link_libraries(mxf_core PUBLIC FFmpeg_avcodec Threads::Threads CURL::libcurl)
 
 if(BUILD_AVS_PLUGIN)
   add_subdirectory(src/avs)
