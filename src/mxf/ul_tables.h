@@ -140,4 +140,36 @@ inline CodecFamily ClassifyCodecUl(const Ul& ul) {
   return CodecFamily::kUnknown;
 }
 
+// True for codecs where every essence element decodes independently (no
+// inter-frame prediction) -- these have no "anchor"/keyframe concept at
+// all, so a forward seek can skip straight to the target frame's essence
+// element without decoding (or needing to decode) anything before it.
+// Used by SourceEngine::SeekAndDecode's fast path.
+//
+// Conservatively false (assume inter-frame dependencies may exist) for
+// anything not verified intra-only: kMpeg2Video covers both intra-only
+// IMX/D-10 *and* long-GOP XDCAM HD under the same UL-classified family
+// (see kCodecUls above -- we don't yet distinguish the profile), and a
+// naive skip-without-decode would produce garbage for the long-GOP case
+// since P/B frames need actual decoded reference pictures the decoder
+// never saw. Likewise kMpeg4/kVc1 are not verified intra-only in the MXF
+// profiles we've seen. kH264 is safe here only because our UL table
+// (kCodecUls) currently maps just the AVC-Intra-specific coding UL to it,
+// never general long-GOP H.264 -- revisit if that ever changes.
+inline bool IsIntraOnlyCodec(CodecFamily family) {
+  switch (family) {
+    case CodecFamily::kRawVideo:
+    case CodecFamily::kV210:
+    case CodecFamily::kDnxhd:
+    case CodecFamily::kProres:
+    case CodecFamily::kJpeg2000:
+    case CodecFamily::kFfv1:
+    case CodecFamily::kDvVideo:
+    case CodecFamily::kH264:
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace mxfsrc

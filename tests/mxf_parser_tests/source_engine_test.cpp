@@ -2,8 +2,11 @@
 // Builds a small synthetic OP1a file with real (uncompressed UYVY) essence
 // so the whole pipeline -- header parse, essence walk, decode, ring buffer,
 // background thread -- runs end to end without needing a real sample file.
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <thread>
 
 #include "core/source_engine.h"
 #include "synthetic_mxf.h"
@@ -60,32 +63,32 @@ void TestSequentialPlayback() {
     CHECK(engine.StreamInfo().numFrames == numFrames);
 
     for (int i = 0; i < numFrames; ++i) {
-      NormalizedFrame frame;
+      std::shared_ptr<NormalizedFrame> frame;
       std::string err;
       FetchStatus st = engine.GetVideoFrame(i, frame, &err);
       CHECK(st == FetchStatus::kOk);
-      CHECK(frame.format == PixelFormat::kUyvy422);
-      CHECK(frame.width == width && frame.height == height);
-      CHECK(!frame.planeData[0].empty());
-      if (!frame.planeData[0].empty()) {
-        CHECK(frame.planeData[0][0] == static_cast<uint8_t>(0x10 + i));  // forward file order preserved
+      CHECK(frame->format == PixelFormat::kUyvy422);
+      CHECK(frame->width == width && frame->height == height);
+      CHECK(!frame->planeData[0].empty());
+      if (!frame->planeData[0].empty()) {
+        CHECK(frame->planeData[0][0] == static_cast<uint8_t>(0x10 + i));  // forward file order preserved
       }
     }
 
     // Re-requesting an already-produced frame should hit the buffer, not re-decode.
-    NormalizedFrame again;
+    std::shared_ptr<NormalizedFrame> again;
     CHECK(engine.GetVideoFrame(2, again, nullptr) == FetchStatus::kOk);
-    CHECK(!again.planeData[0].empty() && again.planeData[0][0] == 0x12);
+    CHECK(!again->planeData[0].empty() && again->planeData[0][0] == 0x12);
 
     // Requesting past the declared frame count reports end-of-stream, not a hang/crash.
-    NormalizedFrame beyond;
+    std::shared_ptr<NormalizedFrame> beyond;
     CHECK(engine.GetVideoFrame(numFrames, beyond, nullptr) == FetchStatus::kEndOfStream);
   }
 
   std::filesystem::remove(path);
 }
 
-void TestEvictionWhenBufferTooSmall() {
+void TestEvictionFallsBackToReDecode() {
   const int width = 4, height = 2, numFrames = 10;
   auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_evict.mxf");
 
@@ -102,15 +105,112 @@ void TestEvictionWhenBufferTooSmall() {
 
     // Jumping straight to the last frame forces the producer to run ahead,
     // evicting frames 0..6 out of the 3-frame window before frame 0 is ever
-    // requested -- exactly the scenario the plan calls out as a hard error
-    // rather than a silent reseek.
-    NormalizedFrame frame;
+    // requested. Rather than failing outright, GetVideoFrame() falls back
+    // to a one-shot re-decode from the start of the file for this genuine
+    // backward-seek case (see plan/options.h notes) -- so this now
+    // succeeds, just via the slow path, rather than returning kEvicted.
+    std::shared_ptr<NormalizedFrame> frame;
     CHECK(engine.GetVideoFrame(numFrames - 1, frame, nullptr) == FetchStatus::kOk);
 
     std::string err;
     FetchStatus st = engine.GetVideoFrame(0, frame, &err);
-    CHECK(st == FetchStatus::kEvicted);
-    CHECK(!err.empty());
+    CHECK(st == FetchStatus::kOk);
+    // Not checking err here: it may still hold the internal ring-buffer's
+    // "evicted" message from the failed first attempt even though the
+    // overall call succeeded via the fallback -- errorOut is only a
+    // meaningful/guaranteed-cleared-on-success contract when status==kOk
+    // is what's checked, which it is above.
+    CHECK(frame && !frame->planeData[0].empty() && frame->planeData[0][0] == 0x10);  // genuinely frame 0's data
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Regression test for the intra-only SeekAndDecode fast path (see
+// IsIntraOnlyCodec / SkipNextVideoElement in source_engine.cpp): requests a
+// genuinely mid-range evicted frame (not just index 0, which the skip loop
+// trivially handles with zero iterations) to make sure the "skip exactly
+// `target` video elements, then decode the next one" counting isn't
+// off-by-one in either direction.
+void TestSeekAndDecodeFastPathLandsOnCorrectMidRangeFrame() {
+  const int width = 4, height = 2, numFrames = 20;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_seek_midrange.mxf");
+
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 3;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    std::shared_ptr<NormalizedFrame> frame;
+    CHECK(engine.GetVideoFrame(numFrames - 1, frame, nullptr) == FetchStatus::kOk);  // evicts everything else
+
+    constexpr int kMidTarget = 12;
+    FetchStatus st = engine.GetVideoFrame(kMidTarget, frame, nullptr);
+    CHECK(st == FetchStatus::kOk);
+    CHECK(frame && !frame->planeData[0].empty() &&
+          frame->planeData[0][0] == static_cast<uint8_t>(0x10 + kMidTarget));
+
+    // And the immediate neighbors, to catch an off-by-one in either
+    // direction rather than just getting lucky on one exact value.
+    CHECK(engine.GetVideoFrame(kMidTarget - 1, frame, nullptr) == FetchStatus::kOk);
+    CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + kMidTarget - 1));
+    CHECK(engine.GetVideoFrame(kMidTarget + 1, frame, nullptr) == FetchStatus::kOk);
+    CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + kMidTarget + 1));
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Regression test for the real bug that motivated eagerdecode (see
+// options.h): a single request for even a nearby frame (e.g. frame 3)
+// used to unlock the decode thread to eagerly race all the way to
+// buffer_frames-deep (default 300) in the background -- fast enough (well
+// under a second at real decode speeds) to evict early frames before a
+// slow-per-frame downstream filter got back around to re-reading one of
+// them, even though it had already been delivered successfully moments
+// earlier. Real-world trigger: QTGMC preset="slower" re-reading frame 0
+// after the engine had already raced to frame 302 of a 300-frame buffer
+// within ~0.5s of wall-clock time. numFrames is large enough that the old
+// (buggy) unconditional buffer_frames-deep eager fill would have had
+// plenty of room to race ahead.
+void TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames() {
+  const int width = 4, height = 2, numFrames = 500;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_margin.mxf");
+
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(path.string());  // default buffer_frames=300, eagerdecode=32
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    std::shared_ptr<NormalizedFrame> frame;
+    std::string err;
+    // Reproduces the exact real-world call sequence observed: 0,0,0,1,2,3.
+    for (int n : {0, 0, 0, 1, 2, 3}) {
+      CHECK(engine.GetVideoFrame(n, frame, &err) == FetchStatus::kOk);
+    }
+
+    // Give the background decode thread real wall-clock time to race ahead
+    // if the bug were still present -- the actual failure happened within
+    // ~0.5s of real time, so this comfortably covers that.
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    FetchStatus st = engine.GetVideoFrame(0, frame, &err);
+    CHECK(st == FetchStatus::kOk);
+    if (st != FetchStatus::kOk) std::cerr << "re-request for frame 0 failed: " << err << std::endl;
+    // Must have been served from the buffer, not via the SeekAndDecode
+    // fallback -- otherwise this test would pass even if the margin fix
+    // regressed, since the fallback alone would silently paper over it.
+    CHECK(engine.NonBufferedServedFrames().empty());
   }
 
   std::filesystem::remove(path);
@@ -142,7 +242,7 @@ void TestOpenPeekDoesNotEvictFrameZero() {
     CHECK(engine.FirstFrame().format == PixelFormat::kUyvy422);
     CHECK(!engine.FirstFrame().planeData[0].empty() && engine.FirstFrame().planeData[0][0] == 0x10);
 
-    NormalizedFrame frame;
+    std::shared_ptr<NormalizedFrame> frame;
     std::string err;
     FetchStatus st = engine.GetVideoFrame(0, frame, &err);
     CHECK(st == FetchStatus::kOk);
@@ -173,7 +273,7 @@ void TestRepeatedRequestForSameFrameSucceeds() {
       return;
     }
 
-    NormalizedFrame frame;
+    std::shared_ptr<NormalizedFrame> frame;
     std::string err;
     CHECK(engine.GetVideoFrame(0, frame, &err) == FetchStatus::kOk);
     FetchStatus second = engine.GetVideoFrame(0, frame, &err);
@@ -206,7 +306,9 @@ void TestUnsupportedCodecFailsOpenCleanly() {
 
 int main() {
   TestSequentialPlayback();
-  TestEvictionWhenBufferTooSmall();
+  TestEvictionFallsBackToReDecode();
+  TestSeekAndDecodeFastPathLandsOnCorrectMidRangeFrame();
+  TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames();
   TestOpenPeekDoesNotEvictFrameZero();
   TestRepeatedRequestForSameFrameSucceeds();
   TestUnsupportedCodecFailsOpenCleanly();

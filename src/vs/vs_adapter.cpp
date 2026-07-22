@@ -126,7 +126,7 @@ const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instan
   auto* d = static_cast<MxfSourceData*>(instanceData);
   if (activationReason != arInitial) return nullptr;
 
-  NormalizedFrame frame;
+  std::shared_ptr<NormalizedFrame> frame;
   std::string err;
   if (d->engine->GetVideoFrame(n, frame, &err) != FetchStatus::kOk) {
     vsapi->setFilterError(err.empty() ? "MxfSource: failed to decode frame" : ("MxfSource: " + err).c_str(),
@@ -136,9 +136,9 @@ const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instan
 
   VSFrame* out = vsapi->newVideoFrame(&d->vi.format, d->vi.width, d->vi.height, nullptr, core);
   if (d->isPackedUyvy) {
-    UnpackUyvyToYuv422Planar(frame, out, vsapi);
+    UnpackUyvyToYuv422Planar(*frame, out, vsapi);
   } else {
-    CopyPlanarFrame(frame, out, vsapi, d->bytesPerSample);
+    CopyPlanarFrame(*frame, out, vsapi, d->bytesPerSample);
   }
   return out;
 }
@@ -160,18 +160,29 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
     vsapi->mapSetError(out, "MxfSource: buffer_frames must be positive");
     return;
   }
+  const int64_t marginArg = vsapi->mapGetInt(in, "eagerdecode", 0, &err);
+  const int eagerdecode = err ? 32 : static_cast<int>(marginArg);
+  if (eagerdecode <= 0) {
+    vsapi->mapSetError(out, "MxfSource: eagerdecode must be positive");
+    return;
+  }
+  int logFileErr = 0;
+  const char* logFile = vsapi->mapGetData(in, "logfile", 0, &logFileErr);
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
+  options.eagerdecode = eagerdecode;
+  options.logfile = logFileErr ? "" : logFile;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
     return;
   }
 
+  const auto& firstFrame = engine->FirstFrame();
   FormatInfo fmtInfo;
-  if (!MapPixelFormat(engine->FirstFrame().format, core, vsapi, fmtInfo)) {
+  if (!MapPixelFormat(firstFrame.format, core, vsapi, fmtInfo)) {
     vsapi->mapSetError(out, "MxfSource: decoded pixel format has no VapourSynth mapping yet");
     return;
   }
@@ -179,8 +190,13 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   auto* d = new MxfSourceData();
   const auto& info = engine->StreamInfo();
   d->vi.format = fmtInfo.format;
-  d->vi.width = static_cast<int>(info.width);
-  d->vi.height = static_cast<int>(info.height);
+  // Width/height come from the actually-decoded frame, not the MXF
+  // descriptor's StoredWidth/StoredHeight -- see the matching comment in
+  // avs_adapter.cpp for why (field-coded/interlaced essence conventionally
+  // stores a single field's height there while the codec hands back a full
+  // decoded frame; sizing from the descriptor silently cropped such frames).
+  d->vi.width = firstFrame.width;
+  d->vi.height = firstFrame.height;
   d->vi.fpsNum = info.editRate.num > 0 ? info.editRate.num : 25;
   d->vi.fpsDen = info.editRate.den > 0 ? info.editRate.den : 1;
   d->vi.numFrames = static_cast<int>(info.numFrames);
@@ -197,6 +213,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
   vspapi->configPlugin("com.ffastrans.mxfsource", "mxfsource", "Forward-only MXF source",
                         VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
-  vspapi->registerFunction("MxfSource", "file:data;buffer_frames:int:opt;", "clip:vnode;", CreateMxfSource, nullptr,
-                            plugin);
+  vspapi->registerFunction("MxfSource",
+                            "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;",
+                            "clip:vnode;", CreateMxfSource, nullptr, plugin);
 }

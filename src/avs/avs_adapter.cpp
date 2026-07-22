@@ -91,15 +91,24 @@ class MxfSource final : public IClip {
  public:
   MxfSource(std::unique_ptr<SourceEngine> engine, IScriptEnvironment* env) : engine_(std::move(engine)) {
     const auto& info = engine_->StreamInfo();
+    const auto& firstFrame = engine_->FirstFrame();
 
     int pixelType = 0;
-    if (!MapPixelFormat(engine_->FirstFrame().format, pixelType, isPackedUyvy_)) {
+    if (!MapPixelFormat(firstFrame.format, pixelType, isPackedUyvy_)) {
       env->ThrowError("MxfSource: decoded pixel format has no AviSynth+ mapping yet");
     }
 
     vi_ = VideoInfo();
-    vi_.width = static_cast<int>(info.width);
-    vi_.height = static_cast<int>(info.height);
+    // Width/height come from the actually-decoded frame, not the MXF
+    // descriptor's StoredWidth/StoredHeight: for field-coded/interlaced
+    // essence, StoredHeight conventionally records a single field's height
+    // (e.g. 544 for a 1080-line frame) while the codec still hands back a
+    // full decoded frame. Sizing the output buffer from the descriptor
+    // instead of the decoder's real output silently cropped such frames to
+    // roughly their top half -- caught via real-file benchmarking, not the
+    // synthetic-file unit tests (see plan Phase 7 notes).
+    vi_.width = firstFrame.width;
+    vi_.height = firstFrame.height;
     vi_.fps_numerator = info.editRate.num > 0 ? static_cast<unsigned>(info.editRate.num) : 25;
     vi_.fps_denominator = info.editRate.den > 0 ? static_cast<unsigned>(info.editRate.den) : 1;
     vi_.num_frames = static_cast<int>(info.numFrames);
@@ -108,7 +117,7 @@ class MxfSource final : public IClip {
   }
 
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override {
-    NormalizedFrame frame;
+    std::shared_ptr<NormalizedFrame> frame;
     std::string err;
     if (engine_->GetVideoFrame(n, frame, &err) != FetchStatus::kOk) {
       env->ThrowError("MxfSource: %s", err.empty() ? "failed to decode frame" : err.c_str());
@@ -116,11 +125,11 @@ class MxfSource final : public IClip {
 
     PVideoFrame out = env->NewVideoFrame(vi_);
     if (isPackedUyvy_) {
-      CopyUyvyAsYuy2(frame, out);
+      CopyUyvyAsYuy2(*frame, out);
     } else {
-      CopyPlane(frame, 0, out, PLANAR_Y);
-      CopyPlane(frame, 1, out, PLANAR_U);
-      CopyPlane(frame, 2, out, PLANAR_V);
+      CopyPlane(*frame, 0, out, PLANAR_Y);
+      CopyPlane(*frame, 1, out, PLANAR_U);
+      CopyPlane(*frame, 2, out, PLANAR_V);
     }
     return out;
   }
@@ -154,10 +163,15 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   if (!path || !*path) env->ThrowError("MxfSource: a file path is required");
   const int bufferFrames = args[1].AsInt(300);
   if (bufferFrames <= 0) env->ThrowError("MxfSource: buffer_frames must be positive");
+  const int eagerdecode = args[2].AsInt(32);
+  if (eagerdecode <= 0) env->ThrowError("MxfSource: eagerdecode must be positive");
+  const char* logFile = args[3].AsString("");
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
+  options.eagerdecode = eagerdecode;
+  options.logfile = logFile;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -179,6 +193,6 @@ const AVS_Linkage* AVS_linkage = nullptr;
 extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
     IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
-  env->AddFunction("MxfSource", "[file]s[buffer_frames]i", CreateMxfSource, nullptr);
+  env->AddFunction("MxfSource", "[file]s[buffer_frames]i[eagerdecode]i[logfile]s", CreateMxfSource, nullptr);
   return "MXF forward-only source plugin";
 }

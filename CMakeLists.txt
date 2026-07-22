@@ -1,4 +1,23 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Must be set before project() so it governs the default /MD-vs-/MT flags
+# CMake initializes at that point. Statically linking the MSVC C++ runtime
+# means mxfsource.dll/mxfsource_vs.dll carry their own copy of the CRT
+# instead of dynamically depending on MSVCP140.dll/VCRUNTIME140*.dll --
+# this plugin gets loaded into arbitrary, unpredictable host processes
+# (AviSynth+/VapourSynth hosts embedded in third-party applications), and a
+# host whose own executable directory happens to bundle an older/ABI-
+# incompatible MSVCP140.dll will shadow ours in the DLL search order
+# (main-executable directory is searched before System32), corrupting
+# memory the moment our code touches std::string/shared_ptr/mutex/thread.
+# Confirmed as the exact root cause of a real crash report: the host's
+# bundled MSVCP140.dll (14.24, ~2019) predated the ABI our code was built
+# against (MSVC 14.42/VS2022), while System32's newer copy (14.51) worked
+# fine. No FFmpeg DLL is affected -- those are MinGW-built and never
+# touch MSVCP140.dll at all.
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(avs_mxf_plugin CXX)
 
 set(CMAKE_CXX_STANDARD 17)

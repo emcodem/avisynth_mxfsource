@@ -7,6 +7,7 @@
 // that crashed the real AviSynth+ host without issue here. Build with
 // `cmake --build build --target read_test_mxf`.
 #include <iostream>
+#include <memory>
 
 #include "core/source_engine.h"
 
@@ -27,16 +28,16 @@ int main(int argc, char** argv) {
   std::cout << "opened: " << info.width << "x" << info.height << " numFrames=" << info.numFrames << std::endl;
 
   for (int64_t i = 0; i < info.numFrames; ++i) {
-    NormalizedFrame frame;
+    std::shared_ptr<NormalizedFrame> frame;
     std::string err;
     FetchStatus st = engine.GetVideoFrame(i, frame, &err);
     if (st != FetchStatus::kOk) {
       std::cerr << "frame " << i << " failed: " << static_cast<int>(st) << " " << err << std::endl;
       return 1;
     }
-    std::cout << "frame " << i << " ok, format=" << static_cast<int>(frame.format) << " w=" << frame.width
-              << " h=" << frame.height << " plane0size=" << frame.planeData[0].size()
-              << " firstByte=" << static_cast<int>(frame.planeData[0].empty() ? 0 : frame.planeData[0][0])
+    std::cout << "frame " << i << " ok, format=" << static_cast<int>(frame->format) << " w=" << frame->width
+              << " h=" << frame->height << " plane0size=" << frame->planeData[0].size()
+              << " firstByte=" << static_cast<int>(frame->planeData[0].empty() ? 0 : frame->planeData[0][0])
               << std::endl;
   }
   std::cout << "all frames read ok" << std::endl;

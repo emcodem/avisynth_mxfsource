@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -17,18 +18,33 @@ enum class FetchStatus { kOk, kEvicted, kEndOfStream, kError };
 // threads call Get().
 //
 // The producer self-paces via WaitForCapacity(): it may only produce index
-// `i` once `i <= watermark + capacity`, where `watermark` is the highest
-// index any consumer has ever asked for. Get() bumps the watermark as soon
-// as it's called, so the producer keeps at most `capacity` frames buffered
-// ahead of whatever the host has actually asked for (or, before anything's
-// been asked for, eagerly fills the first `capacity` slots) -- see plan's
-// "core/ ring buffer" section. Capacity should comfortably exceed the
-// host's own prefetch depth (AviSynth+ Prefetch() lookahead, VapourSynth's
-// core scheduler) so GetFrame() is almost always a cache hit.
+// `i` once `i <= watermark + min(capacity, margin)`, where `watermark` is
+// the highest index any consumer has ever asked for and `margin` (usually
+// much smaller than `capacity`) bounds how far the producer is allowed to
+// eagerly race UNSOLICITED. `capacity` alone would let a single request for
+// even a nearby index (e.g. frame 3) unlock a race all the way to
+// `capacity` frames deep in the background -- fast enough at real decode
+// speeds to evict early frames before a slow-per-frame downstream filter
+// got back around to re-reading one of them, well before `capacity` frames
+// of genuine buffering were ever needed (caught via real-host testing: a
+// QTGMC preset="slower" chain re-reading frame 0 after the engine had
+// already eagerly raced to frame 302 of a 300-frame buffer in under a
+// second). `min(capacity, margin)` naturally reduces to today's original
+// `watermark + capacity` formula whenever `capacity <= margin` (e.g. a
+// deliberately small buffer_frames), preserving the "jump straight to a
+// distant frame evicts everything below it" behavior for that case, while
+// throttling the common case (large capacity, nearby requests) to a much
+// smaller automatic eager-ahead window. `capacity` still governs the *true*
+// maximum window (eviction itself, in Put(), is unchanged) -- an explicit
+// request that itself exceeds the margin still legitimately extends the
+// watermark and thus the ceiling, same as before.
 template <typename T>
 class FrameBuffer {
  public:
-  explicit FrameBuffer(int capacity) : capacity_(capacity), slots_(static_cast<size_t>(capacity)) {}
+  FrameBuffer(int capacity, int eagerReadaheadMargin)
+      : capacity_(capacity),
+        margin_(std::min(capacity, eagerReadaheadMargin)),
+        slots_(static_cast<size_t>(capacity)) {}
 
   // --- producer side (single decode thread only) ---
 
@@ -45,7 +61,7 @@ class FrameBuffer {
   // via real end-to-end testing, not the unit tests (see plan Phase 5 notes).
   bool WaitForCapacity(int64_t index) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&] { return shutdown_ || index < watermark_ + capacity_; });
+    cv_.wait(lock, [&] { return shutdown_ || index < watermark_ + margin_; });
     return !shutdown_;
   }
 
@@ -145,6 +161,7 @@ class FrameBuffer {
   size_t SlotOf(int64_t index) const { return static_cast<size_t>(index % capacity_); }
 
   const int capacity_;
+  const int64_t margin_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::vector<std::optional<T>> slots_;

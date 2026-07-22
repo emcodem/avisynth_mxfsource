@@ -1,8 +1,10 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "codec/decoder.h"
 #include "core/frame_buffer.h"
@@ -12,6 +14,29 @@
 #include "mxf/klv.h"
 
 namespace mxfsrc {
+
+// Tracks how many GetVideoFrame() calls were satisfied from the ring buffer
+// (the expected/fast path) versus how many fell outside its window and had
+// to be served by SeekAndDecode()'s fallback full re-decode-from-start
+// (rare/slow; only happens for genuine out-of-order/backward access, e.g. a
+// real random seek). Logged as a summary when the engine is destroyed --
+// see plan notes: the user wants visibility into how often the fallback
+// path is hit and exactly which frames needed it, to gauge whether
+// buffer_frames or eagerdecode need tuning for a given filter graph.
+struct ServeStats {
+  mutable std::mutex mutex;
+  int64_t bufferedCount = 0;
+  std::vector<int64_t> nonBufferedFrames;
+
+  void RecordBufferedServe() {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++bufferedCount;
+  }
+  void RecordNonBufferedServe(int64_t n) {
+    std::lock_guard<std::mutex> lock(mutex);
+    nonBufferedFrames.push_back(n);
+  }
+};
 
 enum class OpenStatus { kOk, kFileError, kParseError, kUnsupportedCodec, kDecodeError };
 
@@ -50,23 +75,67 @@ class SourceEngine {
   // buffer's consumer watermark -- see plan Phase 5 notes: doing so via the
   // normal Get() path let the producer race ahead and evict this very frame
   // before any real GetVideoFrame(0) call arrived.
-  const NormalizedFrame& FirstFrame() const { return firstFrame_; }
+  const NormalizedFrame& FirstFrame() const { return *firstFrame_; }
 
-  // Blocks until frame `n` is decoded, evicted (n fell behind the
-  // configured buffer_frames window), or the stream ends/errors -- see
-  // FrameBuffer::Get for exact status semantics.
-  FetchStatus GetVideoFrame(int64_t n, NormalizedFrame& out, std::string* errorOut = nullptr);
+  // Blocks until frame `n` is decoded or the stream ends/errors. If `n` has
+  // fallen behind the ring buffer's window (evicted, e.g. a genuine
+  // backward seek -- forward waits are always satisfied normally and never
+  // hit this), falls back to SeekAndDecode() rather than failing: this
+  // plugin is designed for forward-only playback, but the user asked for
+  // random-seek support wherever reasonably easy to add. See
+  // FrameBuffer::Get for the ring-buffer status semantics this wraps.
+  // `out` receives a shared_ptr rather than a copied NormalizedFrame: the
+  // ring buffer keeps its own shared_ptr to the same frame (a repeat
+  // request for an already-produced index -- which real hosts legitimately
+  // make, see plan Phase 5 notes -- must keep working), so FrameBuffer::Get()
+  // can only ever copy the *pointer*, not move the data out. Storing
+  // NormalizedFrame by value in the ring buffer made that copy a full deep
+  // copy of every decoded frame (multi-MB for HD video) on every single
+  // Get() call -- caught via real-file performance benchmarking (measured
+  // ~4x slower than ffmpeg's own native decode of the same file) rather
+  // than the synthetic-file unit tests, which are too small for the cost
+  // to show up.
+  FetchStatus GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFrame>& out, std::string* errorOut = nullptr);
+
+  // Diagnostics: how many GetVideoFrame() calls were served from the ring
+  // buffer (expected fast path) vs required the SeekAndDecode() fallback
+  // (rare/slow path -- a genuine backward seek or an eagerdecode margin
+  // shortfall). Also logged as a one-line summary (with the exact
+  // non-buffered frame numbers) when the engine is destroyed.
+  int64_t BufferedServeCount() const {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    return stats_.bufferedCount;
+  }
+  std::vector<int64_t> NonBufferedServedFrames() const {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    return stats_.nonBufferedFrames;
+  }
 
  private:
   void DecodeThreadMain();
 
+  // Opens a *fresh*, independent MxfReader/EssenceWalker/Decoder on the
+  // same file (separate file handle -- doesn't disturb the primary
+  // background decode thread's own reader/walker/decoder or the ring
+  // buffer's state at all, per the user's own call: "leave the buffer
+  // as-is" for this case) and decodes forward from the very start of
+  // essence up through `target`, discarding every frame before it. Works
+  // for any codec (even long-GOP/inter-frame ones) since decode always
+  // starts from a valid entry point with no index to jump via -- correct
+  // but O(target) slow, since there is no keyframe index to seek to
+  // directly. Returns nullptr if essence runs out before reaching `target`.
+  std::shared_ptr<NormalizedFrame> SeekAndDecode(int64_t target);
+
+  std::string path_;
+  std::string logFile_;
   std::unique_ptr<MxfReader> reader_;
   MxfStreamInfo streamInfo_;
   std::unique_ptr<EssenceWalker> walker_;
   std::unique_ptr<Decoder> videoDecoder_;
-  std::unique_ptr<FrameBuffer<NormalizedFrame>> videoBuffer_;
-  NormalizedFrame firstFrame_;
+  std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;
+  std::shared_ptr<NormalizedFrame> firstFrame_;
   std::thread decodeThread_;
+  ServeStats stats_;
 };
 
 }  // namespace mxfsrc
