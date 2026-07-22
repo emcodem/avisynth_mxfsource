@@ -170,6 +170,9 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   const char* logFile = vsapi->mapGetData(in, "logfile", 0, &logFileErr);
   int httpHeadersErr = 0;
   const char* httpHeaders = vsapi->mapGetData(in, "httpheaders", 0, &httpHeadersErr);
+  int handleOriginErr = 0;
+  const int64_t handleOriginArg = vsapi->mapGetInt(in, "handle_origin", 0, &handleOriginErr);
+  const bool handleOrigin = handleOriginErr ? true : (handleOriginArg != 0);
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
@@ -177,6 +180,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   options.eagerdecode = eagerdecode;
   options.logfile = logFileErr ? "" : logFile;
   options.http_headers = httpHeadersErr ? "" : httpHeaders;
+  options.handle_origin = handleOrigin;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -218,6 +222,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
                         VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
   vspapi->registerFunction(
       "MxfSource",
-      "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;",
+      "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
+      "handle_origin:int:opt;",
       "clip:vnode;", CreateMxfSource, nullptr, plugin);
 }

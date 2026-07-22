@@ -119,6 +119,19 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   }
   streamInfo_ = *info;
 
+  // Override whatever ResolvePackage's generic first-package-wins loop
+  // produced for numFrames with the SourcePackage-authoritative formula
+  // (MP Duration = SP Duration - SP Origin) whenever a SourcePackage video
+  // track was actually found -- see MxfStreamInfo::sourcePackageDuration.
+  // Falls back to the generic value (unchanged) for files with no
+  // resolvable SourcePackage.
+  if (streamInfo_.sourcePackageDuration >= 0) {
+    const int64_t origin = options.handle_origin ? streamInfo_.origin : 0;
+    streamInfo_.numFrames = streamInfo_.sourcePackageDuration - origin;
+  }
+  originSkip_ = options.handle_origin ? streamInfo_.origin : 0;
+  if (originSkip_ < 0) originSkip_ = 0;
+
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
   if (streamInfo_.numFrames < 0) {
     return {OpenStatus::kParseError,
@@ -185,17 +198,21 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
 
   auto frame = std::make_shared<NormalizedFrame>();
 
+  // Host frame index `target` maps to essence video element index
+  // `originSkip_ + target` -- see MxfStreamInfo::origin / originSkip_.
+  const int64_t essenceTarget = originSkip_ + target;
+
   if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
     // No frame depends on any other for these codecs -- every essence
     // element already *is* its own anchor, so skip every video frame
     // before the target without decoding any of them (much cheaper than a
     // full decode), then decode only the target frame itself.
-    for (int64_t i = 0; i < target; ++i) {
+    for (int64_t i = 0; i < essenceTarget; ++i) {
       if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
     }
-    // The loop above discarded exactly `target` video elements (indices
-    // [0, target)); the next one the walker yields is the target itself,
-    // and this time we keep its bytes to actually decode.
+    // The loop above discarded exactly `essenceTarget` video elements
+    // (indices [0, essenceTarget)); the next one the walker yields is the
+    // target itself, and this time we keep its bytes to actually decode.
     EssenceElement targetElement;
     for (;;) {
       if (!freshWalker.Next(targetElement)) return nullptr;
@@ -214,7 +231,7 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // Phase 7 notes) -- decode forward from the very start of essence, which
   // is always correct, just not optimally fast.
   bool essenceExhausted = false;
-  for (int64_t i = 0; i <= target; ++i) {
+  for (int64_t i = 0; i <= essenceTarget; ++i) {
     if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, *frame)) return nullptr;
   }
   return frame;
@@ -222,6 +239,34 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
 
 void SourceEngine::DecodeThreadMain() {
   bool essenceExhausted = false;
+
+  // Discard the leading `originSkip_` video essence elements (Origin
+  // pre-roll/trim, see MxfStreamInfo::origin) before host frame 0 is ever
+  // produced, so ring-buffer index 0 lines up with essence element
+  // `originSkip_`. Mirrors SeekAndDecode's intra-only-vs-GOP branching:
+  // intra-only codecs can skip the raw bytes without decoding them at all;
+  // GOP-based codecs must actually decode (and discard) each one, since a
+  // later frame may depend on it as a reference.
+  if (originSkip_ > 0) {
+    const std::string originError = "MXF essence ended before reaching the Origin offset (" +
+                                     std::to_string(originSkip_) + ")";
+    if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
+      for (int64_t i = 0; i < originSkip_; ++i) {
+        if (!SkipNextVideoElement(*walker_)) {
+          videoBuffer_->SignalError(originError);
+          return;
+        }
+      }
+    } else {
+      NormalizedFrame discard;
+      for (int64_t i = 0; i < originSkip_; ++i) {
+        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, discard)) {
+          videoBuffer_->SignalError(originError);
+          return;
+        }
+      }
+    }
+  }
 
   for (;;) {
     const int64_t next = videoBuffer_->NextIndex();

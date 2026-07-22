@@ -63,6 +63,7 @@ constexpr uint16_t kPackageTracks = 0x4403;
 constexpr uint16_t kPackageDescriptor = 0x4701;
 constexpr uint16_t kContentStoragePackages = 0x1901;
 constexpr uint16_t kTrackEditRate = 0x4B01;
+constexpr uint16_t kTrackOrigin = 0x4B02;
 constexpr uint16_t kTrackSequenceRef = 0x4803;
 constexpr uint16_t kTrackNumber = 0x4804;
 constexpr uint16_t kSequenceDuration = 0x0202;
@@ -82,6 +83,12 @@ struct RawSets {
   std::map<Ul, LocalTagMap> byInstanceUid;
   std::vector<Ul> contentStorages;
   std::vector<Ul> packages;  // Material and Source, in file order
+  // Whether each entry in `packages` is a SourcePackage (true) or a
+  // MaterialPackage (false) -- needed to know which package's Track.Origin
+  // is authoritative (only a SourcePackage's Origin is meaningful; a
+  // MaterialPackage's must always be 0 per SMPTE 377M), independent of
+  // whichever package ResolvePackage happens to resolve fields from first.
+  std::map<Ul, bool> packageIsSource;
 };
 
 bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
@@ -144,7 +151,7 @@ void ResolveDescriptor(const Ul& descriptorRef, const RawSets& sets, MxfStreamIn
   }
 }
 
-void ResolvePackage(const Ul& packageUid, const RawSets& sets, MxfStreamInfo& info) {
+void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePackage, MxfStreamInfo& info) {
   auto pit = sets.byInstanceUid.find(packageUid);
   if (pit == sets.byInstanceUid.end()) return;
   const LocalTagMap& pkg = pit->second;
@@ -167,6 +174,22 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, MxfStreamInfo& in
     if (!GetUl(sequence, tag::kSequenceDataDefinition, dataDefinition)) continue;
     const EssenceKind kind = ClassifyDataDefinition(dataDefinition);
     if (kind != EssenceKind::kVideo && kind != EssenceKind::kAudio) continue;
+
+    // Origin/raw-duration are captured here (ahead of the "already
+    // resolved" skip below) specifically because they must come from the
+    // SourcePackage's video track regardless of whether some other
+    // package's video track was resolved for editRate/trackNumber first --
+    // see MxfStreamInfo::origin's comment.
+    if (kind == EssenceKind::kVideo && isSourcePackage) {
+      int64_t origin = 0;
+      GetI64(track, tag::kTrackOrigin, origin);  // absent => 0, i.e. no trim
+      info.origin = origin;
+      int64_t sourceDuration = -1;
+      if (GetI64(sequence, tag::kSequenceDuration, sourceDuration) && sourceDuration >= 0) {
+        info.sourcePackageDuration = sourceDuration;
+      }
+    }
+
     if ((kind == EssenceKind::kVideo && info.hasVideo) || (kind == EssenceKind::kAudio && info.hasAudio)) {
       continue;  // already resolved this kind from an earlier package/track
     }
@@ -197,6 +220,106 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, MxfStreamInfo& in
   }
 }
 
+// Walks every local-set-coded metadata KLV in [partitionEnd, partitionEnd +
+// byteCount) into `sets`. Shared between the Header Partition's Header
+// Metadata and a Footer Partition's redundant copy of the same (see
+// ParseMxfHeader's footer-precedence handling below) -- identical format,
+// just a different partition's byte range.
+bool ReadMetadataSets(MxfReader& reader, uint64_t partitionEnd, uint64_t byteCount, RawSets& sets) {
+  const uint64_t metadataEnd = partitionEnd + byteCount;
+  if (!reader.Seek(partitionEnd)) return false;
+
+  while (reader.Tell() + 16 + 1 <= metadataEnd && reader.Tell() < reader.Size()) {
+    KlvHeader klv{};
+    if (!ReadKlvHeader(reader, klv)) break;
+    const uint64_t valueEnd = klv.valueOffset + klv.length;
+    if (valueEnd > metadataEnd) break;
+
+    if (UlEquals(klv.key, kKlvFillKey) || UlEquals(klv.key, kPrimerPackKey)) {
+      reader.Seek(valueEnd);
+      continue;
+    }
+    if (!IsLocalSetKey(klv.key)) {
+      reader.Seek(valueEnd);
+      continue;
+    }
+
+    LocalTagMap parsed;
+    if (!ReadLocalSet(reader, klv.length, parsed)) return false;
+
+    const SetType type = ClassifySetType(klv.key);
+    Ul instanceUid{};
+    if (GetInstanceUid(parsed, instanceUid)) {
+      if (type == SetType::kContentStorage) sets.contentStorages.push_back(instanceUid);
+      if (type == SetType::kMaterialPackage || type == SetType::kSourcePackage) {
+        sets.packages.push_back(instanceUid);
+        sets.packageIsSource[instanceUid] = (type == SetType::kSourcePackage);
+      }
+      sets.byInstanceUid[instanceUid] = std::move(parsed);
+    }
+    reader.Seek(valueEnd);
+  }
+  return true;
+}
+
+// Resolves a full RawSets (as produced by ReadMetadataSets) into a fresh
+// MxfStreamInfo -- shared between the Header Partition's pass and a Closed
+// Footer Partition's override pass.
+MxfStreamInfo ResolveStreamInfo(const RawSets& sets) {
+  MxfStreamInfo info;
+
+  std::vector<Ul> packageUids;
+  if (!sets.contentStorages.empty()) {
+    packageUids = GetUlArray(sets.byInstanceUid.at(sets.contentStorages.front()), tag::kContentStoragePackages);
+  }
+  if (packageUids.empty()) packageUids = sets.packages;  // fallback for malformed/unusual files
+
+  for (const Ul& packageUid : packageUids) {
+    auto isSourceIt = sets.packageIsSource.find(packageUid);
+    const bool isSourcePackage = isSourceIt != sets.packageIsSource.end() && isSourceIt->second;
+    ResolvePackage(packageUid, sets, isSourcePackage, info);
+    if (info.hasVideo && info.hasAudio) break;
+  }
+  return info;
+}
+
+// Attempts to override `info` from the Footer Partition's own redundant
+// Header Metadata copy, given a candidate byte offset for it (either the
+// Header Partition Pack's own FooterPartition field, or -- when that's
+// left 0/unknown, as observed on a real Omneon recording -- the last entry
+// of the Random Index Pack; see ParseMxfHeader). No-ops (returns false)
+// unless `candidateOffset` genuinely points at a Closed Footer Partition
+// whose Header Metadata copy resolves a video track, so trying a
+// less-certain second candidate can never regress an already-successful
+// override, nor corrupt `info` with a partial/malformed read.
+bool TryOverrideFromFooterPartition(MxfReader& reader, uint64_t candidateOffset, MxfStreamInfo& info) {
+  if (candidateOffset >= reader.Size()) return false;
+  if (!reader.Seek(candidateOffset)) return false;
+
+  KlvHeader footerKlv{};
+  PartitionKind footerKind{};
+  if (!ReadKlvHeader(reader, footerKlv)) return false;
+  if (!IsPartitionPackKey(footerKlv.key, &footerKind) || footerKind != PartitionKind::kFooter) return false;
+  if (!IsPartitionClosed(ClassifyPartitionStatus(footerKlv.key))) return false;
+
+  std::optional<PartitionPack> footerPartition = ReadPartitionPackValue(reader, footerKlv);
+  if (!footerPartition) return false;
+
+  const uint64_t footerPartitionEnd = footerKlv.valueOffset + footerKlv.length;
+  RawSets footerSets;
+  if (!ReadMetadataSets(reader, footerPartitionEnd, footerPartition->headerByteCount, footerSets)) return false;
+
+  MxfStreamInfo footerInfo = ResolveStreamInfo(footerSets);
+  if (!footerInfo.hasVideo) return false;
+
+  const uint64_t savedHeaderMetadataEnd = info.headerMetadataEnd;
+  const bool savedFooterPartitionPresent = info.footerPartitionPresent;
+  info = footerInfo;
+  info.headerMetadataEnd = savedHeaderMetadataEnd;
+  info.footerPartitionPresent = savedFooterPartitionPresent;
+  return true;
+}
+
 }  // namespace
 
 std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* errorOut) {
@@ -219,50 +342,57 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
 
   const uint64_t partitionEnd = partitionKlv.valueOffset + partitionKlv.length;
   const uint64_t headerMetadataEnd = partitionEnd + partition->headerByteCount;
-  if (!reader.Seek(partitionEnd)) return fail("seek past Header Partition Pack failed");
 
-  RawSets sets;
-  while (reader.Tell() + 16 + 1 <= headerMetadataEnd && reader.Tell() < reader.Size()) {
-    KlvHeader klv{};
-    if (!ReadKlvHeader(reader, klv)) break;
-    const uint64_t valueEnd = klv.valueOffset + klv.length;
-    if (valueEnd > headerMetadataEnd) break;
-
-    if (UlEquals(klv.key, kKlvFillKey) || UlEquals(klv.key, kPrimerPackKey)) {
-      reader.Seek(valueEnd);
-      continue;
-    }
-    if (!IsLocalSetKey(klv.key)) {
-      reader.Seek(valueEnd);
-      continue;
-    }
-
-    LocalTagMap parsed;
-    if (!ReadLocalSet(reader, klv.length, parsed)) return fail("malformed local-set metadata KLV");
-
-    const SetType type = ClassifySetType(klv.key);
-    Ul instanceUid{};
-    if (GetInstanceUid(parsed, instanceUid)) {
-      if (type == SetType::kContentStorage) sets.contentStorages.push_back(instanceUid);
-      if (type == SetType::kMaterialPackage || type == SetType::kSourcePackage) sets.packages.push_back(instanceUid);
-      sets.byInstanceUid[instanceUid] = std::move(parsed);
-    }
-    reader.Seek(valueEnd);
+  RawSets headerSets;
+  if (!ReadMetadataSets(reader, partitionEnd, partition->headerByteCount, headerSets)) {
+    return fail("malformed local-set metadata KLV");
   }
 
-  MxfStreamInfo info;
+  MxfStreamInfo info = ResolveStreamInfo(headerSets);
   info.headerMetadataEnd = headerMetadataEnd;
   info.footerPartitionPresent = partition->footerPartition != 0;
 
-  std::vector<Ul> packageUids;
-  if (!sets.contentStorages.empty()) {
-    packageUids = GetUlArray(sets.byInstanceUid.at(sets.contentStorages.front()), tag::kContentStoragePackages);
-  }
-  if (packageUids.empty()) packageUids = sets.packages;  // fallback for malformed/unusual files
+  // The Random Index Pack (see mxf/partition.h), if present, is read once
+  // and used for two independent fixups below -- both observed on a real
+  // Omneon "growing file" recording, so neither is hypothetical.
+  std::optional<std::vector<RandomIndexPackEntry>> rip = ReadRandomIndexPack(reader);
 
-  for (const Ul& packageUid : packageUids) {
-    ResolvePackage(packageUid, sets, info);
-    if (info.hasVideo && info.hasAudio) break;
+  // Fixup 1: HeaderByteCount can itself undercount the metadata actually
+  // written (observed: a trailing Identification set whose value genuinely
+  // extends past partitionEnd+headerByteCount). ReadMetadataSets above
+  // tolerates this silently -- a KLV whose declared value would cross that
+  // boundary is treated as "no more metadata to read" rather than a parse
+  // failure -- but that leaves headerMetadataEnd (EssenceWalker's scan
+  // start point) landing mid-way through real metadata bytes instead of at
+  // the true start of the next partition, which EssenceWalker then reads
+  // as garbage and fails to find any essence in. The RIP is authoritative
+  // here: its entries record every partition's real byte offset in file
+  // order, so the entry right after the Header Partition's own (always
+  // byteOffset 0) entry is exactly where the Header Partition truly ends.
+  if (rip && rip->size() >= 2 && (*rip)[0].byteOffset == 0) {
+    const uint64_t nextPartitionOffset = (*rip)[1].byteOffset;
+    if (nextPartitionOffset > info.headerMetadataEnd && nextPartitionOffset < reader.Size()) {
+      info.headerMetadataEnd = nextPartitionOffset;
+    }
+  }
+
+  // Fixup 2 (footer precedence, SMPTE 377-1: a Closed partition's metadata
+  // takes precedence over an Open one): some recorders leave the Header
+  // Partition Open/Incomplete -- Duration/Origin genuinely unresolved --
+  // until the recording finishes, writing final values only into the
+  // Footer Partition's own redundant Header Metadata copy.
+  bool overridden = false;
+  if (partition->footerPartition != 0) {
+    overridden = TryOverrideFromFooterPartition(reader, partition->footerPartition, info);
+  }
+  if (!overridden && rip && !rip->empty()) {
+    // The Header Partition Pack's FooterPartition back-reference can be
+    // left 0/unknown even in an otherwise-complete file -- the RIP's last
+    // entry is always the Footer Partition's offset, giving a reader with
+    // no prior knowledge of any partition's byte offset a way to find it
+    // anyway.
+    overridden = TryOverrideFromFooterPartition(reader, rip->back().byteOffset, info);
+    if (overridden) info.footerPartitionPresent = true;
   }
 
   info.durationReliable = info.hasVideo && info.numFrames >= 0 && info.footerPartitionPresent;

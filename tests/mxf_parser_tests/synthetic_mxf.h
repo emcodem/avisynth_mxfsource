@@ -121,19 +121,34 @@ struct SyntheticFile {
   uint32_t width = 320;
   uint32_t height = 240;
   Ul pictureEssenceCoding = kRawVideoCoding;
+
+  // Adds a second Package -- a SourcePackage -- alongside the MaterialPackage
+  // built unconditionally below, so tests can exercise Origin handling (see
+  // header_parser.h's MxfStreamInfo::origin/sourcePackageDuration): only a
+  // SourcePackage's Track.Origin (tag 0x4B02) is meaningful/read by the
+  // parser. Reuses the same CDCI Descriptor as the MaterialPackage rather
+  // than building a second one -- irrelevant to what Origin handling tests.
+  bool includeSourcePackage = false;
+  int64_t sourcePackageDuration = 10;  // SP's raw/untrimmed Sequence.Duration
+  int64_t sourcePackageOrigin = 0;     // SP's Track.Origin (0x4B02)
 };
 
-// Builds a minimal OP1a-shaped Header Partition + Header Metadata:
-// ContentStorage -> MaterialPackage -> Track(TrackNumber) -> Sequence(Picture)
-// -> CDCI Descriptor (320x240, uncompressed 4:2:2, 25fps). Returns just the
-// Header Partition bytes; essence_walker_test.cpp appends a Body Partition
-// after this to test the forward essence walk.
-inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
+// Builds just the Header Metadata local-set KLVs (Primer Pack ->
+// ContentStorage -> MaterialPackage -> Track(TrackNumber) ->
+// Sequence(Picture) -> CDCI Descriptor, plus an optional SourcePackage --
+// see SyntheticFile::includeSourcePackage), with no enclosing Partition
+// Pack. Factored out of BuildSyntheticHeader so the same metadata-building
+// logic can be reused for a Footer Partition's redundant copy (see
+// BuildFooterPrecedenceTestFile) with a different SyntheticFile config.
+inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
   const Ul uidContentStorage = MakeUid(1);
   const Ul uidPackage = MakeUid(2);
   const Ul uidTrack = MakeUid(3);
   const Ul uidSequence = MakeUid(4);
   const Ul uidDescriptor = MakeUid(5);
+  const Ul uidSourcePackage = MakeUid(6);
+  const Ul uidSourceTrack = MakeUid(7);
+  const Ul uidSourceSequence = MakeUid(8);
 
   std::vector<uint8_t> metadata;  // everything from right after the Partition Pack KLV onward
 
@@ -146,7 +161,9 @@ inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
   {
     std::vector<uint8_t> entries;
     AppendTagUl(entries, 0x3C0A, uidContentStorage);
-    AppendTagUlArray(entries, 0x1901, {uidPackage});
+    std::vector<Ul> packageUids = {uidPackage};
+    if (cfg.includeSourcePackage) packageUids.push_back(uidSourcePackage);
+    AppendTagUlArray(entries, 0x1901, packageUids);
     AppendLocalSet(metadata, 0x18, 0x00, entries);
   }
   // MaterialPackage
@@ -183,6 +200,48 @@ inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
     AppendTagUl(entries, 0x3201, cfg.pictureEssenceCoding);
     AppendLocalSet(metadata, 0x28, 0x00, entries);
   }
+
+  if (cfg.includeSourcePackage) {
+    // SourcePackage -- shares the MaterialPackage's Descriptor (see
+    // SyntheticFile::includeSourcePackage). Only its Track.Origin
+    // (0x4B02) and Sequence.Duration (0x0202) are what Origin-handling
+    // tests actually care about.
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidSourcePackage);
+      AppendTagUlArray(entries, 0x4403, {uidSourceTrack});
+      AppendTagUl(entries, 0x4701, uidDescriptor);
+      AppendLocalSet(metadata, 0x37, 0x00, entries);
+    }
+    // Source Track (Generic Track)
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidSourceTrack);
+      AppendTagRational(entries, 0x4B01, 25, 1);
+      AppendTagI64(entries, 0x4B02, cfg.sourcePackageOrigin);
+      AppendTagUl(entries, 0x4803, uidSourceSequence);
+      AppendTagU32(entries, 0x4804, cfg.videoTrackNumber);
+      AppendLocalSet(metadata, 0x3B, 0x00, entries);
+    }
+    // Source Sequence
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidSourceSequence);
+      AppendTagUl(entries, 0x0201, kPictureDataDefinition);
+      AppendTagI64(entries, 0x0202, cfg.sourcePackageDuration);
+      AppendLocalSet(metadata, 0x0F, 0x00, entries);
+    }
+  }
+
+  return metadata;
+}
+
+// Builds a minimal OP1a-shaped Header Partition + Header Metadata (see
+// BuildHeaderMetadataBlock). Returns just the Header Partition bytes;
+// essence_walker_test.cpp appends a Body Partition after this to test the
+// forward essence walk.
+inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
+  std::vector<uint8_t> metadata = BuildHeaderMetadataBlock(cfg);
 
   // Header Partition Pack (fixed 88-byte value; see header_parser.cpp for field order).
   std::vector<uint8_t> file;
@@ -233,6 +292,129 @@ inline void AppendPartitionPack(std::vector<uint8_t>& buf, mxfsrc::PartitionKind
   AppendUl(buf, zeroUl);
   AppendU32BE(buf, 0);
   AppendU32BE(buf, 16);
+}
+
+// Partition Pack status byte (key[14]) values, per SMPTE 377-1 -- see
+// mxf/partition.h's PartitionStatus this must match.
+enum class TestPartitionStatus : uint8_t {
+  kOpenIncomplete = 0x01,
+  kOpenComplete = 0x02,
+  kClosedIncomplete = 0x03,
+  kClosedComplete = 0x04,
+};
+
+// Generalizes AppendPartitionPack with an explicit status byte, FooterPartition
+// offset, and HeaderByteCount -- needed to synthesize the open-header/
+// closed-footer scenario real "growing file" recorders (e.g. Omneon)
+// produce: a Header Partition marked Open & Incomplete (Duration/Origin
+// genuinely unresolved) alongside a Footer Partition marked Closed &
+// Complete, carrying its own full redundant Header Metadata copy with the
+// final values. See BuildFooterPrecedenceTestFile.
+inline void AppendPartitionPackWithFields(std::vector<uint8_t>& buf, mxfsrc::PartitionKind kind,
+                                            TestPartitionStatus status, uint64_t thisPartition,
+                                            uint64_t footerPartitionOffset, uint64_t headerByteCount) {
+  uint8_t kindByte = 0x02;
+  if (kind == mxfsrc::PartitionKind::kBody) kindByte = 0x03;
+  if (kind == mxfsrc::PartitionKind::kFooter) kindByte = 0x04;
+  Ul key = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01,
+            0x0d, 0x01, 0x02, 0x01, 0x01, kindByte, static_cast<uint8_t>(status), 0x00};
+  AppendKlvHeader(buf, key, 88);
+  AppendU16BE(buf, 1);
+  AppendU16BE(buf, 2);
+  AppendU32BE(buf, 1);
+  AppendU64BE(buf, thisPartition);
+  AppendU64BE(buf, 0);  // PreviousPartition
+  AppendU64BE(buf, footerPartitionOffset);
+  AppendU64BE(buf, headerByteCount);
+  AppendU64BE(buf, 0);  // IndexByteCount
+  AppendU32BE(buf, 0);  // IndexSID
+  AppendU64BE(buf, 0);  // BodyOffset
+  AppendU32BE(buf, 1);  // BodySID
+  Ul zeroUl{};
+  AppendUl(buf, zeroUl);
+  AppendU32BE(buf, 0);
+  AppendU32BE(buf, 16);
+}
+
+// Builds the exact real-world scenario that motivated MXF footer-precedence
+// handling (see header_parser.cpp): a Header Partition marked Open &
+// Incomplete whose Header Metadata copy has an unresolvable Duration
+// (`headerCfg.sequenceDuration = -1`), and a Footer Partition marked Closed
+// & Complete carrying its own full, correct Header Metadata copy
+// (`footerCfg`). No Body Partition/essence in between -- irrelevant to
+// header_parser_test.cpp, which only exercises metadata resolution.
+inline std::vector<uint8_t> BuildFooterPrecedenceTestFile(const SyntheticFile& headerCfg,
+                                                             const SyntheticFile& footerCfg) {
+  std::vector<uint8_t> headerMetadata = BuildHeaderMetadataBlock(headerCfg);
+  std::vector<uint8_t> footerMetadata = BuildHeaderMetadataBlock(footerCfg);
+
+  std::vector<uint8_t> file;
+  // Header Partition Pack: ThisPartition=0, FooterPartition filled in below
+  // once we know the footer's actual byte offset.
+  const size_t headerPackPos = file.size();
+  AppendPartitionPackWithFields(file, mxfsrc::PartitionKind::kHeader, TestPartitionStatus::kOpenIncomplete, 0, 0,
+                                  headerMetadata.size());
+  file.insert(file.end(), headerMetadata.begin(), headerMetadata.end());
+
+  const uint64_t footerOffset = file.size();
+  AppendPartitionPackWithFields(file, mxfsrc::PartitionKind::kFooter, TestPartitionStatus::kClosedComplete,
+                                  footerOffset, footerOffset, footerMetadata.size());
+  file.insert(file.end(), footerMetadata.begin(), footerMetadata.end());
+
+  // Patch the Header Partition Pack's FooterPartition field (byte offset
+  // 32 into its 88-byte Value, right after the 17-byte KLV header: 2+2+4+8+8=24,
+  // so FooterPartition starts at KLV-header(17) + 24 = 41) now that it's known.
+  const size_t footerFieldOffset = headerPackPos + 17 + 24;
+  for (int i = 0; i < 8; ++i) {
+    file[footerFieldOffset + static_cast<size_t>(i)] = static_cast<uint8_t>(footerOffset >> (56 - i * 8));
+  }
+
+  return file;
+}
+
+// Builds a Random Index Pack from (BodySID, byteOffset) pairs, computing
+// its own trailing "total pack length" field dynamically so it stays
+// correct regardless of the BER length form AppendKlvHeader picks -- see
+// mxf/partition.h's ReadRandomIndexPack, which this exercises.
+inline void AppendRandomIndexPack(std::vector<uint8_t>& buf,
+                                    const std::vector<std::pair<uint32_t, uint64_t>>& entries) {
+  const size_t packStart = buf.size();
+  std::vector<uint8_t> value;
+  for (const auto& entry : entries) {
+    AppendU32BE(value, entry.first);
+    AppendU64BE(value, entry.second);
+  }
+  AppendKlvHeader(buf, mxfsrc::kRandomIndexPackKey, value.size() + 4);
+  buf.insert(buf.end(), value.begin(), value.end());
+  const uint32_t totalPackLength = static_cast<uint32_t>(buf.size() - packStart + 4);
+  AppendU32BE(buf, totalPackLength);
+}
+
+// Reproduces the real-world Omneon bug this exact scenario was found on:
+// the Header Partition Pack's own FooterPartition field is left 0/unknown
+// even in an otherwise-complete file, so the Footer can only be located via
+// the Random Index Pack at the end of the file (see
+// mxf/partition.h::ReadRandomIndexPack, header_parser.cpp's RIP fallback).
+inline std::vector<uint8_t> BuildRipFooterFallbackTestFile(const SyntheticFile& headerCfg,
+                                                              const SyntheticFile& footerCfg) {
+  std::vector<uint8_t> headerMetadata = BuildHeaderMetadataBlock(headerCfg);
+  std::vector<uint8_t> footerMetadata = BuildHeaderMetadataBlock(footerCfg);
+
+  std::vector<uint8_t> file;
+  AppendPartitionPackWithFields(file, mxfsrc::PartitionKind::kHeader, TestPartitionStatus::kOpenIncomplete, 0, 0,
+                                  headerMetadata.size());
+  file.insert(file.end(), headerMetadata.begin(), headerMetadata.end());
+
+  const uint64_t footerOffset = file.size();
+  AppendPartitionPackWithFields(file, mxfsrc::PartitionKind::kFooter, TestPartitionStatus::kClosedComplete,
+                                  footerOffset, 0, footerMetadata.size());
+  file.insert(file.end(), footerMetadata.begin(), footerMetadata.end());
+
+  // Matches the real file's observed RIP shape: one entry per partition,
+  // BodySID=0 for Header/Footer (no essence of their own), last entry is
+  // always the Footer's offset.
+  AppendRandomIndexPack(file, {{0, 0}, {0, footerOffset}});
+  return file;
 }
 
 inline void AppendKlvFill(std::vector<uint8_t>& buf, uint8_t padLen) {

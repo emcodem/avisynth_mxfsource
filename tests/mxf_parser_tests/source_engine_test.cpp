@@ -284,6 +284,133 @@ void TestRepeatedRequestForSameFrameSucceeds() {
   std::filesystem::remove(path);
 }
 
+std::vector<uint8_t> BuildFileWithOrigin(int width, int height, int64_t essenceFrameCount, int64_t origin) {
+  SyntheticFile cfg;
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = kTrackNumber;
+  cfg.sequenceDuration = essenceFrameCount - origin;  // MaterialPackage's trimmed Duration
+  cfg.includeSourcePackage = true;
+  cfg.sourcePackageDuration = essenceFrameCount;  // SourcePackage's raw/untrimmed Duration
+  cfg.sourcePackageOrigin = origin;
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+  AppendPartitionPack(bytes, PartitionKind::kBody);
+  for (int64_t i = 0; i < essenceFrameCount; ++i) {
+    AppendEssenceElement(bytes, kTrackNumber, MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+  }
+  return bytes;
+}
+
+// Regression/feature test for MXF Origin handling (see
+// OpenOptions::handle_origin, MxfStreamInfo::origin): with the default
+// handle_origin=true, the engine must skip the SourcePackage's Origin
+// worth of pre-roll essence frames so host frame 0 is essence element
+// `origin`, not essence element 0, and expose exactly
+// (essenceFrameCount - origin) frames.
+void TestOriginHandlingSkipsPreRollByDefault() {
+  const int width = 4, height = 2;
+  const int64_t essenceFrameCount = 20, origin = 5;
+  auto path = WriteTempFile(BuildFileWithOrigin(width, height, essenceFrameCount, origin),
+                             "mxfsrc_test_engine_origin_on.mxf");
+
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(path.string());  // handle_origin defaults to true
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::cerr << "Open error: " << res.error << std::endl;
+      std::filesystem::remove(path);
+      return;
+    }
+    CHECK(engine.StreamInfo().numFrames == essenceFrameCount - origin);
+
+    std::shared_ptr<NormalizedFrame> frame;
+    std::string err;
+    CHECK(engine.GetVideoFrame(0, frame, &err) == FetchStatus::kOk);
+    CHECK(frame && !frame->planeData[0].empty() &&
+          frame->planeData[0][0] == static_cast<uint8_t>(0x10 + origin));  // essence element `origin`, not 0
+
+    CHECK(engine.GetVideoFrame(2, frame, &err) == FetchStatus::kOk);
+    CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + origin + 2));
+
+    // Past the exposed (trimmed) frame count is end-of-stream, even though
+    // more raw essence physically exists in the file beyond it.
+    CHECK(engine.GetVideoFrame(essenceFrameCount - origin, frame, &err) == FetchStatus::kEndOfStream);
+  }
+
+  std::filesystem::remove(path);
+}
+
+// handle_origin=false must fully disable the skip and expose the raw,
+// untrimmed essence -- i.e. behave exactly as if Origin were 0.
+void TestHandleOriginFalseDisablesSkip() {
+  const int width = 4, height = 2;
+  const int64_t essenceFrameCount = 20, origin = 5;
+  auto path = WriteTempFile(BuildFileWithOrigin(width, height, essenceFrameCount, origin),
+                             "mxfsrc_test_engine_origin_off.mxf");
+
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.handle_origin = false;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::cerr << "Open error: " << res.error << std::endl;
+      std::filesystem::remove(path);
+      return;
+    }
+    CHECK(engine.StreamInfo().numFrames == essenceFrameCount);
+
+    std::shared_ptr<NormalizedFrame> frame;
+    std::string err;
+    CHECK(engine.GetVideoFrame(0, frame, &err) == FetchStatus::kOk);
+    CHECK(frame && !frame->planeData[0].empty() && frame->planeData[0][0] == 0x10);  // essence element 0, unskipped
+
+    CHECK(engine.GetVideoFrame(essenceFrameCount - 1, frame, &err) == FetchStatus::kOk);
+    CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + essenceFrameCount - 1));
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Same as TestOriginHandlingSkipsPreRollByDefault, but for a frame far
+// enough past the buffer window to force the SeekAndDecode fallback path
+// (see source_engine.cpp) -- verifies the `originSkip_ + target` math there
+// (both the intra-only skip-count loop and the general decode loop) rather
+// than just the DecodeThreadMain startup skip.
+void TestOriginHandlingAppliesToSeekAndDecodeFallback() {
+  const int width = 4, height = 2;
+  const int64_t essenceFrameCount = 30, origin = 5;
+  auto path = WriteTempFile(BuildFileWithOrigin(width, height, essenceFrameCount, origin),
+                             "mxfsrc_test_engine_origin_seek.mxf");
+
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 3;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    std::shared_ptr<NormalizedFrame> frame;
+    // Evicts everything, then request a mid-range frame that must fall back
+    // to SeekAndDecode.
+    CHECK(engine.GetVideoFrame(essenceFrameCount - origin - 1, frame, nullptr) == FetchStatus::kOk);
+
+    constexpr int64_t kMidTarget = 10;
+    FetchStatus st = engine.GetVideoFrame(kMidTarget, frame, nullptr);
+    CHECK(st == FetchStatus::kOk);
+    CHECK(frame && !frame->planeData[0].empty() &&
+          frame->planeData[0][0] == static_cast<uint8_t>(0x10 + origin + kMidTarget));
+  }
+
+  std::filesystem::remove(path);
+}
+
 void TestUnsupportedCodecFailsOpenCleanly() {
   SyntheticFile cfg;
   cfg.sequenceDuration = 1;
@@ -311,6 +438,9 @@ int main() {
   TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames();
   TestOpenPeekDoesNotEvictFrameZero();
   TestRepeatedRequestForSameFrameSucceeds();
+  TestOriginHandlingSkipsPreRollByDefault();
+  TestHandleOriginFalseDisablesSkip();
+  TestOriginHandlingAppliesToSeekAndDecodeFallback();
   TestUnsupportedCodecFailsOpenCleanly();
 
   if (g_failures == 0) {

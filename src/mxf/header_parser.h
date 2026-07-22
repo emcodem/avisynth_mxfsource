@@ -36,6 +36,24 @@ struct MxfStreamInfo {
                                     // walk starts scanning for the first Body Partition from here.
   bool footerPartitionPresent = false;
 
+  // SourcePackage video Track.Origin (baseline tag 0x4B02): how many frames
+  // of pre-roll/trim sit at the start of the essence container before the
+  // MaterialPackage's intended playable range begins. 0 if the file has no
+  // SourcePackage Origin (or it's genuinely 0 -- the common case). Per
+  // SMPTE 377M, MaterialPackage.Origin must always be 0, so this is only
+  // ever read off a set classified as a SourcePackage; see
+  // \the mxf_origin README for the full
+  // SP/MP Origin/Duration relationship this plugin honors.
+  int64_t origin = 0;
+
+  // SourcePackage video Sequence.Duration (baseline tag 0x0202): the raw,
+  // untrimmed essence frame count, i.e. MP Duration + SP Origin. -1 if no
+  // SourcePackage video track was found (e.g. malformed/unusual file) --
+  // callers should fall back to numFrames as resolved below in that case.
+  // Kept separate from numFrames so SourceEngine can apply/ignore the
+  // Origin trim (OpenOptions::handle_origin) without re-parsing metadata.
+  int64_t sourcePackageDuration = -1;
+
   // Per plan's Duration fallback chain: true once (1) Sequence.Duration (or
   // Descriptor.ContainerDuration) resolved AND (2) the Header Partition
   // Pack's FooterPartition offset is nonzero (file is closed/complete).

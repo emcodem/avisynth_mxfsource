@@ -45,6 +45,19 @@ struct OpenOptions {
   // HTTP server behind e.g. an Authorization: Bearer token needs it.
   // Exposed to scripts as MxfSource(..., httpheaders="...").
   std::string http_headers;
+
+  // Whether to honor the MXF SourcePackage Track.Origin property (see
+  // MxfStreamInfo::origin in mxf/header_parser.h): the number of pre-
+  // roll/trim frames at the start of the essence container that sit before
+  // the MaterialPackage's intended playable range. When true (the
+  // default), the engine skips those `origin` frames and exposes exactly
+  // (SP Duration - Origin) frames, matching what an NLE would show for the
+  // edited sequence. When false, Origin is ignored entirely and the engine
+  // exposes the full raw essence from its first frame, as if Origin were 0
+  // -- useful for files with an incorrect/stale Origin value, or to inspect
+  // the untrimmed source essence directly. Exposed to scripts as
+  // MxfSource(..., handle_origin=true/false).
+  bool handle_origin = true;
 };
 
 } // namespace mxfsrc

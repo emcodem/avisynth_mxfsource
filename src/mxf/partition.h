@@ -14,13 +14,42 @@ namespace mxfsrc {
 
 enum class PartitionKind { kHeader, kBody, kFooter };
 
+// Partition Pack status (byte[14] of the key, see below): whether this
+// partition's Header Metadata copy is still being appended to (Open) or
+// finished (Closed), and whether all mandatory properties have been
+// written yet (Complete) or not (Incomplete). Per SMPTE 377-1, a Closed
+// partition's metadata takes precedence over an Open one -- "growing
+// file" recorders (e.g. Omneon) commonly leave the Header Partition Open
+// & Incomplete (Duration/Origin genuinely unresolved yet) until the
+// recording finishes, only writing final values into the redundant Header
+// Metadata copy carried by the (Closed & Complete) Footer Partition. See
+// header_parser.cpp's footer-precedence handling.
+//
+// Value order verified against a real Omneon recording (byte[14]=0x01 on
+// its Header Partition, whose Duration/Origin were genuinely unresolved,
+// vs. byte[14]=0x04 on its Footer Partition, which carried the final
+// values) -- status progresses monotonically from "least settled" to
+// "most settled" as the numeric value increases, not alphabetically.
+enum class PartitionStatus { kOpenIncomplete, kOpenComplete, kClosedIncomplete, kClosedComplete, kUnknown };
+
+inline bool IsPartitionClosed(PartitionStatus status) {
+  return status == PartitionStatus::kClosedComplete || status == PartitionStatus::kClosedIncomplete;
+}
+
 // Partition Pack keys share a 13-byte prefix; byte[13] (0-indexed) selects
-// Header(2)/Body(3)/Footer(4), byte[14] the open/closed/complete status
-// (not needed for MVP parsing, kept available for future use).
+// Header(2)/Body(3)/Footer(4), byte[14] the open/closed/complete status.
 inline constexpr uint8_t kPartitionPackKeyPrefix[13] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01,
                                                           0x01, 0x0d, 0x01, 0x02, 0x01, 0x01};
 
 bool IsPartitionPackKey(const Ul& key, PartitionKind* kindOut);
+
+// Classifies byte[14] of a key already confirmed via IsPartitionPackKey.
+// Values 0x01-0x04 per SMPTE 377-1's Partition Pack status byte; anything
+// else (including pre-2004 Version 1 files, which leave this reserved as
+// 0x00) is reported as kUnknown -- callers should treat kUnknown as "not
+// safely Closed" rather than erroring, since the rest of the Partition
+// Pack is still valid.
+PartitionStatus ClassifyPartitionStatus(const Ul& key);
 
 inline constexpr Ul kPrimerPackKey = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01,
                                        0x0d, 0x01, 0x02, 0x01, 0x01, 0x05, 0x01, 0x00};
@@ -60,5 +89,26 @@ struct PartitionPack {
 // positioned wherever it ends up mid-Value; caller should Seek to
 // klv.valueOffset + klv.length afterwards to continue.
 std::optional<PartitionPack> ReadPartitionPackValue(MxfReader& reader, const KlvHeader& klv);
+
+struct RandomIndexPackEntry {
+  uint32_t bodySid = 0;
+  uint64_t byteOffset = 0;
+};
+
+// Reads the Random Index Pack (RIP), if present: a fixed-format (not
+// local-set-coded) table of every partition's byte offset, always the very
+// last structure in a valid MXF file. It's the one MXF construct explicitly
+// designed to be locatable without already knowing any partition's byte
+// offset in advance -- its own total pack length is duplicated as the last
+// 4 bytes of the file, letting a reader seek backward exactly that many
+// bytes from EOF to find its Key.
+//
+// This is the fallback for locating the Footer Partition when the Header
+// Partition Pack's own FooterPartition field is left 0/unknown -- observed
+// on a real Omneon "growing file" recording that apparently never
+// back-fills that reference even once the file is complete. Per SMPTE
+// 377-1 the Footer Partition is always the last partition in the file, so
+// entries.back().byteOffset (if entries is non-empty) is its offset.
+std::optional<std::vector<RandomIndexPackEntry>> ReadRandomIndexPack(MxfReader& reader);
 
 }  // namespace mxfsrc

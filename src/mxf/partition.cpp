@@ -16,6 +16,16 @@ bool IsPartitionPackKey(const Ul& key, PartitionKind* kindOut) {
   return true;
 }
 
+PartitionStatus ClassifyPartitionStatus(const Ul& key) {
+  switch (key[14]) {
+    case 0x01: return PartitionStatus::kOpenIncomplete;
+    case 0x02: return PartitionStatus::kOpenComplete;
+    case 0x03: return PartitionStatus::kClosedIncomplete;
+    case 0x04: return PartitionStatus::kClosedComplete;
+    default: return PartitionStatus::kUnknown;
+  }
+}
+
 bool IsLocalSetKey(const Ul& key) {
   return UlPrefixEquals(key, kLocalSetKeyPrefix, sizeof(kLocalSetKeyPrefix));
 }
@@ -49,6 +59,38 @@ std::optional<PartitionPack> ReadPartitionPackValue(MxfReader& reader, const Klv
   }
 
   return pack;
+}
+
+std::optional<std::vector<RandomIndexPackEntry>> ReadRandomIndexPack(MxfReader& reader) {
+  const uint64_t fileSize = reader.Size();
+  // Smallest possible RIP: 16-byte key + 1-byte short-form BER length + one
+  // 12-byte entry + 4-byte trailing length = 33 bytes.
+  if (fileSize < 33) return std::nullopt;
+  if (!reader.Seek(fileSize - 4)) return std::nullopt;
+
+  uint32_t ripLength = 0;
+  if (!reader.ReadU32BE(ripLength)) return std::nullopt;
+  if (ripLength < 33 || ripLength > fileSize) return std::nullopt;
+
+  const uint64_t ripStart = fileSize - ripLength;
+  if (!reader.Seek(ripStart)) return std::nullopt;
+
+  KlvHeader klv{};
+  if (!ReadKlvHeader(reader, klv)) return std::nullopt;
+  if (!UlEquals(klv.key, kRandomIndexPackKey)) return std::nullopt;
+  if (klv.length < 4) return std::nullopt;
+
+  const uint64_t valueEnd = klv.valueOffset + klv.length;
+  const uint64_t entriesEnd = valueEnd - 4;  // last 4 bytes: redundant total-pack-length trailer
+
+  std::vector<RandomIndexPackEntry> entries;
+  while (reader.Tell() + 12 <= entriesEnd) {
+    RandomIndexPackEntry entry;
+    if (!reader.ReadU32BE(entry.bodySid)) return std::nullopt;
+    if (!reader.ReadU64BE(entry.byteOffset)) return std::nullopt;
+    entries.push_back(entry);
+  }
+  return entries;
 }
 
 }  // namespace mxfsrc

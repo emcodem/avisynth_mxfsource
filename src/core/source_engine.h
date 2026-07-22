@@ -129,6 +129,10 @@ class SourceEngine {
   std::string path_;
   std::string logFile_;
   std::string httpHeaders_;
+  // Number of leading video essence elements to discard before essence
+  // element 0 becomes host frame 0 -- OpenOptions::handle_origin ?
+  // streamInfo_.origin : 0. See DecodeThreadMain/SeekAndDecode.
+  int64_t originSkip_ = 0;
   std::unique_ptr<MxfReader> reader_;
   MxfStreamInfo streamInfo_;
   std::unique_ptr<EssenceWalker> walker_;
