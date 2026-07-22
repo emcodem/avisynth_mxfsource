@@ -95,6 +95,33 @@ Current status:
   AviSynth-specific. Stress-run 18+ times across both small (buffer_frames=5,
   20 frames) and larger (default buffer_frames=300, 60 frames) synthetic
   files with no failures.
+- **Phase 9 (real-world Atomos Shogun XAVC fix + XAVC-L support) -- done.**
+  Real XAVC-Intra and XAVC-L (long-GOP) files from an Atomos Shogun (both
+  1920x1088/1080p50) exposed two general parsing bugs, not anything
+  XAVC-specific: (1) `header_parser.cpp`'s RIP-based `headerMetadataEnd`
+  fixup assumed RIP's second entry is always a Body Partition immediately
+  following the Header -- files with no separate Body Partition at all
+  (essence written directly after Header Metadata, RIP's second entry is
+  the Footer instead) had it jump `headerMetadataEnd` straight to the
+  Footer, causing `EssenceWalker` to skip every essence element and fail
+  with "MXF essence ended before reaching the declared frame count"; fixed
+  by only trusting that RIP entry when it actually resolves to a Body
+  Partition Pack. (2) `EssenceWalker` misparsed this recorder's raw
+  zero-byte KAG-boundary padding (not a spec-compliant KLV Fill Item) as a
+  run of bogus zero-length KLVs, desyncing before it reached the real
+  essence; fixed with a resync helper that scans forward for the next
+  legitimate KLV key (SMPTE UL designator `06.0E.2B.34`) instead of
+  trusting a length field derived from noise. Both are regression-tested
+  with hand-crafted synthetic files reproducing each layout
+  (`essence_walker_test.cpp`). Separately, XAVC-L's PictureEssenceCoding UL
+  (registered under a different family than AVC-Intra) is now classified as
+  its own `CodecFamily::kH264LongGop` -- decoded via the same generic
+  `AvcodecDecoder`/H.264 path as `kH264`, but correctly excluded from the
+  intra-only seek fast path since it has real B-frame dependencies (XAVC-I
+  itself already matched the existing AVC-Intra UL entry and needed no
+  table change). Verified end-to-end against the real files with
+  `read_test_mxf` (every frame of both files decodes correctly), not just
+  synthetic unit tests.
 
 ## Build
 

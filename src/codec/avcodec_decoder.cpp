@@ -21,6 +21,7 @@ AVCodecID ToAvCodecId(CodecFamily family) {
     case CodecFamily::kJpeg2000: return AV_CODEC_ID_JPEG2000;
     case CodecFamily::kDnxhd: return AV_CODEC_ID_DNXHD;
     case CodecFamily::kH264: return AV_CODEC_ID_H264;
+    case CodecFamily::kH264LongGop: return AV_CODEC_ID_H264;
     case CodecFamily::kProres: return AV_CODEC_ID_PRORES;
     case CodecFamily::kFfv1: return AV_CODEC_ID_FFV1;
     default: return AV_CODEC_ID_NONE;

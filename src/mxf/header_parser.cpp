@@ -368,11 +368,25 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   // as garbage and fails to find any essence in. The RIP is authoritative
   // here: its entries record every partition's real byte offset in file
   // order, so the entry right after the Header Partition's own (always
-  // byteOffset 0) entry is exactly where the Header Partition truly ends.
+  // byteOffset 0) entry is exactly where the Header Partition truly ends --
+  // *if* that entry is a separate Body Partition. Some real files (observed:
+  // Atomos Shogun XAVC-Intra/XAVC-L recordings) have no Body Partition at
+  // all -- the Header Partition itself carries the Index Table Segment and
+  // then all essence directly after its Header Metadata, and RIP[1] is the
+  // Footer Partition instead. Blindly trusting RIP[1] there would jump
+  // straight to the Footer and make EssenceWalker skip every essence
+  // element in the file, so this fixup only applies when RIP[1] actually
+  // resolves to a Body Partition Pack.
   if (rip && rip->size() >= 2 && (*rip)[0].byteOffset == 0) {
     const uint64_t nextPartitionOffset = (*rip)[1].byteOffset;
-    if (nextPartitionOffset > info.headerMetadataEnd && nextPartitionOffset < reader.Size()) {
-      info.headerMetadataEnd = nextPartitionOffset;
+    if (nextPartitionOffset > info.headerMetadataEnd && nextPartitionOffset < reader.Size() &&
+        reader.Seek(nextPartitionOffset)) {
+      KlvHeader nextKlv{};
+      PartitionKind nextKind{};
+      if (ReadKlvHeader(reader, nextKlv) && IsPartitionPackKey(nextKlv.key, &nextKind) &&
+          nextKind == PartitionKind::kBody) {
+        info.headerMetadataEnd = nextPartitionOffset;
+      }
     }
   }
 

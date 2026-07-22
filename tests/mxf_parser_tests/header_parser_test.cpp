@@ -230,6 +230,34 @@ void TestNoFooterPartitionLeavesUnknownDurationUnresolved() {
   std::filesystem::remove(path);
 }
 
+// Regression test for real Atomos Shogun XAVC-L files: their
+// PictureEssenceCoding UL (registered under the 0x0D family, distinct from
+// AVC-Intra's 0x0A family) must classify as CodecFamily::kH264LongGop, not
+// kUnknown -- and that family must NOT be treated as intra-only (it's
+// genuine long-GOP H.264 with B-frame reference dependencies), unlike
+// kH264 which covers only verified I-frame-only AVC-Intra/XAVC-Intra ULs.
+void TestXavcLongGopUlClassification() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 10;
+  cfg.pictureEssenceCoding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+                              0x04, 0x01, 0x02, 0x02, 0x01, 0x31, 0x60, 0x01};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_xavc_longgop.mxf");
+
+  {
+    MxfReader reader(path.string());
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (info) {
+      CHECK(info->videoCodec == CodecFamily::kH264LongGop);
+    }
+  }
+
+  std::filesystem::remove(path);
+
+  CHECK(!IsIntraOnlyCodec(CodecFamily::kH264LongGop));
+  CHECK(IsIntraOnlyCodec(CodecFamily::kH264));
+}
+
 void TestRejectsNonMxfFile() {
   std::vector<uint8_t> garbage = {'n', 'o', 't', ' ', 'm', 'x', 'f'};
   auto path = WriteTempFile(garbage, "mxfsrc_test_garbage.mxf");
@@ -255,6 +283,7 @@ int main() {
   TestFooterPrecedenceOverridesOpenIncompleteHeader();
   TestRipFallbackLocatesFooterWhenHeaderFieldIsZero();
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
+  TestXavcLongGopUlClassification();
   TestRejectsNonMxfFile();
 
   if (g_failures == 0) {

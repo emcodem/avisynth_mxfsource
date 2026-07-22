@@ -76,6 +76,107 @@ void TestWalksVideoElementsInOrderSkippingOthers() {
   std::filesystem::remove(path);
 }
 
+// Regression test for real Atomos Shogun XAVC-Intra/XAVC-L recordings: there
+// is no separate Body Partition at all -- essence elements follow the
+// Header Partition's own Header Metadata directly, and the Random Index
+// Pack's only two entries are the Header (byteOffset 0) and the Footer.
+// header_parser.cpp's Fixup 1 must not mistake the Footer's offset for
+// "where Header Metadata truly ends" (see its comment) -- doing so would
+// make EssenceWalker skip every essence element in the file.
+void TestNoBodyPartitionEssenceFollowsHeaderDirectly() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 3;
+  cfg.videoTrackNumber = kVideoTrackNumber;
+  cfg.includeFooterPartitionOffset = false;  // force RIP-based footer discovery
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xCC, 0});
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xCC, 1});
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xCC, 2});
+
+  const uint64_t footerOffset = bytes.size();
+  AppendPartitionPack(bytes, PartitionKind::kFooter);
+  AppendRandomIndexPack(bytes, {{0, 0}, {0, footerOffset}});
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_no_body_partition.mxf");
+  {
+    MxfReader reader(path.string());
+    CHECK(reader.IsOpen());
+
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (!info) {
+      std::filesystem::remove(path);
+      return;
+    }
+    // The bug this guards against: Fixup 1 mistaking the Footer's offset
+    // for the "next partition" and jumping headerMetadataEnd there.
+    CHECK(info->headerMetadataEnd < footerOffset);
+
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
+                          info->audioTrackNumber, info->hasAudio);
+    int64_t count = 0;
+    EssenceElement element;
+    while (walker.Next(element)) {
+      CHECK(element.isVideo);
+      CHECK(element.data.size() == 2);
+      CHECK(element.data[0] == 0xCC);
+      CHECK(element.data[1] == static_cast<uint8_t>(count));
+      ++count;
+    }
+    CHECK(count == 3);
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Regression test for the same real Atomos Shogun files: they pad a
+// partition out to a KAG boundary using raw zero bytes instead of a
+// spec-compliant KLV Fill Item. A run length that isn't a multiple of 17
+// (a zero-length KLV's header size) would desync a naive walk so it lands
+// misaligned inside the real essence element and fails outright --
+// EssenceWalker must resync past it instead (see essence_walker.cpp's
+// ResyncToUlDesignator).
+void TestSkipsNonCompliantZeroBytePadding() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 2;
+  cfg.videoTrackNumber = kVideoTrackNumber;
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+
+  AppendPartitionPack(bytes, PartitionKind::kBody);
+  bytes.insert(bytes.end(), 37, 0);  // 37 raw zero bytes, not a multiple of 17
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 0});
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 1});
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_zero_padding.mxf");
+  {
+    MxfReader reader(path.string());
+    CHECK(reader.IsOpen());
+
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (!info) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
+                          info->audioTrackNumber, info->hasAudio);
+    int64_t count = 0;
+    EssenceElement element;
+    while (walker.Next(element)) {
+      CHECK(element.isVideo);
+      CHECK(element.data.size() == 2);
+      CHECK(element.data[0] == 0xDD);
+      CHECK(element.data[1] == static_cast<uint8_t>(count));
+      ++count;
+    }
+    CHECK(count == 2);
+  }
+
+  std::filesystem::remove(path);
+}
+
 void TestEmptyBodyPartitionYieldsNoElements() {
   SyntheticFile cfg;
   cfg.sequenceDuration = 0;
@@ -107,6 +208,8 @@ void TestEmptyBodyPartitionYieldsNoElements() {
 
 int main() {
   TestWalksVideoElementsInOrderSkippingOthers();
+  TestNoBodyPartitionEssenceFollowsHeaderDirectly();
+  TestSkipsNonCompliantZeroBytePadding();
   TestEmptyBodyPartitionYieldsNoElements();
 
   if (g_failures == 0) {

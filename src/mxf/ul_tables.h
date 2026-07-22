@@ -57,6 +57,7 @@ enum class CodecFamily {
   kV210,
   kDnxhd,
   kH264,
+  kH264LongGop,
   kProres,
   kFfv1,
   kAac,
@@ -105,7 +106,14 @@ inline constexpr CodecUl kCodecUls[] = {
      CodecFamily::kDnxhd},
     {{0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0x04, 0x01, 0x02, 0x02, 0x01, 0x32, 0x00, 0x00},
      14,
-     CodecFamily::kH264},  // AVC-Intra
+     CodecFamily::kH264},  // AVC-Intra (also matches Sony XAVC-Intra, verified against a real
+                            // Atomos Shogun XAVC-I file -- same registered coding UL family)
+    {{0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D, 0x04, 0x01, 0x02, 0x02, 0x01, 0x31, 0x00, 0x00},
+     14,
+     CodecFamily::kH264LongGop},  // Sony XAVC long-GOP (XAVC-L/XAVC-HD Long GOP), verified
+                                   // against a real Atomos Shogun XAVC-L file -- distinct
+                                   // CodecFamily from plain kH264 since this is genuinely
+                                   // long-GOP (B-frames), unlike every other UL mapped to kH264.
     {{0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A, 0x04, 0x01, 0x02, 0x01, 0x01, 0x02, 0x02, 0x01},
      16,
      CodecFamily::kV210},
@@ -153,9 +161,13 @@ inline CodecFamily ClassifyCodecUl(const Ul& ul) {
 // naive skip-without-decode would produce garbage for the long-GOP case
 // since P/B frames need actual decoded reference pictures the decoder
 // never saw. Likewise kMpeg4/kVc1 are not verified intra-only in the MXF
-// profiles we've seen. kH264 is safe here only because our UL table
-// (kCodecUls) currently maps just the AVC-Intra-specific coding UL to it,
-// never general long-GOP H.264 -- revisit if that ever changes.
+// profiles we've seen. kH264 is safe here because our UL table
+// (kCodecUls) maps only AVC-Intra-shaped coding ULs to it (Panasonic
+// AVC-Intra and Sony XAVC-Intra, both verified I-frame-only against real
+// files); genuine long-GOP H.264 (Sony XAVC-L) is classified as the
+// separate CodecFamily::kH264LongGop specifically so it does NOT hit this
+// fast path -- it has real B-frame reference dependencies like any other
+// long-GOP codec here.
 inline bool IsIntraOnlyCodec(CodecFamily family) {
   switch (family) {
     case CodecFamily::kRawVideo:

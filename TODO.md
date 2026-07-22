@@ -4,7 +4,49 @@ Plans for the remaining work after Phases 0-6 (MVP: OP1a, frame-wrapped
 essence, one video track, ring-buffer forward decode, both host adapters --
 see README's "Current status" for what's already done and verified).
 
-## Phase 7: Expand codec/OP coverage
+## Phase 7: Expand codec/OP coverage -- mostly done
+
+### Status update (real-file verification session)
+
+Items 1-3 below are no longer purely theoretical concerns -- they've each had
+real-file verification this session (see README's Phase 9), which changed
+the risk picture without necessarily completing the originally-scoped
+engineering task:
+
+- **XAVC-Intra**: already matched the existing AVC-Intra UL entry and
+  decodes correctly end-to-end (1.9GB/3116-frame real file) with zero
+  bitstream normalization -- Annex-B passthrough just works.
+- **XAVC-L (long-GOP)**: was previously unclassified (`kUnknown` ->
+  "unsupported codec"); added as a new `CodecFamily::kH264LongGop`, verified
+  against a real file, all frames decode correctly.
+- **ProRes**: verified against a real 6434-frame Adobe Premiere export --
+  every frame decodes correctly. Found (but did not fix) a real gap: we
+  never set `codec_tag`/extradata, so avcodec logs `Unknown prores profile
+  0` on every decoder init. Decode output looks correct regardless (ProRes
+  self-describes enough per-frame), but item 3's "verify" task remains open
+  for anything beyond this one real sample, and there's still no committed
+  regression test for ProRes decode (see item 3 below).
+- **D-10/IMX**: verified against a real 234MB Bremer-Test D-10 IMX50 file --
+  decodes all 751 frames correctly. Hit the same "declared header size
+  undercounts real metadata" class of bug fixed for XAVC, but via
+  `EssenceWalker`'s zero-padding resync (added for a different reason)
+  rather than a proper fix -- see item 1's caveat below, still open.
+- **DNxHD**: 7 real "DNxHD"-named sample files actually all carry a genuine
+  MPEG-2 422P@HL coding UL (not the DNxHD-specific UL family in our table)
+  and decode correctly as MPEG-2. The DNxHD-specific UL entries in
+  `ul_tables.h` remain unverified against any real sample.
+- **JPEG2000**: no real samples exist on the available sample share (a
+  broadcast-QC archive; J2K-in-MXF is mostly a digital-cinema/IMF thing).
+  Still purely synthetic-verified, unchanged.
+- **Two general parsing bugs found and properly fixed** (not codec-specific,
+  affects any file with these layouts): `header_parser.cpp`'s RIP-based
+  `headerMetadataEnd` fixup jumping to the Footer Partition on files with no
+  separate Body Partition, and `EssenceWalker` desyncing on non-compliant
+  raw zero-byte KAG padding. Both are regression-tested
+  (`essence_walker_test.cpp`).
+
+Items 4 (OP-Atom) and 5 (clip-wrapped essence) below are untouched --  no
+real sample of either was available this session.
 
 ### Context
 
@@ -42,6 +84,18 @@ of it is realistic for a general-purpose ffmpeg-facing MXF reader.
 ### Work items
 
 #### 1. IMX/D-10 padding stripping
+- **Update:** a real D-10 file (Bremer-Test IMX50) decodes correctly today,
+  but only because `EssenceWalker`'s zero-byte-padding resync (added for the
+  XAVC fix, see status update above) happened to recover from a
+  metadata-undercount gap in this specific file. That resync mechanism can
+  in principle false-positive-lock onto a UL-designator-looking byte
+  sequence embedded in unrelated real metadata (not just literal zero
+  padding) and land on a non-KLV boundary -- it worked here, but isn't a
+  guaranteed fix for this class of bug the way the RIP-based
+  `headerMetadataEnd` fix is for the no-Body-Partition case. Worth hardening
+  properly (e.g. extending `ReadMetadataSets` to keep reading past a
+  too-small `HeaderByteCount` as long as it keeps finding legitimately-shaped
+  local-set KLVs) rather than relying on this side effect.
 - Detect D-10 essence via `CodecFamily::kMpeg2Video` + the specific D-10 UL
   entry in `kCodecUls` (`src/mxf/ul_tables.h:82-84`) -- currently
   indistinguishable from plain XDCAM MPEG-2 once classified; needs its own
@@ -58,6 +112,13 @@ of it is realistic for a general-purpose ffmpeg-facing MXF reader.
   padding, verify decode produces the correct frame and doesn't choke.
 
 #### 2. AVC-Intra NAL normalization
+- **Update:** verified against two real Atomos Shogun files (XAVC-Intra and
+  XAVC-L, both H.264, see README's Phase 9) that raw passthrough decodes
+  every frame correctly with no NAL reframing at all -- both use Annex-B
+  start codes already, which is what avcodec's H.264 decoder expects by
+  default. Still unverified against AVCC-framed (length-prefixed) AVC-Intra
+  from other vendors, so this item isn't fully closed, but it's lower risk
+  than previously assumed.
 - Add a small bitstream helper (`src/codec/h264_bitstream.{h,cpp}`) that
   detects Annex-B (0x00000001 / 0x000001 start codes) vs AVCC
   (4-byte-length-prefixed) framing and normalizes to whichever
@@ -72,6 +133,15 @@ of it is realistic for a general-purpose ffmpeg-facing MXF reader.
   identically).
 
 #### 3. Verify ProRes and JPEG2000 decode paths
+- **Update:** ProRes verified against a real file, decodes correctly, but
+  surfaced a real gap worth fixing: `AvcodecDecoder` never sets
+  `AVCodecContext::codec_tag`, so avcodec can't identify which ProRes
+  sub-profile (Proxy/LT/422/HQ/4444/4444XQ) it's decoding and logs `Unknown
+  prores profile 0`. Fixing this needs an authoritative UL-suffix-byte ->
+  FourCC mapping (SMPTE RDD 44's picture coding register) verified against
+  more than one real sample -- don't guess it, a wrong FourCC could silently
+  produce worse output (e.g. mislabeling 4:4:4 content) than today's
+  harmless warning. JPEG2000 still has zero real samples available.
 - Extend `decoder_test.cpp`'s encode-then-decode round-trip pattern
   (`EncodeOneMpeg2Frame`, Phase 3) with `EncodeOneProResFrame` and
   `EncodeOneJpeg2000Frame` equivalents, using avcodec's own encoders as the
@@ -224,6 +294,19 @@ in README or the sample scripts yet).
   declared framecount (4500)` -- Header Metadata's declared Duration
   didn't match the essence actually present. The user said they'd inspect
   it themselves; this was never resolved in code.
+- **Update:** two real *causes* that produce this exact error message have
+  since been found and fixed (real Atomos Shogun XAVC-Intra/XAVC-L files,
+  see README's Phase 9): (a) `header_parser.cpp`'s RIP-based
+  `headerMetadataEnd` fixup jumping straight to the Footer Partition on
+  files with no separate Body Partition, and (b) `EssenceWalker` desyncing
+  on non-compliant raw zero-byte KAG padding. Both are now handled and
+  regression-tested. Whether either explains the original
+  `E:\20201112_001299.mxf` report is unconfirmed (that file isn't available
+  in this environment) -- if the error resurfaces on a real file, capture
+  its RIP entries/partition layout (see the fix's commit for the diagnostic
+  approach: dump the Random Index Pack, the partition kind at each entry,
+  and a hex scan from `headerMetadataEnd` for any non-KLV-shaped bytes)
+  before assuming it's a new root cause.
 - Before implementing a fix, revisit what the user found. Options to weigh
   once the actual cause is known: fail hard (current behavior -- safest,
   most honest about a real mismatch), clamp `numFrames` down to whatever
