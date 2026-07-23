@@ -298,6 +298,18 @@ void SourceEngine::DecodeThreadMain() {
     }
   }
 
+  // Recycled from the ring buffer's most recent eviction (see
+  // FrameBuffer::Put) whenever nothing else still holds a reference to it --
+  // reusing its already-resident plane buffers avoids paying fresh
+  // heap-allocation/OS-page-fault cost on every single decoded frame, which
+  // real-file benchmarking found was dwarfing actual codec decode time (tens
+  // of ms/frame reallocating multi-MB buffers vs ~1-2ms of real H.264
+  // decode). Only reused when use_count() == 1: anything higher means a
+  // consumer (e.g. the AVS/VS adapter) is still holding the shared_ptr from
+  // an earlier Get(), so mutating it in place would corrupt data out from
+  // under that caller.
+  std::shared_ptr<NormalizedFrame> recycled;
+
   for (;;) {
     const int64_t next = videoBuffer_->NextIndex();
     if (next >= streamInfo_.numFrames) {
@@ -306,14 +318,19 @@ void SourceEngine::DecodeThreadMain() {
     }
     if (!videoBuffer_->WaitForCapacity(next)) return;  // shutdown requested
 
-    auto frame = std::make_shared<NormalizedFrame>();
+    std::shared_ptr<NormalizedFrame> frame;
+    if (recycled && recycled.use_count() == 1) {
+      frame = std::move(recycled);
+    } else {
+      frame = std::make_shared<NormalizedFrame>();
+    }
     if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, *frame)) {
       videoBuffer_->SignalError("MXF essence ended before reaching the declared frame count (" +
                                  std::to_string(streamInfo_.numFrames) + ")");
       return;
     }
 
-    videoBuffer_->Put(next, std::move(frame));
+    recycled = videoBuffer_->Put(next, std::move(frame)).value_or(nullptr);
   }
 }
 

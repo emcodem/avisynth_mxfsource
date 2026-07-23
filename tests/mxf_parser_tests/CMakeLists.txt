@@ -4,6 +4,13 @@ add_executable(mxf_parser_tests
 target_link_libraries(mxf_parser_tests PRIVATE mxf_core)
 add_test(NAME mxf_parser_smoke_test COMMAND mxf_parser_tests)
 
+add_executable(mxf_frame_buffer_tests
+  frame_buffer_test.cpp
+)
+target_compile_features(mxf_frame_buffer_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_frame_buffer_tests PRIVATE mxf_core)
+add_test(NAME mxf_frame_buffer_tests COMMAND mxf_frame_buffer_tests)
+
 add_executable(mxf_header_parser_tests
   header_parser_test.cpp
 )

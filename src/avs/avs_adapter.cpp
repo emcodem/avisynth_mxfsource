@@ -147,6 +147,16 @@ class MxfSource final : public IClip {
     // of relying on that engine-internal locking to also guard our own
     // public entry points.
     if (cachehints == CACHE_GET_MTMODE) return MT_SERIALIZED;
+    // Without this, AviSynth+'s script interpreter auto-inserts a generic
+    // Cache filter after us (its compatibility fallback for filters that
+    // don't declare an opinion) -- pure redundancy on top of SourceEngine's
+    // own bounded ring buffer (OpenOptions::buffer_frames), and the
+    // VapourSynth adapter's real-file testing found that exact class of
+    // extra host-side cache growing unbounded and degrading throughput over
+    // a run (see vs_adapter.cpp's setCacheMode(cmForceDisable) fix and its
+    // comment for the measured effect). Declaring CACHE_DONT_CACHE_ME here
+    // is the AviSynth+ equivalent of that fix.
+    if (cachehints == CACHE_DONT_CACHE_ME) return 1;
     return 0;
   }
 

@@ -73,16 +73,24 @@ class FrameBuffer {
 
   // Stores `value` at `index`, which must equal NextIndex() at the time of
   // the call. Evicts the oldest buffered frame first if the window is
-  // already at capacity.
-  void Put(int64_t index, T value) {
+  // already at capacity, handing that evicted value back to the caller
+  // (instead of just destroying it) so the producer can recycle its
+  // allocation for a future Put() -- see SourceEngine::DecodeThreadMain,
+  // where this is the difference between allocating a fresh multi-MB
+  // NormalizedFrame per frame (paying OS page-fault cost on every single
+  // decode) and reusing one whose buffers are already resident.
+  std::optional<T> Put(int64_t index, T value) {
     std::lock_guard<std::mutex> lock(mutex_);
+    std::optional<T> evicted;
     if (highestProduced_ >= 0 && index - lowestValid_ + 1 > capacity_) {
+      evicted = std::move(slots_[SlotOf(lowestValid_)]);
       slots_[SlotOf(lowestValid_)].reset();
       ++lowestValid_;
     }
     slots_[SlotOf(index)] = std::move(value);
     highestProduced_ = index;
     cv_.notify_all();
+    return evicted;
   }
 
   void SignalEndOfStream() {

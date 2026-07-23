@@ -21,7 +21,16 @@ endforeach()
 
 # No compression/cookie-jar/netrc features needed for reading MXF byte
 # ranges; skip zlib so Unix builds don't need a system zlib dev package.
+# CURL_ZSTD must be forced off too: curl's CMakeLists auto-detects and
+# links a system zstd if find_package(zstd) succeeds (e.g. a machine with
+# a conda/miniforge environment on its CMAKE_PREFIX_PATH), and that zstd is
+# typically a *shared* library -- silently pulling zstd.dll in as an
+# undeployed transitive dependency of what's otherwise built fully static
+# (see this file's own header comment). Confirmed as the exact cause of
+# mxfsource_vs.dll failing to load in a real VapourSynth host
+# (GetLastError 126) on a machine with such a zstd package installed.
 set(CURL_ZLIB OFF CACHE BOOL "" FORCE)
+set(CURL_ZSTD OFF CACHE BOOL "" FORCE)
 set(CURL_USE_LIBPSL OFF CACHE BOOL "" FORCE)
 set(CURL_DISABLE_COOKIES ON CACHE BOOL "" FORCE)
 set(CURL_DISABLE_NETRC ON CACHE BOOL "" FORCE)

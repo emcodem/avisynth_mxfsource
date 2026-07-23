@@ -211,8 +211,27 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   d->bytesPerSample = fmtInfo.bytesPerSample;
   d->engine = std::move(engine);
 
-  vsapi->createVideoFilter(out, "MxfSource", &d->vi, MxfSourceGetFrame, MxfSourceFree, fmUnordered, nullptr, 0, d,
-                            core);
+  // Explicitly disabled (cmForceDisable) rather than left at VS core's
+  // default cmAuto: SourceEngine already provides its own bounded
+  // ring-buffer window (OpenOptions::buffer_frames), so an additional
+  // generic VS-core cache on top is pure redundancy -- and, worse, real
+  // testing (vspipe piping this filter's entire output, which issues many
+  // concurrent frame requests) showed VS core's automatic cache retaining
+  // frames for the *whole file* with no eviction, growing without bound
+  // (538 4K 4:2:2 10-bit frames is ~18GB) and making per-frame throughput
+  // degrade continuously over the run (25fps -> 10fps) instead of holding
+  // steady. Mirrors avs_adapter.cpp's MT_SERIALIZED choice: this class owns
+  // the one source of caching/threading truth, so the host's own generic
+  // mechanism is turned off rather than layered on top.
+  VSNode* node = vsapi->createVideoFilter2("MxfSource", &d->vi, MxfSourceGetFrame, MxfSourceFree, fmUnordered,
+                                            nullptr, 0, d, core);
+  if (!node) {
+    vsapi->mapSetError(out, "MxfSource: failed to create filter node");
+    return;
+  }
+  vsapi->setCacheMode(node, cmForceDisable);
+  vsapi->mapSetNode(out, "clip", node, maAppend);
+  vsapi->freeNode(node);
 }
 
 }  // namespace
