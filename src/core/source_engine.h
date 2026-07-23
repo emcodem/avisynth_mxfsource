@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "core/options.h"
 #include "mxf/essence_walker.h"
 #include "mxf/header_parser.h"
+#include "mxf/index_table.h"
 #include "mxf/klv.h"
 
 namespace mxfsrc {
@@ -27,6 +29,10 @@ struct ServeStats {
   mutable std::mutex mutex;
   int64_t bufferedCount = 0;
   std::vector<int64_t> nonBufferedFrames;
+  // How many SeekAndDecode() calls found a usable Index Table Segment entry
+  // (mxf/index_table.h) and started decoding from a nearby keyframe instead
+  // of essence element 0 -- see SourceEngine::videoIndex_.
+  int64_t indexAssistedSeeks = 0;
 
   void RecordBufferedServe() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -35,6 +41,10 @@ struct ServeStats {
   void RecordNonBufferedServe(int64_t n) {
     std::lock_guard<std::mutex> lock(mutex);
     nonBufferedFrames.push_back(n);
+  }
+  void RecordIndexAssistedSeek() {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++indexAssistedSeeks;
   }
 };
 
@@ -110,6 +120,20 @@ class SourceEngine {
     std::lock_guard<std::mutex> lock(stats_.mutex);
     return stats_.nonBufferedFrames;
   }
+  // How many SeekAndDecode() calls used an Index Table Segment-derived
+  // keyframe offset instead of decoding forward from essence element 0 --
+  // see videoIndex_.
+  int64_t IndexAssistedSeekCount() const {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    return stats_.indexAssistedSeeks;
+  }
+
+  // Diagnostics for manual tools (see tests/mxf_parser_tests/read_test_mxf.cpp):
+  // whether a usable Index Table Segment-derived lookup was built at all,
+  // and how far it reaches. videoIndex_ is populated once in Open() and
+  // never mutated afterward, so no locking is needed to read it.
+  bool HasEssenceIndex() const { return videoIndex_.has_value() && !videoIndex_->Empty(); }
+  int64_t EssenceIndexHighestEditUnit() const { return videoIndex_ ? videoIndex_->HighestCoveredEditUnit() : -1; }
 
  private:
   void DecodeThreadMain();
@@ -135,6 +159,13 @@ class SourceEngine {
   int64_t originSkip_ = 0;
   std::unique_ptr<MxfReader> reader_;
   MxfStreamInfo streamInfo_;
+  // Best-effort Index Table lookup (mxf/index_table.h), built once in
+  // Open() and never mutated afterward -- read-only, no locking needed,
+  // same immutable-after-Open() lifecycle as streamInfo_ itself. nullopt if
+  // no usable Index Table Segment was found for streamInfo_.bodySid --
+  // SeekAndDecode() falls back to its original from-essence-element-0
+  // behavior whenever this is unset, so absence is never a hard failure.
+  std::optional<EssenceIndex> videoIndex_;
   std::unique_ptr<EssenceWalker> walker_;
   std::unique_ptr<Decoder> videoDecoder_;
   std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;

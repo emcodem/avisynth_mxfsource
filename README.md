@@ -122,6 +122,37 @@ Current status:
   table change). Verified end-to-end against the real files with
   `read_test_mxf` (every frame of both files decodes correctly), not just
   synthetic unit tests.
+- **Phase 10 (Index Table Segment reading for real random-access seeks) --
+  done.** New `src/mxf/index_table.h/.cpp` parses MXF Index Table Segments
+  (SMPTE 377-1 SS10, key/tags verified against FFmpeg's mxfdec.c/mxfenc.c)
+  and builds a flattened, binary-searchable per-BodySID lookup
+  (`EssenceIndex`) supporting both CBR (`EditUnitByteCount` formula) and
+  VBR (`IndexEntryArray`, via a new batch reader -- `GetUlArray` wasn't
+  reusable, it's hardcoded to 16-byte-UL batches) edit units, stitched
+  across multiple segments/partitions where present.
+  `SourceEngine::SeekAndDecode`'s GOP-based branch (previously always a
+  full O(target) redecode from essence element 0 for every out-of-window
+  request -- the real mechanism behind slow/janky scrubbing for long-GOP
+  codecs like XDCAM MPEG-2 and XAVC-L) now consults this index first: when
+  it resolves, decode starts from the nearest preceding keyframe's byte
+  offset instead, exposed via a new `IndexAssistedSeekCount()` diagnostic.
+  Absent or inapplicable index (nothing found, target outside every
+  covered range) degrades silently to the original from-0 behavior --
+  purely additive, verified via the existing intra-only fast path and a
+  new synthetic-GOP regression suite remaining unaffected. Also unblocks
+  the frame-count fallback: `Open()` now derives `numFrames` from the
+  index's own covered range when Header Metadata's Duration is absent.
+  Real-file verification (`read_test_mxf`, extended to report index
+  coverage) against the Phase 9 XAVC-L file found and fixed a second
+  instance of that phase's zero-byte-KAG-padding bug -- this time in the
+  new Index Table scanner, not `EssenceWalker` -- fixed by promoting the
+  resync helpers to shared utilities in `mxf/klv.h/.cpp`. Confirmed against
+  the real file: index built, covers all 3115 frames, a genuine
+  eviction-forced seek resolved via the index and decoded correctly. New
+  tests: `tests/mxf_parser_tests/index_table_test.cpp` (13 cases) plus
+  `source_engine_test.cpp` additions using a real encoded MPEG-2 I/P-frame
+  sequence (avcodec's own encoder) to prove byte-identical output both with
+  and without an index present.
 
 ## Build
 

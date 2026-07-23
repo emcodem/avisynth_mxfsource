@@ -26,6 +26,8 @@ int main(int argc, char** argv) {
   }
   const auto& info = engine.StreamInfo();
   std::cout << "opened: " << info.width << "x" << info.height << " numFrames=" << info.numFrames << std::endl;
+  std::cout << "essenceIndex: built=" << engine.HasEssenceIndex()
+             << " highestCoveredEditUnit=" << engine.EssenceIndexHighestEditUnit() << std::endl;
 
   for (int64_t i = 0; i < info.numFrames; ++i) {
     std::shared_ptr<NormalizedFrame> frame;
@@ -41,5 +43,27 @@ int main(int argc, char** argv) {
               << std::endl;
   }
   std::cout << "all frames read ok" << std::endl;
+
+  // The sequential read above naturally evicted early frames from the ring
+  // buffer once it walked far enough past them (default buffer_frames=300),
+  // so re-requesting an early/mid frame now exercises SeekAndDecode's
+  // eviction-triggered fallback for real -- a direct probe of whether the
+  // Index Table Segment-assisted path (if this file has one) actually
+  // engages, not just whether sequential playback works.
+  if (info.numFrames > 10) {
+    const int64_t probeTarget = info.numFrames / 3;
+    std::shared_ptr<NormalizedFrame> frame;
+    std::string err;
+    FetchStatus st = engine.GetVideoFrame(probeTarget, frame, &err);
+    std::cout << "seek probe: requested frame " << probeTarget << " status=" << static_cast<int>(st);
+    if (st == FetchStatus::kOk) {
+      std::cout << " ok, firstByte=" << static_cast<int>(frame->planeData[0].empty() ? 0 : frame->planeData[0][0]);
+    } else {
+      std::cout << " err=" << err;
+    }
+    std::cout << std::endl;
+  }
+
+  std::cout << "indexAssistedSeeks=" << engine.IndexAssistedSeekCount() << std::endl;
   return 0;
 }

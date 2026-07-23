@@ -3,12 +3,19 @@
 // so the whole pipeline -- header parse, essence walk, decode, ring buffer,
 // background thread -- runs end to end without needing a real sample file.
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <thread>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+}
+
 #include "core/source_engine.h"
+#include "mxf/index_table.h"
 #include "synthetic_mxf.h"
 
 using namespace mxfsrc;
@@ -284,6 +291,49 @@ void TestRepeatedRequestForSameFrameSucceeds() {
   std::filesystem::remove(path);
 }
 
+// Regression test for a real deadlock found via a real file + real host
+// (AvsPmod): MxfSource(..., buffer_frames=1, eagerdecode=1/2) hung Open()
+// forever. Root cause was in FrameBuffer (frame_buffer.h): the eager-fill
+// window `index < watermark_ + margin_` used an initial watermark_ of -1,
+// so whenever margin_ (min(buffer_frames, eagerdecode)) was exactly 1, the
+// window became `index < 0` -- the producer could never produce even frame
+// 0, and Open()'s Peek(0) call (which deliberately never advances the
+// watermark) had nothing to wake it. Covers both buffer_frames=1 and
+// eagerdecode=1 individually, since either alone is enough to hit margin_=1.
+void TestOpenSucceedsWithMinimalBufferOrEagerdecode() {
+  const int width = 4, height = 2, numFrames = 5;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_minimal_margin.mxf");
+
+  for (int bufferFrames : {1, 300}) {
+    for (int eagerdecode : {1, 32}) {
+      if (bufferFrames == 300 && eagerdecode == 32) continue;  // that's every other test's default; skip here
+
+      SourceEngine engine;
+      OpenOptions opts;
+      opts.buffer_frames = bufferFrames;
+      opts.eagerdecode = eagerdecode;
+      OpenResult res = engine.Open(path.string(), opts);
+      CHECK(res.status == OpenStatus::kOk);
+      if (res.status != OpenStatus::kOk) {
+        std::cerr << "Open failed (buffer_frames=" << bufferFrames << " eagerdecode=" << eagerdecode
+                   << "): " << res.error << std::endl;
+        continue;
+      }
+
+      std::shared_ptr<NormalizedFrame> frame;
+      std::string err;
+      FetchStatus st = engine.GetVideoFrame(0, frame, &err);
+      CHECK(st == FetchStatus::kOk);
+      if (st != FetchStatus::kOk) {
+        std::cerr << "frame 0 failed (buffer_frames=" << bufferFrames << " eagerdecode=" << eagerdecode
+                   << "): " << err << std::endl;
+      }
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
 std::vector<uint8_t> BuildFileWithOrigin(int width, int height, int64_t essenceFrameCount, int64_t origin) {
   SyntheticFile cfg;
   cfg.width = width;
@@ -411,6 +461,279 @@ void TestOriginHandlingAppliesToSeekAndDecodeFallback() {
   std::filesystem::remove(path);
 }
 
+// MP@ML Long GoP (XDCAM) PictureEssenceCoding UL, from ul_tables.h --
+// classifies as CodecFamily::kMpeg2Video, IsIntraOnlyCodec==false, so
+// SourceEngine's GOP-based SeekAndDecode branch (the one Index Table
+// support targets) is what gets exercised, not the intra-only fast path.
+constexpr Ul kMpeg2LongGopCoding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x03,
+                                     0x04, 0x01, 0x02, 0x02, 0x01, 0x01, 0x11, 0x00};
+
+struct EncodedGopEntry {
+  std::vector<uint8_t> data;
+  bool isKeyframe = false;
+};
+
+// Encodes a real I/P-frame MPEG-2 sequence with avcodec's own encoder (same
+// "no real MXF/ES sample files are available in this environment" rationale
+// as decoder_test.cpp's EncodeOneMpeg2Frame, extended here with
+// gop_size > 1 for genuine inter-frame dependencies). max_b_frames is left
+// at 0 deliberately: B-frame reordering is orthogonal to what this test
+// verifies (the seek-to-keyframe mechanism only cares about each essence
+// element's own stored-order keyframe flag and byte offset, not display
+// order) and real B-frame content is already covered by this session's
+// real-file verification (XDCAM/XAVC-L, see README Phase 9) -- keeping
+// max_b_frames=0 here means output packet order == input frame order,
+// which keeps this synthetic test's bookkeeping simple and robust.
+std::vector<EncodedGopEntry> EncodeMpeg2Gop(int width, int height, int numFrames, int gopSize) {
+  std::vector<EncodedGopEntry> result;
+  const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+  if (!enc) return result;
+
+  AVCodecContext* encCtx = avcodec_alloc_context3(enc);
+  if (!encCtx) return result;
+  encCtx->width = width;
+  encCtx->height = height;
+  encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+  encCtx->time_base = {1, 25};
+  encCtx->framerate = {25, 1};
+  encCtx->gop_size = gopSize;
+  encCtx->max_b_frames = 0;
+
+  if (avcodec_open2(encCtx, enc, nullptr) < 0) {
+    avcodec_free_context(&encCtx);
+    return result;
+  }
+
+  AVFrame* frame = av_frame_alloc();
+  frame->format = AV_PIX_FMT_YUV420P;
+  frame->width = width;
+  frame->height = height;
+  if (av_frame_get_buffer(frame, 32) < 0) {
+    av_frame_free(&frame);
+    avcodec_free_context(&encCtx);
+    return result;
+  }
+
+  AVPacket* pkt = av_packet_alloc();
+  auto drainPackets = [&]() {
+    while (avcodec_receive_packet(encCtx, pkt) == 0) {
+      EncodedGopEntry entry;
+      entry.data.assign(pkt->data, pkt->data + pkt->size);
+      entry.isKeyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+      result.push_back(std::move(entry));
+      av_packet_unref(pkt);
+    }
+  };
+
+  for (int i = 0; i < numFrames; ++i) {
+    std::memset(frame->data[0], static_cast<uint8_t>(16 + i), static_cast<size_t>(frame->linesize[0]) * height);
+    std::memset(frame->data[1], 128, static_cast<size_t>(frame->linesize[1]) * ((height + 1) / 2));
+    std::memset(frame->data[2], 128, static_cast<size_t>(frame->linesize[2]) * ((height + 1) / 2));
+    frame->pts = i;
+    if (avcodec_send_frame(encCtx, frame) < 0) break;
+    drainPackets();
+  }
+  avcodec_send_frame(encCtx, nullptr);  // flush
+  drainPackets();
+
+  av_packet_free(&pkt);
+  av_frame_free(&frame);
+  avcodec_free_context(&encCtx);
+  return result;
+}
+
+// Byte length of AppendBerLength's encoding for `length`, without writing
+// anything -- needed to predict each essence element's exact absolute file
+// offset before the file is actually built (see BuildGopFile).
+size_t BerLengthSize(uint64_t length) {
+  if (length < 0x80) return 1;
+  size_t n = 0;
+  uint64_t v = length;
+  do {
+    ++n;
+    v >>= 8;
+  } while (v != 0);
+  return 1 + n;
+}
+
+// Builds a GOP-shaped synthetic OP1a file from already-encoded MPEG-2
+// packets. When `includeIndexTable` is true, a Body Partition carries a
+// correctly-populated Index Table Segment (VBR: one entry per essence
+// element, Flags derived from each packet's real keyframe-ness,
+// StreamOffset computed to exactly match where that element's KLV actually
+// ends up in the file) ahead of the essence; when false, the Body
+// Partition carries no index at all (IndexByteCount=0), exercising the
+// unchanged legacy from-essence-element-0 fallback.
+std::vector<uint8_t> BuildGopFile(const std::vector<EncodedGopEntry>& entries, int width, int height,
+                                    uint32_t trackNumber, bool includeIndexTable) {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = static_cast<int64_t>(entries.size());
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = trackNumber;
+  cfg.pictureEssenceCoding = kMpeg2LongGopCoding;
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+
+  if (!includeIndexTable) {
+    AppendPartitionPack(file, PartitionKind::kBody);
+    for (const auto& e : entries) AppendEssenceElement(file, trackNumber, e.data);
+    return file;
+  }
+
+  IndexTableSegmentSpec segSpec;
+  segSpec.indexStartPosition = 0;
+  segSpec.indexDuration = static_cast<int64_t>(entries.size());
+  segSpec.indexSid = 1;
+  segSpec.bodySid = 1;
+  for (const auto& e : entries) segSpec.entries.push_back({e.isKeyframe ? uint8_t{0x00} : uint8_t{0x30}, 0});
+
+  // Fixed-width fields throughout -- the segment's serialized size doesn't
+  // depend on the actual StreamOffset values, only on entry count, so a
+  // placeholder-offset build (all zero) already tells us exactly how large
+  // the real segment will be, letting us compute essenceContainerBaseOffset
+  // (and therefore every element's correct relative StreamOffset) before
+  // writing anything's final content.
+  std::vector<uint8_t> placeholderSegBytes;
+  AppendIndexTableSegment(placeholderSegBytes, segSpec);
+
+  const uint64_t bodyPartitionOffset = file.size();
+  AppendPartitionPack(file, PartitionKind::kBody, placeholderSegBytes.size(), /*indexSid=*/1);
+  const uint64_t essenceContainerBaseOffset = file.size() + placeholderSegBytes.size();
+
+  uint64_t cursor = essenceContainerBaseOffset;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    segSpec.entries[i].streamOffset = cursor - essenceContainerBaseOffset;
+    cursor += 16 + BerLengthSize(entries[i].data.size()) + entries[i].data.size();
+  }
+
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, segSpec);
+  // Sanity: fixed-width fields mean patching in real offsets never changes
+  // the segment's serialized size versus the placeholder used above.
+  if (segBytes.size() != placeholderSegBytes.size()) {
+    std::cerr << "BuildGopFile: unexpected Index Table Segment size mismatch" << std::endl;
+  }
+
+  file.insert(file.end(), segBytes.begin(), segBytes.end());
+  for (const auto& e : entries) AppendEssenceElement(file, trackNumber, e.data);
+
+  // EnumeratePartitionsForIndex (mxf/index_table.h) only ever knows about
+  // the Header Partition (offset 0) automatically -- discovering the Body
+  // Partition (where the Index Table Segment above actually lives) requires
+  // a RIP, exactly like a real multi-partition file.
+  AppendRandomIndexPack(file, {{1, 0}, {1, bodyPartitionOffset}});
+  return file;
+}
+
+// Decodes every frame [0, count) sequentially via the normal ring-buffer
+// path (ample buffer_frames, no eviction) -- the ground-truth reference
+// this test compares targeted/seek-driven decodes against.
+std::vector<std::vector<uint8_t>> DecodeAllSequentially(const std::string& path, int64_t count) {
+  std::vector<std::vector<uint8_t>> planes(static_cast<size_t>(count));
+  SourceEngine engine;
+  OpenResult res = engine.Open(path);
+  if (res.status != OpenStatus::kOk) {
+    std::cerr << "DecodeAllSequentially: Open failed: " << res.error << std::endl;
+    return planes;
+  }
+  for (int64_t i = 0; i < count; ++i) {
+    std::shared_ptr<NormalizedFrame> frame;
+    std::string err;
+    if (engine.GetVideoFrame(i, frame, &err) != FetchStatus::kOk) {
+      std::cerr << "DecodeAllSequentially: frame " << i << " failed: " << err << std::endl;
+      continue;
+    }
+    planes[static_cast<size_t>(i)] = frame->planeData[0];
+  }
+  return planes;
+}
+
+constexpr uint32_t kGopTrackNumber = 0x02020200;
+constexpr int kGopWidth = 16, kGopHeight = 16, kGopSize = 5, kGopNumFrames = 15;
+
+// Baseline: with no Index Table Segment at all, SeekAndDecode's GOP branch
+// must still behave exactly as before this feature -- a full forward
+// decode from essence element 0 -- and produce pixel-identical output to
+// sequential playback for a real, genuinely inter-predicted (long-GOP)
+// codec, not just the uncompressed intra-only synthetic files the rest of
+// this file's tests use.
+void TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex() {
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
+  if (encoded.size() != static_cast<size_t>(kGopNumFrames)) return;
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(bytes, "mxfsrc_test_gop_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kGopNumFrames);
+  std::filesystem::remove(referencePath);
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_no_index.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 2;  // window=[13,14] after jumping to the last frame -- target below must be genuinely evicted
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      CHECK(engine.GetVideoFrame(kGopNumFrames - 1, frame, nullptr) == FetchStatus::kOk);  // evicts everything below 13
+
+      constexpr int64_t kTarget = 10;  // start of the third GOP -- well outside the [13,14] window
+      FetchStatus st = engine.GetVideoFrame(kTarget, frame, nullptr);
+      CHECK(st == FetchStatus::kOk);
+      if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
+      CHECK(!engine.NonBufferedServedFrames().empty());  // confirms the fallback path was genuinely exercised
+      CHECK(engine.IndexAssistedSeekCount() == 0);        // no Index Table in this file -- never index-assisted
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// With an Index Table Segment present, an eviction-triggered SeekAndDecode
+// call for a GOP-based codec must use it: FindPrecedingKeyframe resolves a
+// byte offset closer than essence element 0 (here, exactly the target
+// GOP's own keyframe), decode starts a brand-new freshDecoder there instead
+// of from element 0. (Note: deliberately corrupting an earlier GOP to
+// "prove" the corrupted bytes are never touched, as originally planned,
+// turns out to be untestable through the public API -- GetVideoFrame only
+// ever calls SeekAndDecode for a frame that the primary background thread
+// already decoded successfully and then evicted, and that thread always
+// decodes sequentially from element 0 first, so any earlier corruption
+// poisons the whole engine before eviction can even occur. The counter
+// check below is the direct, authoritative proof of use instead.)
+void TestIndexTableAssistedSeekUsesIndexAndMatchesReference() {
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
+  if (encoded.size() != static_cast<size_t>(kGopNumFrames)) return;
+
+  auto referenceBytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_idx_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kGopNumFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_with_index.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 2;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      CHECK(engine.GetVideoFrame(kGopNumFrames - 1, frame, nullptr) == FetchStatus::kOk);  // evicts everything below 13
+
+      constexpr int64_t kTarget = 10;  // start of the third GOP -- itself a keyframe
+      FetchStatus st = engine.GetVideoFrame(kTarget, frame, nullptr);
+      CHECK(st == FetchStatus::kOk);
+      if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
+      CHECK(!engine.NonBufferedServedFrames().empty());
+      CHECK(engine.IndexAssistedSeekCount() > 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 void TestUnsupportedCodecFailsOpenCleanly() {
   SyntheticFile cfg;
   cfg.sequenceDuration = 1;
@@ -438,9 +761,12 @@ int main() {
   TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames();
   TestOpenPeekDoesNotEvictFrameZero();
   TestRepeatedRequestForSameFrameSucceeds();
+  TestOpenSucceedsWithMinimalBufferOrEagerdecode();
   TestOriginHandlingSkipsPreRollByDefault();
   TestHandleOriginFalseDisablesSkip();
   TestOriginHandlingAppliesToSeekAndDecodeFallback();
+  TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex();
+  TestIndexTableAssistedSeekUsesIndexAndMatchesReference();
   TestUnsupportedCodecFailsOpenCleanly();
 
   if (g_failures == 0) {

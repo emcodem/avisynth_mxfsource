@@ -92,4 +92,24 @@ struct KlvHeader {
 // whether to read or skip it (via Seek(valueOffset + length)).
 bool ReadKlvHeader(MxfReader& reader, KlvHeader& out);
 
+// Every legitimate KLV key begins with the SMPTE UL registry designator
+// (06.0E.2B.34, ST 298). Some real-world recorders (observed: Atomos Shogun
+// XAVC-Intra/XAVC-L recordings) pad a partition out to a KAG boundary using
+// raw zero bytes instead of a spec-compliant KLV Fill Item -- such a run of
+// zeros parses as a spurious zero-length "KLV" with an all-zero key, and
+// naively trusting its (bogus) length field walks forward one KLV-header's
+// worth of bytes at a time, which is generally not a multiple of the
+// actual pad length. That desyncs a naive walk so it lands misaligned
+// inside real KLV data afterward and fails outright instead of just
+// skipping the padding. Shared by EssenceWalker and the Index Table
+// Segment partition scanner (mxf/index_table.h), both of which walk
+// forward through a byte range that can contain this kind of padding.
+bool LooksLikeKlvKey(const Ul& key);
+
+// Scans forward byte-by-byte from the reader's current position for the
+// next occurrence of the UL designator, leaving the reader positioned
+// exactly at its first byte so the caller can retry ReadKlvHeader there.
+// Returns false if the designator never occurs before EOF.
+bool ResyncToUlDesignator(MxfReader& reader);
+
 }  // namespace mxfsrc

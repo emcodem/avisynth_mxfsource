@@ -104,4 +104,29 @@ bool ReadKlvHeader(MxfReader& reader, KlvHeader& out) {
   return true;
 }
 
+namespace {
+constexpr uint8_t kUlDesignator[4] = {0x06, 0x0e, 0x2b, 0x34};
+}
+
+bool LooksLikeKlvKey(const Ul& key) { return std::memcmp(key.data(), kUlDesignator, sizeof(kUlDesignator)) == 0; }
+
+bool ResyncToUlDesignator(MxfReader& reader) {
+  uint8_t window[4] = {};
+  size_t have = 0;
+  while (reader.Tell() < reader.Size()) {
+    uint8_t b = 0;
+    if (!reader.ReadU8(b)) return false;
+    if (have < 4) {
+      window[have++] = b;
+    } else {
+      window[0] = window[1];
+      window[1] = window[2];
+      window[2] = window[3];
+      window[3] = b;
+    }
+    if (have == 4 && std::memcmp(window, kUlDesignator, 4) == 0) return reader.Seek(reader.Tell() - 4);
+  }
+  return false;
+}
+
 }  // namespace mxfsrc

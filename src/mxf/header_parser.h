@@ -36,6 +36,12 @@ struct MxfStreamInfo {
                                     // walk starts scanning for the first Body Partition from here.
   bool footerPartitionPresent = false;
 
+  // Header Partition Pack's own BodySID field (see mxf/partition.h's
+  // PartitionPack) -- identifies which essence container this file's video
+  // belongs to, used to correlate against an Index Table Segment's own
+  // BodySID when building mxf/index_table.h's EssenceIndex.
+  uint32_t bodySid = 0;
+
   // SourcePackage video Track.Origin (baseline tag 0x4B02): how many frames
   // of pre-roll/trim sit at the start of the essence container before the
   // MaterialPackage's intended playable range begins. 0 if the file has no

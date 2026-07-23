@@ -132,11 +132,24 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   originSkip_ = options.handle_origin ? streamInfo_.origin : 0;
   if (originSkip_ < 0) originSkip_ = 0;
 
+  // Best-effort: absent/failed index building degrades silently to
+  // videoIndex_ staying nullopt, which SeekAndDecode already treats as "no
+  // index available, use the from-essence-element-0 fallback" -- never a
+  // hard Open() failure.
+  videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
+
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
   if (streamInfo_.numFrames < 0) {
-    return {OpenStatus::kParseError,
-            "unable to determine frame count from Header Metadata (RIP/Index Table and essence-count "
-            "fallback are not yet implemented, see plan Phase 1 Duration fallback chain step 5)"};
+    if (videoIndex_ && !videoIndex_->Empty()) {
+      // Natural fallback win: an Index Table Segment's own covered range
+      // supplies a frame count when Header Metadata's Duration is absent.
+      streamInfo_.numFrames = videoIndex_->HighestCoveredEditUnit() + 1;
+    }
+    if (streamInfo_.numFrames < 0) {
+      return {OpenStatus::kParseError,
+              "unable to determine frame count from Header Metadata (no Index Table Segment either; "
+              "essence-count fallback not yet implemented, see plan Phase 1 Duration fallback chain step 5)"};
+    }
   }
 
   videoDecoder_ = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
@@ -193,9 +206,6 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
                                           static_cast<int>(streamInfo_.height));
   if (!freshDecoder) return nullptr;
 
-  EssenceWalker freshWalker(freshReader, streamInfo_.headerMetadataEnd, streamInfo_.videoTrackNumber,
-                             streamInfo_.hasVideo, streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
-
   auto frame = std::make_shared<NormalizedFrame>();
 
   // Host frame index `target` maps to essence video element index
@@ -206,7 +216,12 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     // No frame depends on any other for these codecs -- every essence
     // element already *is* its own anchor, so skip every video frame
     // before the target without decoding any of them (much cheaper than a
-    // full decode), then decode only the target frame itself.
+    // full decode), then decode only the target frame itself. EssenceWalker
+    // is constructed here (not shared with the GOP branch below) since it
+    // holds a reference member and can't be reassigned once the branch's
+    // own start offset is known.
+    EssenceWalker freshWalker(freshReader, streamInfo_.headerMetadataEnd, streamInfo_.videoTrackNumber,
+                               streamInfo_.hasVideo, streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
     for (int64_t i = 0; i < essenceTarget; ++i) {
       if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
     }
@@ -225,13 +240,28 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     return frame;
   }
 
-  // GOP-based codec (e.g. XDCAM long-GOP MPEG-2): no known anchor without
-  // reading an Index Table Segment/RIP or inspecting the bitstream for
-  // I-frame boundaries, neither of which is implemented yet (see plan
-  // Phase 7 notes) -- decode forward from the very start of essence, which
-  // is always correct, just not optimally fast.
+  // GOP-based codec (e.g. XDCAM long-GOP MPEG-2, XAVC-L): consult the Index
+  // Table-derived lookup (mxf/index_table.h), if available, for a byte
+  // offset closer than essence element 0 -- FindPrecedingKeyframe only ever
+  // returns an actual I-frame's offset, so restarting a brand-new decoder
+  // there is valid; startEditUnit is handed back alongside startOffset so
+  // the decode-forward loop below knows exactly how many more frames it
+  // still needs (rather than needing to infer it from the byte offset).
+  // Absent/inapplicable index -> unchanged from-essence-element-0 behavior.
+  uint64_t startOffset = streamInfo_.headerMetadataEnd;
+  int64_t startEditUnit = 0;
+  if (videoIndex_) {
+    if (auto seekPoint = videoIndex_->FindPrecedingKeyframe(essenceTarget)) {
+      startOffset = seekPoint->byteOffset;
+      startEditUnit = seekPoint->editUnit;
+      stats_.RecordIndexAssistedSeek();
+    }
+  }
+
+  EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
+                             streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
   bool essenceExhausted = false;
-  for (int64_t i = 0; i <= essenceTarget; ++i) {
+  for (int64_t i = startEditUnit; i <= essenceTarget; ++i) {
     if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, *frame)) return nullptr;
   }
   return frame;

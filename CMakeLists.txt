@@ -58,6 +58,8 @@ add_library(mxf_core STATIC
   src/mxf/header_parser.h
   src/mxf/essence_walker.cpp
   src/mxf/essence_walker.h
+  src/mxf/index_table.cpp
+  src/mxf/index_table.h
   src/mxf/ul_tables.h
   src/codec/decoder.h
   src/codec/raw_unpack.cpp

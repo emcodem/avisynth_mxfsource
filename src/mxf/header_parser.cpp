@@ -314,9 +314,11 @@ bool TryOverrideFromFooterPartition(MxfReader& reader, uint64_t candidateOffset,
 
   const uint64_t savedHeaderMetadataEnd = info.headerMetadataEnd;
   const bool savedFooterPartitionPresent = info.footerPartitionPresent;
+  const uint32_t savedBodySid = info.bodySid;
   info = footerInfo;
   info.headerMetadataEnd = savedHeaderMetadataEnd;
   info.footerPartitionPresent = savedFooterPartitionPresent;
+  info.bodySid = savedBodySid;
   return true;
 }
 
@@ -351,6 +353,7 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   MxfStreamInfo info = ResolveStreamInfo(headerSets);
   info.headerMetadataEnd = headerMetadataEnd;
   info.footerPartitionPresent = partition->footerPartition != 0;
+  info.bodySid = partition->bodySid;
 
   // The Random Index Pack (see mxf/partition.h), if present, is read once
   // and used for two independent fixups below -- both observed on a real

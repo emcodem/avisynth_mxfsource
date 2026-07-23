@@ -167,7 +167,17 @@ class FrameBuffer {
   std::vector<std::optional<T>> slots_;
   int64_t lowestValid_ = 0;
   int64_t highestProduced_ = -1;
-  int64_t watermark_ = -1;
+  // Starts at 0, not -1: WaitForCapacity's eager-fill window is `index <
+  // watermark_ + margin_`, and margin_ can be as small as 1 (buffer_frames=1
+  // or eagerdecode=1, both legal). With watermark_ == -1, that window becomes
+  // `index < 0`, which no frame index ever satisfies -- the producer could
+  // never produce even frame 0, and Open()'s initial Peek(0) (which
+  // deliberately never advances the watermark, see Peek's own comment) would
+  // block forever with no consumer ever arriving to unblock it. Starting at 0
+  // guarantees the window always covers frame 0 regardless of how small
+  // margin_ is. Found via a real file opened with buffer_frames=1: Open()
+  // hung indefinitely in AvsPmod.
+  int64_t watermark_ = 0;
   bool endOfStream_ = false;
   bool shutdown_ = false;
   std::optional<std::string> error_;

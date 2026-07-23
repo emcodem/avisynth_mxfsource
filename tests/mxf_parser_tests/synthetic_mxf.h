@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "mxf/essence_walker.h"
+#include "mxf/index_table.h"
 #include "mxf/klv.h"
 #include "mxf/partition.h"
 
@@ -272,7 +273,8 @@ inline std::vector<uint8_t> BuildSyntheticHeader(const SyntheticFile& cfg) {
 // header_parser.cpp's ReadPartitionPackValue). Field contents beyond the
 // discriminator bytes in `key` don't matter for EssenceWalker, which skips
 // every Partition Pack unconditionally.
-inline void AppendPartitionPack(std::vector<uint8_t>& buf, mxfsrc::PartitionKind kind) {
+inline void AppendPartitionPack(std::vector<uint8_t>& buf, mxfsrc::PartitionKind kind, uint64_t indexByteCount = 0,
+                                  uint32_t indexSid = 0) {
   uint8_t discriminator = kind == mxfsrc::PartitionKind::kBody ? 0x03 : 0x04;
   Ul key = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01,
             0x0d, 0x01, 0x02, 0x01, 0x01, discriminator, 0x01, 0x00};
@@ -284,8 +286,8 @@ inline void AppendPartitionPack(std::vector<uint8_t>& buf, mxfsrc::PartitionKind
   AppendU64BE(buf, 0);  // PreviousPartition
   AppendU64BE(buf, 0);  // FooterPartition
   AppendU64BE(buf, 0);  // HeaderByteCount
-  AppendU64BE(buf, 0);  // IndexByteCount
-  AppendU32BE(buf, 0);  // IndexSID
+  AppendU64BE(buf, indexByteCount);
+  AppendU32BE(buf, indexSid);
   AppendU64BE(buf, 0);  // BodyOffset
   AppendU32BE(buf, 1);  // BodySID
   Ul zeroUl{};
@@ -312,7 +314,8 @@ enum class TestPartitionStatus : uint8_t {
 // final values. See BuildFooterPrecedenceTestFile.
 inline void AppendPartitionPackWithFields(std::vector<uint8_t>& buf, mxfsrc::PartitionKind kind,
                                             TestPartitionStatus status, uint64_t thisPartition,
-                                            uint64_t footerPartitionOffset, uint64_t headerByteCount) {
+                                            uint64_t footerPartitionOffset, uint64_t headerByteCount,
+                                            uint64_t indexByteCount = 0, uint32_t indexSid = 0) {
   uint8_t kindByte = 0x02;
   if (kind == mxfsrc::PartitionKind::kBody) kindByte = 0x03;
   if (kind == mxfsrc::PartitionKind::kFooter) kindByte = 0x04;
@@ -326,8 +329,8 @@ inline void AppendPartitionPackWithFields(std::vector<uint8_t>& buf, mxfsrc::Par
   AppendU64BE(buf, 0);  // PreviousPartition
   AppendU64BE(buf, footerPartitionOffset);
   AppendU64BE(buf, headerByteCount);
-  AppendU64BE(buf, 0);  // IndexByteCount
-  AppendU32BE(buf, 0);  // IndexSID
+  AppendU64BE(buf, indexByteCount);
+  AppendU32BE(buf, indexSid);
   AppendU64BE(buf, 0);  // BodyOffset
   AppendU32BE(buf, 1);  // BodySID
   Ul zeroUl{};
@@ -415,6 +418,72 @@ inline std::vector<uint8_t> BuildRipFooterFallbackTestFile(const SyntheticFile& 
   // always the Footer's offset.
   AppendRandomIndexPack(file, {{0, 0}, {0, footerOffset}});
   return file;
+}
+
+// One IndexEntryArray row spec, mirroring mxf/index_table.h's
+// IndexTableEntry -- TemporalOffset/KeyFrameOffset are always written as 0
+// (unused by the parser, see index_table.h's comment).
+struct IndexTableEntrySpec {
+  uint8_t flags = 0;
+  uint64_t streamOffset = 0;
+};
+
+// Builds an IndexEntryArray tag's raw Value bytes: {4-byte count}{4-byte
+// itemLength} header, then `entries.size()` rows of `itemLength` bytes each
+// (itemLength must be >= 11; any bytes beyond the 11-byte fixed prefix are
+// zero-padded, simulating unused trailing SliceOffset[]/PosTable[] data --
+// used to test that GetIndexEntryArray's stride skips them correctly).
+inline std::vector<uint8_t> BuildIndexEntryArrayBytes(const std::vector<IndexTableEntrySpec>& entries,
+                                                        uint32_t itemLength = 11) {
+  std::vector<uint8_t> value;
+  AppendU32BE(value, static_cast<uint32_t>(entries.size()));
+  AppendU32BE(value, itemLength);
+  for (const auto& e : entries) {
+    value.push_back(0);  // TemporalOffset -- unused
+    value.push_back(0);  // KeyFrameOffset -- unused
+    value.push_back(e.flags);
+    AppendU64BE(value, e.streamOffset);
+    for (uint32_t pad = 11; pad < itemLength; ++pad) value.push_back(0);
+  }
+  return value;
+}
+
+// Index Table Segment spec for AppendIndexTableSegment -- mirrors
+// mxf/index_table.h's IndexTableSegment. `entries` is only written when
+// editUnitByteCount == 0 (VBR); a CBR segment (editUnitByteCount != 0)
+// omits the IndexEntryArray tag entirely, matching real files.
+struct IndexTableSegmentSpec {
+  uint32_t indexEditRateNum = 25;
+  uint32_t indexEditRateDen = 1;
+  int64_t indexStartPosition = 0;
+  int64_t indexDuration = 0;
+  uint32_t editUnitByteCount = 0;
+  uint32_t indexSid = 1;
+  uint32_t bodySid = 1;
+  std::vector<IndexTableEntrySpec> entries;
+  uint32_t indexEntryItemLength = 11;
+};
+
+// Appends one Index Table Segment KLV using the literal
+// mxfsrc::kIndexTableSegmentKey -- NOT AppendLocalSet, which hardcodes the
+// Header-Metadata set-type key prefix (a different key family).
+inline void AppendIndexTableSegment(std::vector<uint8_t>& buf, const IndexTableSegmentSpec& spec) {
+  std::vector<uint8_t> entries;
+  AppendTagRational(entries, 0x3F0B, static_cast<int32_t>(spec.indexEditRateNum),
+                      static_cast<int32_t>(spec.indexEditRateDen));
+  AppendTagI64(entries, 0x3F0C, spec.indexStartPosition);
+  AppendTagI64(entries, 0x3F0D, spec.indexDuration);
+  AppendTagU32(entries, 0x3F05, spec.editUnitByteCount);
+  AppendTagU32(entries, 0x3F06, spec.indexSid);
+  AppendTagU32(entries, 0x3F07, spec.bodySid);
+  if (spec.editUnitByteCount == 0 && !spec.entries.empty()) {
+    std::vector<uint8_t> arrayBytes = BuildIndexEntryArrayBytes(spec.entries, spec.indexEntryItemLength);
+    AppendU16BE(entries, 0x3F0A);
+    AppendU16BE(entries, static_cast<uint16_t>(arrayBytes.size()));
+    entries.insert(entries.end(), arrayBytes.begin(), arrayBytes.end());
+  }
+  AppendKlvHeader(buf, mxfsrc::kIndexTableSegmentKey, entries.size());
+  buf.insert(buf.end(), entries.begin(), entries.end());
 }
 
 inline void AppendKlvFill(std::vector<uint8_t>& buf, uint8_t padLen) {

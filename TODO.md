@@ -254,29 +254,58 @@ in README or the sample scripts yet).
   correct decoded samples for arbitrary `start`/`count`, including ranges
   that don't align with video frame boundaries.
 
-#### 2. Index Table Segment / RIP reading for real random-access seeks
-- `SourceEngine::SeekAndDecode`'s GOP-based-codec branch still decodes
-  forward from frame 0 for *every* out-of-window request -- correct but
-  O(target), since no anchor/keyframe location is known without an index.
-- Read Index Table Segments (SMPTE 377-1 §10) from Body/Footer partitions:
-  gives byte offset + temporal/key-frame offset per edit unit, enabling a
-  real seek -- jump to the nearest preceding I-frame's byte offset and
-  decode forward only from there, instead of from 0.
-- This is the highest-value single item in Phase 8 for the "primarily
-  forward-decode but support random seeks where reasonably easy" goal --
-  without it, GOP-based seeks (the codec family of the actual real file
-  used for benchmarking this session, XDCAM long-GOP MPEG-2) stay O(n)
-  forever, and the existing intra-only fast path in `SeekAndDecode`
-  benefits nothing from it (already O(1)-ish via skip-without-decode).
-- Also unblocks the frame-count fallback chain already stubbed in
-  `source_engine.cpp:84-88` (the `numFrames < 0` early-return) -- an Index
-  Table/RIP can supply an authoritative duration when Header Metadata's
-  Duration property is absent or unreliable. This is directly relevant to
-  the still-open real-file bug below (item 4).
-- Test: synthetic file with an Index Table Segment, verify `SeekAndDecode`
-  uses it to skip straight to the nearest preceding key frame instead of
-  decoding from frame 0, and that the frame produced is byte-identical to
-  what full forward decode would have produced.
+#### 2. Index Table Segment / RIP reading for real random-access seeks -- DONE
+- New `src/mxf/index_table.h/.cpp`: parses Index Table Segments (SMPTE
+  377-1 SS10, key/tags verified against FFmpeg's mxfdec.c/mxfenc.c) --
+  `EnumeratePartitionsForIndex`/`ScanPartitionForIndexSegments` locate them
+  via the existing RIP + each partition's `indexByteCount`/`indexSid`
+  (mirroring `ReadMetadataSets`'s scan pattern); `BuildEssenceIndex`
+  flattens one-or-more segments per BodySID (both CBR via the
+  `EditUnitByteCount` formula and VBR via a new `IndexEntryArray` batch
+  reader -- `GetUlArray` wasn't reusable, it's hardcoded to 16-byte-UL
+  batches) into a single sorted, binary-searchable `EssenceIndex`, with
+  full multi-segment stitching (stable-sorted, deterministic
+  first-file-order-wins on any overlap).
+- `SourceEngine` builds this once in `Open()` (`videoIndex_`, immutable
+  after) and `SeekAndDecode`'s GOP-based branch now consults
+  `FindPrecedingKeyframe(essenceTarget)` first: if it resolves, a fresh
+  `EssenceWalker`/decoder starts at that keyframe's byte offset instead of
+  essence element 0, decoding only from there forward -- a new
+  `ServeStats::indexAssistedSeeks` counter (`SourceEngine::IndexAssistedSeekCount()`)
+  confirms when this actually engaged. Absent/inapplicable index (no
+  segment found, target outside every covered range, etc.) degrades
+  silently to the original from-0 behavior in every case -- purely
+  additive, never a regression risk.
+- Also unblocks the frame-count fallback: `Open()` now derives `numFrames`
+  from the index's own covered range when Header Metadata's Duration is
+  absent, before giving up with `kParseError`.
+- **Real-file verification found and fixed a second instance of this
+  session's zero-byte-KAG-padding bug** (see README Phase 9): the same
+  Atomos Shogun XAVC-L file that has no separate Body Partition also pads
+  its Index Table region with raw zero bytes, which the new scanner
+  initially mis-parsed the same way `EssenceWalker` originally did. Fixed
+  by promoting `EssenceWalker`'s `LooksLikeKlvKey`/`ResyncToUlDesignator`
+  helpers to shared utilities in `mxf/klv.h/.cpp` and reusing them in
+  `ScanPartitionForIndexSegments` too. Confirmed end-to-end against the
+  real XAVC-L file: `essenceIndex: built=1 highestCoveredEditUnit=3114`
+  (covers the full 3115-frame file), a deliberate eviction-forcing seek
+  probe resolved via the index (`indexAssistedSeeks=1`) and decoded
+  correctly.
+- Tests: `tests/mxf_parser_tests/index_table_test.cpp` (13 cases covering
+  VBR/CBR parsing, `IndexEntryArray` trailing-byte skipping, keyframe
+  lookup edge cases, multi-segment stitching, malformed/out-of-bounds
+  entry handling) plus `source_engine_test.cpp` additions using a real
+  encoded MPEG-2 I/P-frame sequence (avcodec's own encoder, `gop_size>1`)
+  to prove both the unchanged no-index fallback and the index-assisted
+  path produce byte-identical output to sequential playback. Note: the
+  original plan to additionally corrupt an earlier GOP to "prove" the
+  index bypasses it turned out to be untestable through the public API --
+  `GetVideoFrame` only ever invokes `SeekAndDecode` for a frame the primary
+  background thread already decoded successfully and then evicted, and
+  that thread always decodes sequentially from element 0 first, so any
+  earlier corruption poisons the whole engine before eviction can even
+  occur. The `IndexAssistedSeekCount()` counter is the direct proof of use
+  instead.
 
 #### 3. Essence-count fallback for frame count
 - Per `source_engine.cpp:84-88`, when Header Metadata's Duration is
@@ -358,19 +387,21 @@ in README or the sample scripts yet).
   verified end-to-end this session).
 - Document known limitations explicitly in README rather than leaving them
   only in code comments: GOP-based codecs' seek fallback is O(n) until
-  item 2 lands; audio is silent until item 1 lands.
+  item 2 lands (**update: item 2 is done**, see above -- O(n) only remains
+  for files with no usable Index Table Segment); audio is silent until
+  item 1 lands.
 
 ### Suggested order
 
-1. Resolve the open real-file frame-count bug (item 4's first bullet) --
-   lowest effort relative to impact, and it's a concrete bug the user
-   already reported and hasn't heard back on.
-2. Index Table Segment / RIP reading (item 2) -- highest-value single
-   item; unblocks both real random-seek performance and the frame-count
-   fallback (item 3 becomes optional once this lands).
+1. ~~Resolve the open real-file frame-count bug (item 4's first bullet)~~ --
+   substantially addressed this session, see item 4's update.
+2. ~~Index Table Segment / RIP reading (item 2)~~ -- **done**; unblocked
+   both real random-seek performance and the frame-count fallback (item 3
+   is now optional, only matters for files with neither a reliable
+   Duration nor an Index Table).
 3. Real audio output (item 1) -- large, mostly independent piece of work;
    a source plugin with permanently silent audio is a real gap for a
-   general-purpose ffmpeg-facing reader.
+   general-purpose ffmpeg-facing reader. Next up.
 4. Cross-platform re-verification (item 5) -- do after the above land, so
    it verifies the final Phase 7/8 feature set rather than running twice.
 5. Multi-track handling (item 6) and the general malformed-input hardening

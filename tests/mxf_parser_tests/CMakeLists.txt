@@ -18,6 +18,13 @@ target_compile_features(mxf_essence_walker_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_essence_walker_tests PRIVATE mxf_core)
 add_test(NAME mxf_essence_walker_tests COMMAND mxf_essence_walker_tests)
 
+add_executable(mxf_index_table_tests
+  index_table_test.cpp
+)
+target_compile_features(mxf_index_table_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_index_table_tests PRIVATE mxf_core)
+add_test(NAME mxf_index_table_tests COMMAND mxf_index_table_tests)
+
 add_executable(mxf_decoder_tests
   decoder_test.cpp
 )
