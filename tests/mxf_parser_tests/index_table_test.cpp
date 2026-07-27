@@ -103,6 +103,27 @@ void TestIsKeyframeFlagsTruthTable() {
   CHECK(IsKeyframeFlags(0x80));  // random-access marker bit, unrelated to the 0x30 prediction bits
 }
 
+// A real Canon XAVC long-GOP file flags the first one or two B pictures
+// immediately after a keyframe as backward-prediction-only (0x13: bit4 set,
+// bit5 clear) rather than the 0x33 (both bits set) every other B picture in
+// the same GOP carries. EstimateReorderDelay's run-length count must still
+// include these -- they're still displayed out of decode order and held in
+// the reorder buffer, just referencing one direction -- or it silently
+// undercounts the GOP's true reorder depth and SeekAndDecode lands on the
+// wrong frame right after this GOP's keyframe.
+void TestEstimateReorderDelayCountsBackwardOnlyBFrames() {
+  EssenceIndex index(std::vector<FlatIndexEntry>{
+      {100, 1000, true, 0x40},   // I
+      {101, 1100, false, 0x13},  // backward-only B (the real file's anomaly)
+      {102, 1200, false, 0x13},  // backward-only B
+      {103, 1300, false, 0x26},  // P
+      {104, 1400, false, 0x33},  // ordinary B
+      {105, 1500, false, 0x33},  // ordinary B
+      {106, 1600, false, 0x26},  // P
+  });
+  CHECK(index.EstimateReorderDelay(100) == 2);
+}
+
 void TestFindPrecedingKeyframeTargetIsAlreadyKeyframe() {
   EssenceIndex index(std::vector<FlatIndexEntry>{
       {10, 1000, true},
@@ -432,6 +453,7 @@ int main() {
   TestVbrSegmentRoundTrip();
   TestIndexEntryArrayItemLength15SkipsTrailingBytes();
   TestIsKeyframeFlagsTruthTable();
+  TestEstimateReorderDelayCountsBackwardOnlyBFrames();
   TestFindPrecedingKeyframeTargetIsAlreadyKeyframe();
   TestFindPrecedingKeyframeWalksBackToEarlierKeyframe();
   TestFindPrecedingKeyframeNoKeyframeBeforeTarget();

@@ -38,12 +38,20 @@ struct IndexTableEntry {
 // dependency on anything earlier" seek target.
 inline bool IsKeyframeFlags(uint8_t flags) { return (flags & 0x30) == 0; }
 
-// bit4 AND bit5 both set => uses both backward- and forward-prediction =>
-// a B picture. Distinct from a P picture (only one of the two bits set,
-// !IsKeyframeFlags but not a B picture either) -- see
-// EssenceIndex::EstimateReorderDelay, the only consumer that cares about
-// this finer distinction.
-inline bool IsBFrameFlags(uint8_t flags) { return (flags & 0x30) == 0x30; }
+// bit4 (backward-prediction-used) set at all => a picture displayed out of
+// its coded/decode position => needs reorder-buffer accounting, whether or
+// not bit5 (forward-prediction-used) is also set. A true P picture only
+// ever sets bit5 alone (forward-only, decode position == display position);
+// bit4-set-alone is NOT a P picture, it's a one-directional B picture some
+// encoders emit for the frame(s) immediately following a keyframe (real
+// Canon XAVC long-GOP file: every ordinary B picture in a GOP carries 0x33,
+// but that GOP's first one or two carry 0x13 -- bit4 only -- instead;
+// treating that as "not a B picture" undercounted
+// EssenceIndex::EstimateReorderDelay's run length by exactly that many
+// frames at every such GOP's boundary, landing SeekAndDecode on the wrong
+// frame right after it). EstimateReorderDelay is the only consumer that
+// cares about this distinction at all.
+inline bool IsBFrameFlags(uint8_t flags) { return (flags & 0x10) != 0; }
 
 // One parsed Index Table Segment. A segment covers edit units
 // [indexStartPosition, indexStartPosition + indexDuration) for one IndexSID.
