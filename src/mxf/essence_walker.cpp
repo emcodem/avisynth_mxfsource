@@ -18,7 +18,7 @@ EssenceWalker::EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array
   reader_.Seek(startOffset);
 }
 
-bool EssenceWalker::Next(EssenceElement& out) {
+bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
   while (reader_.Tell() + 17 <= reader_.Size()) {
     const uint64_t klvStart = reader_.Tell();
     KlvHeader klv{};
@@ -39,6 +39,11 @@ bool EssenceWalker::Next(EssenceElement& out) {
         out.isVideo = matchesVideo;
         out.isAudio = matchesAudio && !matchesVideo;
         out.filePosition = klvStart;
+        if (!wantData) {
+          out.data.clear();
+          if (!reader_.Seek(valueEnd)) return false;
+          return true;
+        }
         out.data.resize(klv.length);
         if (klv.length > 0 && !reader_.ReadBytes(out.data.data(), klv.length)) return false;
         return true;

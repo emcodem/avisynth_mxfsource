@@ -1,7 +1,9 @@
 #include "core/source_engine.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <vector>
 
 #include "codec/decoder_factory.h"
 #include "mxf/ul_tables.h"
@@ -35,14 +37,16 @@ bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhau
 }
 
 // Advances `walker` to its next VIDEO essence element (skipping audio/other
-// tracks) and discards it *without decoding it* -- still pays for the KLV
-// walk and reading its raw bytes off disk, but skips the actual (often far
-// more expensive) codec decode work entirely. Only safe for intra-only
-// codecs (see IsIntraOnlyCodec), where no frame depends on any other, so
-// there's nothing decoding it would have contributed anyway.
+// tracks) and discards it *without decoding it* -- pays only for the KLV
+// walk (each element's own small header), not for reading its actual
+// payload bytes off disk/network (wantData=false, see EssenceWalker::Next)
+// or for the actual (often far more expensive) codec decode work. Only
+// safe for intra-only codecs (see IsIntraOnlyCodec), where no frame depends
+// on any other, so there's nothing decoding it would have contributed
+// anyway.
 bool SkipNextVideoElement(EssenceWalker& walker) {
   EssenceElement element;
-  while (walker.Next(element)) {
+  while (walker.Next(element, /*wantData=*/false)) {
     if (element.isVideo) return true;
   }
   return false;
@@ -174,6 +178,30 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
 }
 
 FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFrame>& out, std::string* errorOut) {
+  // A forward request far enough beyond what's actually been produced so far
+  // behaves exactly like a backward seek past the window: the ring buffer's
+  // blocking Get() would just wait for the single background decode thread
+  // to decode every intervening frame in order, one at a time -- as slow as
+  // a full linear scan (the real-world bug this guards against: seeking to
+  // frame 6413 of a long file blocked for ~30s while the background thread
+  // sequentially decoded frames 0..6413). Bypass the wait and go straight to
+  // the same Index Table-assisted SeekAndDecode() fallback used for genuine
+  // backward seeks below, rather than only reaching for it once a frame has
+  // already been evicted.
+  if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) {
+    auto seeked = SeekAndDecode(n);
+    if (!seeked) {
+      if (errorOut) {
+        *errorOut = "requested frame is far ahead of the current decode position, and the fallback "
+                    "re-decode failed to reach it";
+      }
+      return FetchStatus::kError;
+    }
+    out = seeked;
+    stats_.RecordNonBufferedServe(n);
+    return FetchStatus::kOk;
+  }
+
   FetchStatus status = videoBuffer_->Get(n, out, errorOut);
   if (status == FetchStatus::kOk) {
     stats_.RecordBufferedServe();
@@ -214,20 +242,43 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
 
   if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
     // No frame depends on any other for these codecs -- every essence
-    // element already *is* its own anchor, so skip every video frame
-    // before the target without decoding any of them (much cheaper than a
-    // full decode), then decode only the target frame itself. EssenceWalker
-    // is constructed here (not shared with the GOP branch below) since it
-    // holds a reference member and can't be reassigned once the branch's
-    // own start offset is known.
-    EssenceWalker freshWalker(freshReader, streamInfo_.headerMetadataEnd, streamInfo_.videoTrackNumber,
-                               streamInfo_.hasVideo, streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
-    for (int64_t i = 0; i < essenceTarget; ++i) {
+    // element already *is* its own anchor. Every Index Table entry for an
+    // intra-only codec is therefore always a "keyframe" (see
+    // FlattenSegmentInto's CBR branch and IsKeyframeFlags for VBR), so
+    // FindPrecedingKeyframe(essenceTarget) -- when the index covers it --
+    // resolves to the target's *own* byte offset directly, with zero
+    // backward walk. Consulting it turns this into an O(1) direct seek
+    // instead of the O(target) skip loop below, which -- even though it
+    // never decodes the skipped frames -- still pays for reading every one
+    // of their full compressed payloads off disk/network on its way to the
+    // target (SkipNextVideoElement's own wantData=false only removes that
+    // cost when this direct jump isn't available). Real bug found on a
+    // real 93GB XAVC-Intra file over an SMB share: seeking to frame 5000
+    // with no index-assisted jump dragged several GB of essence data
+    // across the network merely to skip past it. Absent/inapplicable index
+    // (e.g. a gap, or no Index Table Segment at all) -> unchanged
+    // from-essence-element-0 skip-walk behavior.
+    uint64_t startOffset = streamInfo_.headerMetadataEnd;
+    int64_t startEditUnit = 0;
+    if (videoIndex_) {
+      if (auto seekPoint = videoIndex_->FindPrecedingKeyframe(essenceTarget)) {
+        startOffset = seekPoint->byteOffset;
+        startEditUnit = seekPoint->editUnit;
+        stats_.RecordIndexAssistedSeek();
+      }
+    }
+    // EssenceWalker is constructed here (not shared with the GOP branch
+    // below) since it holds a reference member and can't be reassigned
+    // once the branch's own start offset is known.
+    EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
+                               streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
+    for (int64_t i = startEditUnit; i < essenceTarget; ++i) {
       if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
     }
-    // The loop above discarded exactly `essenceTarget` video elements
-    // (indices [0, essenceTarget)); the next one the walker yields is the
-    // target itself, and this time we keep its bytes to actually decode.
+    // The loop above discarded every video element between startEditUnit
+    // and essenceTarget (zero iterations when the index jumped straight to
+    // the target itself); the next one the walker yields is the target,
+    // and this time we keep its bytes to actually decode.
     EssenceElement targetElement;
     for (;;) {
       if (!freshWalker.Next(targetElement)) return nullptr;
@@ -250,18 +301,60 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // Absent/inapplicable index -> unchanged from-essence-element-0 behavior.
   uint64_t startOffset = streamInfo_.headerMetadataEnd;
   int64_t startEditUnit = 0;
+  // Decoding straight through to `essenceTarget` from a mid-stream keyframe
+  // restart would land some number of edit units too far forward -- a
+  // decoder restarted fresh needs its B-picture reordering pipeline to fill
+  // before its Nth output genuinely corresponds to input element N, unlike
+  // decoding continuously from edit unit 0 (this engine's other two decode
+  // paths, DecodeThreadMain and the startEditUnit==0 fallback below), which
+  // is exactly as warmed-up at any point as the main pipeline itself and
+  // needs no compensation at all. `iterations` (computed below, once
+  // startEditUnit/reorderDelay are final) already subtracts this out; real
+  // bug found via content comparison against an independent ffmpeg decode:
+  // counting outputs unconditionally landed 2 edit units too far forward on
+  // a real long-GOP MPEG-2 camera file -- AVCodecContext::delay wasn't
+  // populated for that codec and per-packet pts weren't reliably preserved
+  // through avcodec's own reordering, so neither could recover this number
+  // from the decoder itself. See EssenceIndex::EstimateReorderDelay for how
+  // it's derived from the index's own flags instead.
+  //
+  // A target within reorderDelay of its own nearest keyframe can't be
+  // reached this way at all -- decoding even the minimum one iteration
+  // already overshoots it (verified against ffmpeg: the two edit units
+  // immediately at/after a keyframe come out as content from 1-2 units
+  // further still). Rather than silently returning that wrong frame, walk
+  // back to progressively earlier keyframes (more runway before the
+  // target) until there's enough room, or fall back to element 0 (needs no
+  // compensation, proven above) if the file's very first keyframe still
+  // isn't far enough away. kMaxBackwardKeyframeHops bounds this walk-back
+  // in case reorderDelay is ever wildly overestimated for a malformed
+  // index, so a bad file can't spin forever.
   if (videoIndex_) {
-    if (auto seekPoint = videoIndex_->FindPrecedingKeyframe(essenceTarget)) {
-      startOffset = seekPoint->byteOffset;
-      startEditUnit = seekPoint->editUnit;
-      stats_.RecordIndexAssistedSeek();
+    int64_t searchFrom = essenceTarget;
+    constexpr int kMaxBackwardKeyframeHops = 8;
+    for (int hop = 0; hop < kMaxBackwardKeyframeHops; ++hop) {
+      auto seekPoint = videoIndex_->FindPrecedingKeyframe(searchFrom);
+      if (!seekPoint) break;  // no keyframe at/before searchFrom -- use the element-0 fallback below
+      const int delay = videoIndex_->EstimateReorderDelay(seekPoint->editUnit);
+      if (seekPoint->editUnit == 0 || essenceTarget - seekPoint->editUnit - delay >= 1) {
+        startOffset = seekPoint->byteOffset;
+        startEditUnit = seekPoint->editUnit;
+        stats_.RecordIndexAssistedSeek();
+        break;
+      }
+      if (seekPoint->editUnit == 0) break;  // can't search earlier than this
+      searchFrom = seekPoint->editUnit - 1;
     }
   }
+
+  const int reorderDelay = startEditUnit > 0 ? videoIndex_->EstimateReorderDelay(startEditUnit) : 0;
+  const int64_t iterations = std::max<int64_t>(1, essenceTarget - startEditUnit - reorderDelay + 1);
+  const int64_t adjustedTarget = startEditUnit + iterations - 1;
 
   EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
                              streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
   bool essenceExhausted = false;
-  for (int64_t i = startEditUnit; i <= essenceTarget; ++i) {
+  for (int64_t i = startEditUnit; i <= adjustedTarget; ++i) {
     if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, *frame)) return nullptr;
   }
   return frame;

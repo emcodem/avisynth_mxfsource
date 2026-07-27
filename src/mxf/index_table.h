@@ -38,6 +38,13 @@ struct IndexTableEntry {
 // dependency on anything earlier" seek target.
 inline bool IsKeyframeFlags(uint8_t flags) { return (flags & 0x30) == 0; }
 
+// bit4 AND bit5 both set => uses both backward- and forward-prediction =>
+// a B picture. Distinct from a P picture (only one of the two bits set,
+// !IsKeyframeFlags but not a B picture either) -- see
+// EssenceIndex::EstimateReorderDelay, the only consumer that cares about
+// this finer distinction.
+inline bool IsBFrameFlags(uint8_t flags) { return (flags & 0x30) == 0x30; }
+
 // One parsed Index Table Segment. A segment covers edit units
 // [indexStartPosition, indexStartPosition + indexDuration) for one IndexSID.
 struct IndexTableSegment {
@@ -90,7 +97,15 @@ struct IndexScanPartition {
   uint32_t indexSid = 0;
   uint64_t indexByteRangeStart = 0;  // partitionEnd + headerByteCount
   uint64_t indexByteRangeEnd = 0;    // indexByteRangeStart + indexByteCount
-  uint64_t essenceStartOffset = 0;   // == indexByteRangeEnd; base for this partition's essence StreamOffsets
+  uint64_t essenceStartOffset = 0;   // == indexByteRangeEnd; where this partition's own essence bytes begin
+  // This partition's Partition Pack BodyOffset (SMPTE 377-1): this
+  // partition's position within the *logical*, cross-partition essence
+  // container for bodySid, i.e. the StreamOffset an Index Table Segment
+  // entry would have if it pointed at the very first byte this partition
+  // physically contributes. Needed to resolve a StreamOffset into an actual
+  // file offset when the segment describing it isn't collocated with the
+  // essence itself (see BuildEssenceIndex).
+  uint64_t bodyOffset = 0;
 };
 
 // Enumerates every partition worth scanning for Index Table Segments: the
@@ -123,6 +138,14 @@ struct FlatIndexEntry {
   int64_t editUnit = 0;
   uint64_t byteOffset = 0;
   bool isKeyframe = false;
+  // Raw IndexTableEntry::flags this row was derived from (0 for CBR rows,
+  // which are always synthesized as isKeyframe=true -- see
+  // FlattenSegmentInto). Kept alongside the already-collapsed isKeyframe
+  // bool so EssenceIndex::EstimateReorderDelay can distinguish a B picture
+  // (bit4 AND bit5 both set) from a P picture (only one set) -- a
+  // distinction IsKeyframeFlags's single bool deliberately throws away,
+  // since nothing else needs it.
+  uint8_t flags = 0;
 };
 
 // A resolved, queryable index for one video track (one BodySID), built once
@@ -154,6 +177,23 @@ class EssenceIndex {
   // (a gap, or before/after every covered range), or if no keyframe exists
   // anywhere at or before it within the covered range.
   std::optional<SeekPoint> FindPrecedingKeyframe(int64_t targetEditUnit) const;
+
+  // Estimates the B-picture reordering pipeline depth a decoder restarted
+  // fresh at `keyframeEditUnit` (which must itself be a keyframe -- normally
+  // FindPrecedingKeyframe's own return value) will need before its Nth
+  // output genuinely corresponds to input element N -- i.e. how many extra
+  // outputs SourceEngine::SeekAndDecode's GOP branch needs to decode (and
+  // discard) past its naive target before landing on the real one. Derived
+  // straight from the index's own flags, not the decoder: counts the run of
+  // consecutive B pictures (both backward- and forward-prediction bits set,
+  // SMPTE 377-1 flags bits 4+5) immediately following the keyframe --
+  // exactly the reordering depth a standard closed-GOP structure implies
+  // (e.g. IBBP has a run of 2, matching a real long-GOP MPEG-2 camera
+  // recording this was found against; AVCodecContext::delay/frame pts
+  // weren't reliable enough to derive it from the decoder itself for that
+  // file's codec). Returns 0 if `keyframeEditUnit` isn't covered/found, or
+  // if the run is empty (no reordering, e.g. I/P-only GOPs).
+  int EstimateReorderDelay(int64_t keyframeEditUnit) const;
 
  private:
   std::vector<FlatIndexEntry> entries_;  // sorted ascending & unique by editUnit

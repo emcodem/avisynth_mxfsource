@@ -123,6 +123,19 @@ class FrameBuffer {
     return GetImpl(index, out, /*advanceWatermark=*/true, errorOut);
   }
 
+  // Non-blocking peek at the highest index produced so far (or -1 if
+  // nothing has been produced yet) and at the buffer's total window size.
+  // Lets a caller decide, before ever calling the blocking Get(), whether a
+  // requested index is close enough to let the producer catch up naturally
+  // or far enough ahead that waiting for sequential production would be as
+  // slow as a full linear scan -- see SourceEngine::GetVideoFrame's
+  // forward-seek bypass.
+  int64_t HighestProduced() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return highestProduced_;
+  }
+  int Capacity() const { return capacity_; }
+
   // Like Get(), but does NOT advance the watermark. For inspecting a frame
   // that the eager initial fill already produced (e.g. SourceEngine::Open()
   // learning frame 0's pixel format) without that inspection itself

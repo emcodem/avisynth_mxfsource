@@ -2,6 +2,7 @@
 // Builds a small synthetic OP1a file with real (uncompressed UYVY) essence
 // so the whole pipeline -- header parse, essence walk, decode, ring buffer,
 // background thread -- runs end to end without needing a real sample file.
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -471,6 +472,12 @@ constexpr Ul kMpeg2LongGopCoding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x
 struct EncodedGopEntry {
   std::vector<uint8_t> data;
   bool isKeyframe = false;
+  // SMPTE 377-1 Index Table Entry flags this entry should carry -- 0x00 for
+  // a keyframe, 0x30 for a B picture (both prediction directions), 0x20 for
+  // a P picture (forward only). Kept alongside `isKeyframe` (which collapses
+  // P and B together as "not a keyframe") so tests can exercise
+  // EssenceIndex::EstimateReorderDelay, which needs to tell P and B apart.
+  uint8_t flags = 0;
 };
 
 // Encodes a real I/P-frame MPEG-2 sequence with avcodec's own encoder (same
@@ -520,6 +527,7 @@ std::vector<EncodedGopEntry> EncodeMpeg2Gop(int width, int height, int numFrames
       EncodedGopEntry entry;
       entry.data.assign(pkt->data, pkt->data + pkt->size);
       entry.isKeyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+      entry.flags = entry.isKeyframe ? uint8_t{0x00} : uint8_t{0x30};
       result.push_back(std::move(entry));
       av_packet_unref(pkt);
     }
@@ -527,6 +535,100 @@ std::vector<EncodedGopEntry> EncodeMpeg2Gop(int width, int height, int numFrames
 
   for (int i = 0; i < numFrames; ++i) {
     std::memset(frame->data[0], static_cast<uint8_t>(16 + i), static_cast<size_t>(frame->linesize[0]) * height);
+    std::memset(frame->data[1], 128, static_cast<size_t>(frame->linesize[1]) * ((height + 1) / 2));
+    std::memset(frame->data[2], 128, static_cast<size_t>(frame->linesize[2]) * ((height + 1) / 2));
+    frame->pts = i;
+    if (avcodec_send_frame(encCtx, frame) < 0) break;
+    drainPackets();
+  }
+  avcodec_send_frame(encCtx, nullptr);  // flush
+  drainPackets();
+
+  av_packet_free(&pkt);
+  av_frame_free(&frame);
+  avcodec_free_context(&encCtx);
+  return result;
+}
+
+// Extracts picture_coding_type (1=I, 2=P, 3=B; 0 if not found) from a raw
+// MPEG-2 Picture Header (start code 0x000001 0x00): temporal_reference (10
+// bits) then picture_coding_type (3 bits) immediately follow the 4-byte
+// start code, so byte[5]'s top 3 bits (after temporal_reference's low 2
+// bits) hold it. Only this test file needs real per-frame I/P/B
+// classification (to derive accurate Index Table Entry flags for
+// EstimateReorderDelay) -- avcodec's own encoder output doesn't otherwise
+// expose pict_type per emitted packet.
+int ParseMpeg2PictureCodingType(const std::vector<uint8_t>& data) {
+  for (size_t i = 0; i + 5 < data.size(); ++i) {
+    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0x00) {
+      return (data[i + 5] >> 3) & 0x7;
+    }
+  }
+  return 0;
+}
+
+// Same as EncodeMpeg2Gop, but with real B-frame reordering (max_b_frames >
+// 0) -- specifically to exercise EssenceIndex::EstimateReorderDelay /
+// SourceEngine::SeekAndDecode's reorder-delay compensation, which
+// EncodeMpeg2Gop's max_b_frames=0 stream can never touch (no reordering
+// occurs at all when packet order == input frame order already). Each
+// entry's isKeyframe/flags are derived from the bitstream's own
+// picture_coding_type (see ParseMpeg2PictureCodingType) rather than just
+// AV_PKT_FLAG_KEY, since B vs P needs to be told apart here.
+std::vector<EncodedGopEntry> EncodeMpeg2GopWithBFrames(int width, int height, int numFrames, int gopSize,
+                                                         int maxBFrames) {
+  std::vector<EncodedGopEntry> result;
+  const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+  if (!enc) return result;
+
+  AVCodecContext* encCtx = avcodec_alloc_context3(enc);
+  if (!encCtx) return result;
+  encCtx->width = width;
+  encCtx->height = height;
+  encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+  encCtx->time_base = {1, 25};
+  encCtx->framerate = {25, 1};
+  encCtx->gop_size = gopSize;
+  encCtx->max_b_frames = maxBFrames;
+
+  if (avcodec_open2(encCtx, enc, nullptr) < 0) {
+    avcodec_free_context(&encCtx);
+    return result;
+  }
+
+  AVFrame* frame = av_frame_alloc();
+  frame->format = AV_PIX_FMT_YUV420P;
+  frame->width = width;
+  frame->height = height;
+  if (av_frame_get_buffer(frame, 32) < 0) {
+    av_frame_free(&frame);
+    avcodec_free_context(&encCtx);
+    return result;
+  }
+
+  AVPacket* pkt = av_packet_alloc();
+  auto drainPackets = [&]() {
+    while (avcodec_receive_packet(encCtx, pkt) == 0) {
+      EncodedGopEntry entry;
+      entry.data.assign(pkt->data, pkt->data + pkt->size);
+      const int pictType = ParseMpeg2PictureCodingType(entry.data);
+      entry.isKeyframe = pictType == 1;
+      entry.flags = pictType == 3 ? uint8_t{0x30} : (pictType == 2 ? uint8_t{0x20} : uint8_t{0x00});
+      result.push_back(std::move(entry));
+      av_packet_unref(pkt);
+    }
+  };
+
+  // Distinct per-frame content (not just a flat color) so a
+  // wrong-but-plausible decoded frame (e.g. landed on the wrong nearby
+  // edit unit) doesn't coincidentally produce identical bytes to the
+  // correct one -- a real risk with B-frame motion-compensated encoding of
+  // otherwise-uniform content.
+  for (int i = 0; i < numFrames; ++i) {
+    for (int y = 0; y < height; ++y) {
+      std::memset(frame->data[0] + static_cast<size_t>(y) * frame->linesize[0],
+                  static_cast<uint8_t>(16 + i * 7 + y), static_cast<size_t>(width));
+    }
     std::memset(frame->data[1], 128, static_cast<size_t>(frame->linesize[1]) * ((height + 1) / 2));
     std::memset(frame->data[2], 128, static_cast<size_t>(frame->linesize[2]) * ((height + 1) / 2));
     frame->pts = i;
@@ -585,7 +687,7 @@ std::vector<uint8_t> BuildGopFile(const std::vector<EncodedGopEntry>& entries, i
   segSpec.indexDuration = static_cast<int64_t>(entries.size());
   segSpec.indexSid = 1;
   segSpec.bodySid = 1;
-  for (const auto& e : entries) segSpec.entries.push_back({e.isKeyframe ? uint8_t{0x00} : uint8_t{0x30}, 0});
+  for (const auto& e : entries) segSpec.entries.push_back({e.flags, 0});
 
   // Fixed-width fields throughout -- the segment's serialized size doesn't
   // depend on the actual StreamOffset values, only on entry count, so a
@@ -734,6 +836,135 @@ void TestIndexTableAssistedSeekUsesIndexAndMatchesReference() {
   std::filesystem::remove(path);
 }
 
+// Regression test for the real-world hang reported via AvsPmod: seeking
+// straight to a far-ahead frame (e.g. frame 6413 of a long file) took ~30s
+// because GetVideoFrame() only ever reached for the fast Index
+// Table-assisted SeekAndDecode() fallback once a frame had already been
+// evicted from the ring buffer -- a *forward* jump to a not-yet-produced
+// frame just blocked on the buffer's Get(), which silently waits for the
+// single background thread to decode every intervening frame in order.
+// This is the very first GetVideoFrame() call the engine ever sees (nothing
+// has been evicted, nothing else has been requested yet), so the only way
+// this can pass is via the forward-jump bypass added to GetVideoFrame(),
+// not the pre-existing eviction-triggered path exercised by
+// TestIndexTableAssistedSeekUsesIndexAndMatchesReference above.
+void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
+  if (encoded.size() != static_cast<size_t>(kGopNumFrames)) return;
+
+  auto referenceBytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_fwdseek_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kGopNumFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_fwdseek.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 2;  // tiny window: target below is far beyond it without any prior eviction
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      constexpr int64_t kTarget = 10;  // start of the third GOP -- itself a keyframe
+      std::shared_ptr<NormalizedFrame> frame;
+      FetchStatus st = engine.GetVideoFrame(kTarget, frame, nullptr);
+      CHECK(st == FetchStatus::kOk);
+      if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
+      CHECK(!engine.NonBufferedServedFrames().empty());  // proves the fast path, not the sequential wait, was used
+      CHECK(engine.IndexAssistedSeekCount() > 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Regression test for a real bug found via content comparison against an
+// independent ffmpeg decode of a real long-GOP MPEG-2 camera file: a
+// decoder restarted fresh at a mid-stream keyframe (as every index-assisted
+// seek does) needs its B-picture reordering pipeline to fill before its Nth
+// output genuinely corresponds to input element N -- naively counting
+// outputs landed 2 edit units too far forward, silently returning the
+// *wrong* (but plausible, same-size) frame. AVCodecContext::delay wasn't
+// populated for that codec and per-packet pts weren't reliably preserved
+// through avcodec's own reordering, so SourceEngine::SeekAndDecode instead
+// derives the compensation straight from the index's own flags (see
+// EssenceIndex::EstimateReorderDelay). EncodeMpeg2Gop (used by every other
+// GOP test in this file) can't exercise any of this: max_b_frames=0 there
+// means packet order == input order, so no reordering ever occurs.
+// Targets both a mid-GOP frame (plenty of runway past its keyframe) and the
+// two edit units immediately at/after a keyframe (zero/one frame of
+// runway) -- the second case can't be satisfied from that keyframe at all
+// and must fall back to an earlier one (or, right at the start of the
+// file, element 0 -- see SeekAndDecode's backward keyframe walk).
+void TestReorderDelayCompensationMatchesReferenceWithRealBFrames() {
+  constexpr int width = 32, height = 32, gopSize = 6, maxBFrames = 2, numFrames = 30;
+  auto encoded = EncodeMpeg2GopWithBFrames(width, height, numFrames, gopSize, maxBFrames);
+  CHECK(encoded.size() == static_cast<size_t>(numFrames));
+  if (encoded.size() != static_cast<size_t>(numFrames)) return;
+
+  // Confirms this encode actually produced B pictures (flags=0x30) --
+  // otherwise this test would silently degrade into not exercising the
+  // reorder-delay path at all, same trap as EncodeMpeg2Gop's max_b_frames=0.
+  const bool hasBFrames = std::any_of(encoded.begin(), encoded.end(), [](const EncodedGopEntry& e) {
+    return e.flags == 0x30;
+  });
+  CHECK(hasBFrames);
+  if (!hasBFrames) return;
+
+  constexpr uint32_t kBFrameTrackNumber = 0x03030300;
+  auto referenceBytes = BuildGopFile(encoded, width, height, kBFrameTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_bframes_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), numFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, width, height, kBFrameTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_bframes_indexed.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 2;  // tiny: every GetVideoFrame call below is a genuine SeekAndDecode
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      // First find a keyframe (any GOP boundary but the first, so a
+      // backward fallback to an earlier one is actually possible) to target
+      // frames relative to.
+      int64_t keyframeEditUnit = -1;
+      for (int64_t i = 1; i < numFrames; ++i) {
+        if (encoded[static_cast<size_t>(i)].isKeyframe) {
+          keyframeEditUnit = i;
+          break;
+        }
+      }
+      CHECK(keyframeEditUnit > 0);
+      if (keyframeEditUnit <= 0) {
+        std::filesystem::remove(path);
+        return;
+      }
+
+      for (int64_t target : {keyframeEditUnit, keyframeEditUnit + 1, keyframeEditUnit + 2, keyframeEditUnit + 5}) {
+        if (target >= numFrames) continue;
+        std::shared_ptr<NormalizedFrame> frame;
+        std::string err;
+        FetchStatus st = engine.GetVideoFrame(target, frame, &err);
+        CHECK(st == FetchStatus::kOk);
+        if (st != FetchStatus::kOk) {
+          std::cerr << "target=" << target << " failed: " << err << std::endl;
+          continue;
+        }
+        CHECK(frame->planeData[0] == reference[target]);
+        if (frame->planeData[0] != reference[target]) {
+          std::cerr << "target=" << target << " (keyframe=" << keyframeEditUnit << "): content mismatch"
+                     << std::endl;
+        }
+      }
+      CHECK(engine.IndexAssistedSeekCount() > 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 void TestUnsupportedCodecFailsOpenCleanly() {
   SyntheticFile cfg;
   cfg.sequenceDuration = 1;
@@ -767,6 +998,8 @@ int main() {
   TestOriginHandlingAppliesToSeekAndDecodeFallback();
   TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex();
   TestIndexTableAssistedSeekUsesIndexAndMatchesReference();
+  TestReorderDelayCompensationMatchesReferenceWithRealBFrames();
+  TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
   TestUnsupportedCodecFailsOpenCleanly();
 
   if (g_failures == 0) {

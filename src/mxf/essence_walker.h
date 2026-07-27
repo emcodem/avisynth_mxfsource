@@ -41,7 +41,19 @@ class EssenceWalker {
 
   // Advances to and returns the next matching essence element. Returns
   // false at EOF or on a malformed KLV (out.data is left empty in that case).
-  bool Next(EssenceElement& out);
+  //
+  // `wantData=false` skips reading the matched element's payload bytes off
+  // disk/network entirely (just seeks past its Value) -- out.data is left
+  // empty, but isVideo/isAudio/filePosition are still valid. For a caller
+  // that only needs to count/locate elements (e.g.
+  // SourceEngine::SeekAndDecode's intra-only-codec skip-to-target loop),
+  // this is the difference between a cheap seek and actually transferring
+  // every intervening frame's full compressed payload -- real bug found on
+  // a real 93GB XAVC-Intra file over an SMB share: seeking to frame 5000
+  // dragged several GB of essence data across the network only to discard
+  // all of it, because Next() unconditionally read each skipped video
+  // element's payload even though nothing was ever going to look at it.
+  bool Next(EssenceElement& out, bool wantData = true);
 
   uint64_t Position() const { return reader_.Tell(); }
 
