@@ -350,7 +350,9 @@ void TestMultiSegmentStitching() {
                                   segABytes.size(), 1);
   file.insert(file.end(), 64, 0);
   file.insert(file.end(), segABytes.begin(), segABytes.end());
-  file.insert(file.end(), 400, 0);  // essence trailer covering segment A's offsets
+  const uint64_t essenceBaseA = file.size();  // == segment A's essenceContainerBaseOffset once parsed
+  constexpr uint64_t kPartitionAEssenceBytes = 400;
+  file.insert(file.end(), kPartitionAEssenceBytes, 0);  // essence trailer covering segment A's offsets
 
   const uint64_t partition2Offset = file.size();
   IndexTableSegmentSpec segB;
@@ -358,11 +360,27 @@ void TestMultiSegmentStitching() {
   segB.indexDuration = 3;
   segB.indexSid = 1;
   segB.bodySid = 1;
-  segB.entries = {{0x00, 50}, {0x30, 150}, {0x30, 250}};
+  // StreamOffset is defined relative to the whole logical, cross-partition
+  // essence container (SMPTE 377-1), not to this partition's own essence --
+  // so these continue on from where partition A's own BodyOffset range
+  // (0..kPartitionAEssenceBytes) leaves off, landing at
+  // essenceBaseB+50/150/250 once resolved via BodyOffset.
+  segB.entries = {{0x00, kPartitionAEssenceBytes + 50},
+                   {0x30, kPartitionAEssenceBytes + 150},
+                   {0x30, kPartitionAEssenceBytes + 250}};
   std::vector<uint8_t> segBBytes;
   AppendIndexTableSegment(segBBytes, segB);
+  // BodyOffset: partition A's own essence byte count, i.e. where partition B's
+  // essence genuinely begins within the logical, cross-partition essence
+  // container -- must be distinct from partition A's own BodyOffset (0) or
+  // BuildEssenceIndex's bodyRanges sort can't tell the two partitions apart
+  // (a real bug this test previously tripped over: AppendPartitionPackWithFields
+  // used to hardcode BodyOffset=0 for every partition it built, so this and
+  // TestOverlappingSegmentsDeterministicFirstWins both ended up with two
+  // BodyOffset=0 entries and the resolved offset silently depended on
+  // std::sort's unspecified tie-breaking between them).
   AppendPartitionPackWithFields(file, PartitionKind::kBody, TestPartitionStatus::kClosedComplete, partition2Offset, 0,
-                                  64, segBBytes.size(), 1);
+                                  64, segBBytes.size(), 1, kPartitionAEssenceBytes);
   file.insert(file.end(), 64, 0);
   file.insert(file.end(), segBBytes.begin(), segBBytes.end());
   const uint64_t essenceBaseB = file.size();  // == this segment's essenceContainerBaseOffset once parsed
@@ -385,10 +403,14 @@ void TestMultiSegmentStitching() {
         CHECK(point->editUnit == 3);
         CHECK(point->byteOffset == essenceBaseB + 50);
       }
-      // editUnit 2 (in segment A) resolves within segment A.
+      // editUnit 2 (in segment A) resolves within segment A, against
+      // partition A's own essence base -- not partition B's.
       auto pointA = index->FindPrecedingKeyframe(2);
       CHECK(pointA.has_value());
-      if (pointA) CHECK(pointA->editUnit == 0);
+      if (pointA) {
+        CHECK(pointA->editUnit == 0);
+        CHECK(pointA->byteOffset == essenceBaseA + 100);
+      }
     }
   }
   std::filesystem::remove(path);
@@ -412,7 +434,8 @@ void TestOverlappingSegmentsDeterministicFirstWins() {
   file.insert(file.end(), 64, 0);
   file.insert(file.end(), segABytes.begin(), segABytes.end());
   const uint64_t essenceBaseA = file.size();  // == segment A's essenceContainerBaseOffset once parsed
-  file.insert(file.end(), 400, 0);
+  constexpr uint64_t kPartitionAEssenceBytes = 400;
+  file.insert(file.end(), kPartitionAEssenceBytes, 0);
 
   const uint64_t partition2Offset = file.size();
   IndexTableSegmentSpec segB;
@@ -423,8 +446,10 @@ void TestOverlappingSegmentsDeterministicFirstWins() {
   segB.entries = {{0x00, 999}, {0x30, 888}};  // "second" -- should lose
   std::vector<uint8_t> segBBytes;
   AppendIndexTableSegment(segBBytes, segB);
+  // BodyOffset must be distinct from partition A's (0) -- see the identical
+  // comment in TestMultiSegmentStitching for why.
   AppendPartitionPackWithFields(file, PartitionKind::kBody, TestPartitionStatus::kClosedComplete, partition2Offset, 0,
-                                  64, segBBytes.size(), 1);
+                                  64, segBBytes.size(), 1, kPartitionAEssenceBytes);
   file.insert(file.end(), 64, 0);
   file.insert(file.end(), segBBytes.begin(), segBBytes.end());
   file.insert(file.end(), 1400, 0);  // large enough that segB's own (losing) offsets would also be in-bounds

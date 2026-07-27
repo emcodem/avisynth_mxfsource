@@ -348,14 +348,20 @@ std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoB
   // BodySID's essence if its own Partition Pack claims that exact BodySID
   // (Header/Footer Partitions that merely host Index Table Segments report
   // BodySID 0 or an unrelated value and are naturally excluded).
+  //
+  // Stable, like segments/flat below: a well-formed file never has two
+  // partitions genuinely sharing one BodyOffset, but a malformed one might
+  // (or ResyncToActualEssenceStart guessing wrong for one of them) -- stable
+  // sort at least makes "first-enumerated-partition wins" well-defined
+  // instead of leaving a tie to std::sort's unspecified order.
   std::vector<BodyRange> bodyRanges;
   for (const auto& partition : scanPartitions) {
     if (partition.bodySid == 0) continue;  // never a partition's own essence, only an index/metadata host
     if (videoBodySid != 0 && partition.bodySid != videoBodySid) continue;
     bodyRanges.push_back({partition.bodyOffset, partition.essenceStartOffset});
   }
-  std::sort(bodyRanges.begin(), bodyRanges.end(),
-            [](const BodyRange& a, const BodyRange& b) { return a.bodyOffset < b.bodyOffset; });
+  std::stable_sort(bodyRanges.begin(), bodyRanges.end(),
+                   [](const BodyRange& a, const BodyRange& b) { return a.bodyOffset < b.bodyOffset; });
 
   // Stable sorts throughout: on a genuine tie (overlapping/duplicate
   // segments sharing an IndexStartPosition, or two segments producing the
