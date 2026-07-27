@@ -44,6 +44,30 @@ bool FileByteSource::ReadBytes(void* dst, size_t n) {
 
 bool FileByteSource::Skip(uint64_t n) {
   if (!file_) return false;
+  // Small forward skips are read-and-discarded rather than fseek'd past --
+  // unlike glibc (which can satisfy an in-buffer seek with no syscall at
+  // all), the Windows CRT's fseek unconditionally discards its stdio buffer
+  // and forces a fresh underlying read on the very next fread, regardless of
+  // how close the target is. EssenceWalker calls this for every KLV it isn't
+  // interested in (System Items, audio elements, Index Table Segments, KLV
+  // Fill) -- one or more per essence element on a typical frame-wrapped
+  // OP1a file -- so each one was forcing an extra real read (an extra
+  // network round trip, for a file opened over an SMB share) that plain
+  // sequential fread'ing through the same bytes wouldn't. Large skips still
+  // use a real seek: reading megabytes just to throw them away would cost
+  // far more (real bytes actually transferred over the wire) than the round
+  // trip it avoids.
+  constexpr uint64_t kMaxDiscardRead = 64 * 1024;
+  if (n <= kMaxDiscardRead) {
+    uint8_t discard[4096];
+    uint64_t remaining = n;
+    while (remaining > 0) {
+      const size_t chunk = remaining < sizeof(discard) ? static_cast<size_t>(remaining) : sizeof(discard);
+      if (fread(discard, 1, chunk, file_) != chunk) return false;
+      remaining -= chunk;
+    }
+    return true;
+  }
   return MXFSRC_FSEEK(file_, static_cast<mxfsrc_off_t>(n), SEEK_CUR) == 0;
 }
 

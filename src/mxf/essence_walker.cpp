@@ -39,9 +39,16 @@ bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
         out.isVideo = matchesVideo;
         out.isAudio = matchesAudio && !matchesVideo;
         out.filePosition = klvStart;
-        if (!wantData) {
+        // Audio's payload is never read here regardless of `wantData` --
+        // nothing in this codebase decodes it yet (see TODO Phase 8 item 1,
+        // GetAudio always returns silence), so every audio element on a real
+        // file with an audio track was otherwise being read off disk/network
+        // and heap-allocated into `out.data` only to be immediately
+        // discarded by every current caller (SourceEngine::DecodeNextFrame's
+        // `if (!element.isVideo) continue;`).
+        if (!wantData || !matchesVideo) {
           out.data.clear();
-          if (!reader_.Seek(valueEnd)) return false;
+          if (!reader_.Skip(klv.length)) return false;
           return true;
         }
         out.data.resize(klv.length);
@@ -53,7 +60,7 @@ bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
     // Partition packs, Primer Pack repeats, Index Table Segments, System
     // Items, KLV Fill, essence elements from untracked tracks, etc. -- all
     // skipped the same way: move past the Value without interpreting it.
-    if (!reader_.Seek(valueEnd)) return false;
+    if (!reader_.Skip(klv.length)) return false;
   }
   return false;
 }
