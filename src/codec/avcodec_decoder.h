@@ -25,6 +25,8 @@ class AvcodecDecoder final : public Decoder {
   bool IsValid() const override;
 
  private:
+  bool ReceiveOneFrame(NormalizedFrame& out);
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

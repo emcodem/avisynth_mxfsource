@@ -259,6 +259,53 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Traces the raw sequential EssenceWalker (the exact same class
+  // SourceEngine::DecodeThreadMain uses) from headerMetadataEnd forward,
+  // printing every VIDEO essence element's index/file position/length --
+  // no decode involved. Used to pin down exactly where a sequential walk
+  // desyncs vs where the file's own byte layout actually places a given
+  // edit unit (cross-check against index-scan's offsets). args: <file>
+  // trace-essence [maxVideoElements=700].
+  if (argc >= 3 && std::string(argv[2]) == "trace-essence") {
+    const int maxVideo = argc >= 4 ? std::stoi(argv[3]) : 700;
+    MxfReader reader(argv[1]);
+    if (!reader.IsOpen()) {
+      std::cerr << "failed to open" << std::endl;
+      return 1;
+    }
+    std::string err;
+    auto info = ParseMxfHeader(reader, &err);
+    if (!info) {
+      std::cerr << "ParseMxfHeader failed: " << err << std::endl;
+      return 1;
+    }
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
+                         info->audioTrackNumber, info->hasAudio);
+    int videoCount = 0;
+    int64_t totalElements = 0;
+    while (videoCount < maxVideo) {
+      EssenceElement element;
+      const uint64_t beforePos = reader.Tell();
+      if (!walker.Next(element)) {
+        std::cout << "walker.Next() FAILED after " << videoCount << " video elements, " << totalElements
+                   << " total elements. reader.Tell()=" << reader.Tell() << " reader.Size()=" << reader.Size()
+                   << std::endl;
+        return 1;
+      }
+      ++totalElements;
+      if (element.isVideo) {
+        if (videoCount < 10 || videoCount >= maxVideo - 10 || videoCount % 100 == 0) {
+          std::cout << "video[" << videoCount << "] filePosition=" << element.filePosition
+                     << " dataSize=" << element.data.size() << " (walker was at " << beforePos
+                     << " before this Next())" << std::endl;
+        }
+        ++videoCount;
+      }
+    }
+    std::cout << "reached " << videoCount << " video elements, stopping (limit)." << std::endl;
+    return 0;
+  }
+
   SourceEngine engine;
   OpenOptions openOpts;
   // Optional 3rd arg: buffer_frames, e.g. large enough to cover the whole

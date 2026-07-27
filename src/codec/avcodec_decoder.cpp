@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstring>
+#include <deque>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -54,6 +56,18 @@ struct AvcodecDecoder::Impl {
   AVCodecContext* ctx = nullptr;
   AVFrame* frame = nullptr;
   AVPacket* packet = nullptr;
+  // Frames drained from avcodec but not yet claimed by a caller -- see
+  // SendAndReceive's retry loop: avcodec_send_packet can transiently return
+  // AVERROR(EAGAIN) when its internal queue is full (more likely with
+  // frame-threaded decode), and per its documented contract the caller must
+  // drain a frame via avcodec_receive_frame to make room and then retry the
+  // SAME send, not discard the packet. But SendAndReceive's own contract is
+  // strictly one-output-frame-per-call, so any frame drained purely to make
+  // room for a still-pending send is stashed here and handed out on a later
+  // call instead of being lost. Queuing it as an already-converted
+  // NormalizedFrame (not a raw AVFrame ref) keeps this a plain FIFO with no
+  // separate cleanup path.
+  std::deque<NormalizedFrame> pending;
 
   ~Impl() {
     if (frame) av_frame_free(&frame);
@@ -61,6 +75,27 @@ struct AvcodecDecoder::Impl {
     if (ctx) avcodec_free_context(&ctx);
   }
 };
+
+bool AvcodecDecoder::ReceiveOneFrame(NormalizedFrame& out) {
+  const int recvRet = avcodec_receive_frame(impl_->ctx, impl_->frame);
+  if (recvRet < 0) return false;  // AVERROR(EAGAIN): needs more input; AVERROR_EOF: truly done
+
+  out.format = FromAvPixFmt(impl_->frame->format);
+  out.width = impl_->frame->width;
+  out.height = impl_->frame->height;
+  const int numPlanes = NumPlanes(out.format);
+  for (int p = 0; p < numPlanes; ++p) {
+    const int planeHeight = p == 0 ? out.height : ChromaHeight(out.format, out.height);
+    const int stride = impl_->frame->linesize[p];
+    out.stride[p] = stride;
+    out.planeHeight[p] = planeHeight;
+    out.planeData[p].assign(impl_->frame->data[p], impl_->frame->data[p] + static_cast<size_t>(stride) * planeHeight);
+  }
+  for (int p = numPlanes; p < 3; ++p) out.planeData[p].clear();
+
+  av_frame_unref(impl_->frame);
+  return true;
+}
 
 AvcodecDecoder::AvcodecDecoder(CodecFamily family, int width, int height) : impl_(std::make_unique<Impl>()) {
   const AVCodecID id = ToAvCodecId(family);
@@ -138,28 +173,38 @@ bool AvcodecDecoder::SendAndReceive(const std::vector<uint8_t>& essenceData, Nor
     std::memcpy(impl_->packet->data, essenceData.data(), essenceData.size());
     std::memset(impl_->packet->data + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
-    const int sendRet = avcodec_send_packet(impl_->ctx, impl_->packet);
-    if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) return false;
+    // avcodec_send_packet can transiently return AVERROR(EAGAIN) when its
+    // internal queue is already full (more likely with frame-threaded
+    // decode, e.g. high-resolution long-GOP H.264): the documented contract
+    // is to drain a frame via avcodec_receive_frame to make room and then
+    // retry the SAME send, not move on to the next essence element --
+    // silently doing the latter would drop that element's compressed data
+    // on the floor forever. Any frame drained here purely to make room is
+    // real decoded output, not a throwaway -- it's queued into `pending`
+    // (see above) rather than discarded.
+    for (;;) {
+      const int sendRet = avcodec_send_packet(impl_->ctx, impl_->packet);
+      if (sendRet == 0) break;
+      if (sendRet != AVERROR(EAGAIN)) return false;
+      NormalizedFrame drained;
+      if (!ReceiveOneFrame(drained)) return false;  // shouldn't happen per API docs; bail rather than spin
+      impl_->pending.push_back(std::move(drained));
+    }
   }
 
-  const int recvRet = avcodec_receive_frame(impl_->ctx, impl_->frame);
-  if (recvRet < 0) return false;  // AVERROR(EAGAIN): needs more input before a frame is ready
-
-  out.format = FromAvPixFmt(impl_->frame->format);
-  out.width = impl_->frame->width;
-  out.height = impl_->frame->height;
-  const int numPlanes = NumPlanes(out.format);
-  for (int p = 0; p < numPlanes; ++p) {
-    const int planeHeight = p == 0 ? out.height : ChromaHeight(out.format, out.height);
-    const int stride = impl_->frame->linesize[p];
-    out.stride[p] = stride;
-    out.planeHeight[p] = planeHeight;
-    out.planeData[p].assign(impl_->frame->data[p], impl_->frame->data[p] + static_cast<size_t>(stride) * planeHeight);
+  // Serve frames pulled out purely to make room for the send above (or left
+  // over from an earlier such call) before ever asking avcodec for a new
+  // one -- they were pulled out of decode order first and must be handed to
+  // the caller in that same order. Checked only *after* the send/drain above
+  // has already run, never before: essenceData must always actually reach
+  // avcodec every call, or a new element would be silently skipped whenever
+  // a pending frame happened to already be available.
+  if (!impl_->pending.empty()) {
+    out = std::move(impl_->pending.front());
+    impl_->pending.pop_front();
+    return true;
   }
-  for (int p = numPlanes; p < 3; ++p) out.planeData[p].clear();
-
-  av_frame_unref(impl_->frame);
-  return true;
+  return ReceiveOneFrame(out);
 }
 
 }  // namespace mxfsrc

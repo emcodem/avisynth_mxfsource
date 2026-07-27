@@ -76,6 +76,12 @@ void CopyPlanarFrame(const NormalizedFrame& src, VSFrame* dst, const VSAPI* vsap
     const int height = vsapi->getFrameHeight(dst, p);
     const uint8_t* s = src.planeData[p].data();
     const int sStride = src.stride[p];
+    // See avs_adapter.cpp's CopyPlane for why the contiguous case is worth
+    // special-casing: one bulk memcpy instead of `height` row-by-row calls.
+    if (dStride == sStride && dStride == rowBytes) {
+      std::memcpy(d, s, static_cast<size_t>(rowBytes) * static_cast<size_t>(height));
+      continue;
+    }
     for (int y = 0; y < height; ++y) {
       std::memcpy(d + static_cast<ptrdiff_t>(y) * dStride, s + static_cast<ptrdiff_t>(y) * sStride,
                   static_cast<size_t>(rowBytes));

@@ -57,6 +57,16 @@ void CopyPlane(const NormalizedFrame& src, int srcPlaneIdx, PVideoFrame& dst, in
   const int height = dst->GetHeight(avsPlane);
   const uint8_t* s = src.planeData[srcPlaneIdx].data();
   const int sStride = src.stride[srcPlaneIdx];
+  // Both sides happen to be unpadded (no per-row slack beyond the pixel
+  // data itself) often enough -- typical video widths are already
+  // SIMD-alignment-friendly, so neither AviSynth's nor avcodec's allocator
+  // needs to round the pitch up -- that one bulk memcpy is preferable to
+  // the row-by-row loop below: same bytes moved, but one dispatch/alignment
+  // check instead of `height` of them (e.g. 2160 calls for a 4K frame).
+  if (dPitch == sStride && dPitch == rowBytes) {
+    std::memcpy(d, s, static_cast<size_t>(rowBytes) * static_cast<size_t>(height));
+    return;
+  }
   for (int y = 0; y < height; ++y) {
     std::memcpy(d + static_cast<ptrdiff_t>(y) * dPitch, s + static_cast<ptrdiff_t>(y) * sStride,
                 static_cast<size_t>(rowBytes));
