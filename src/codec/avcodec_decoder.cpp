@@ -5,6 +5,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 }
@@ -111,9 +112,31 @@ bool AvcodecDecoder::SendAndReceive(const std::vector<uint8_t>& essenceData, Nor
     const int drainRet = avcodec_send_packet(impl_->ctx, nullptr);
     if (drainRet < 0 && drainRet != AVERROR_EOF) return false;
   } else {
-    av_packet_unref(impl_->packet);
-    if (av_new_packet(impl_->packet, static_cast<int>(essenceData.size())) < 0) return false;
+    const int size = static_cast<int>(essenceData.size());
+    // Reuse the packet's existing buffer instead of av_new_packet's fresh
+    // av_malloc on every single frame, whenever that's safe: it's safe
+    // exactly when nothing else still holds a reference to it (frame-
+    // threaded decode can keep earlier packets alive internally -- see
+    // AV_INPUT_BUFFER_PADDING_SIZE-sized 0x00 tail below matching what
+    // av_new_packet itself would zero) and it's already large enough.
+    // avcodec_send_packet takes its own reference via av_packet_ref (a
+    // cheap refcount bump, since our packet already carries a buf) rather
+    // than requiring this function's memcpy to be the only copy in
+    // existence, so handing back the same buffer here doesn't race with
+    // that internal ref. Falls back to a fresh allocation otherwise (first
+    // call, buffer still referenced elsewhere, or grown past capacity).
+    AVBufferRef* buf = impl_->packet->buf;
+    const bool canReuse =
+        buf != nullptr && av_buffer_get_ref_count(buf) == 1 && buf->size >= size + AV_INPUT_BUFFER_PADDING_SIZE;
+    if (canReuse) {
+      impl_->packet->data = buf->data;
+      impl_->packet->size = size;
+    } else {
+      av_packet_unref(impl_->packet);
+      if (av_new_packet(impl_->packet, size) < 0) return false;
+    }
     std::memcpy(impl_->packet->data, essenceData.data(), essenceData.size());
+    std::memset(impl_->packet->data + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
     const int sendRet = avcodec_send_packet(impl_->ctx, impl_->packet);
     if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) return false;

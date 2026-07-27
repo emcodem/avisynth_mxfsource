@@ -21,18 +21,26 @@ namespace {
 // future codec-specific quirks. Returns false only once the decoder has
 // truly nothing left to give after essence is exhausted (real end of
 // stream/error) -- the caller should treat that as fatal for its purpose.
-bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhausted, NormalizedFrame& outFrame) {
+// `scratch` is caller-owned and reused across every call (rather than a
+// fresh EssenceElement declared per call) so its `data` vector's heap buffer
+// survives from one frame to the next -- resize() then only grows the
+// buffer on the rare frame that's bigger than any seen so far, instead of
+// paying a fresh multi-frame-sized allocation on literally every single
+// frame. Same "recycle instead of reallocate" rationale as
+// SourceEngine::DecodeThreadMain's NormalizedFrame recycling, just applied
+// to the input (compressed essence) side instead of the output side.
+bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhausted, EssenceElement& scratch,
+                     NormalizedFrame& outFrame) {
   for (;;) {
     if (essenceExhausted) {
       return decoder.SendAndReceive({}, outFrame);
     }
-    EssenceElement element;
-    if (!walker.Next(element)) {
+    if (!walker.Next(scratch)) {
       essenceExhausted = true;
       continue;
     }
-    if (!element.isVideo) continue;  // audio elements: not wired into a ring buffer yet
-    if (decoder.SendAndReceive(element.data, outFrame)) return true;
+    if (!scratch.isVideo) continue;  // audio elements: not wired into a ring buffer yet
+    if (decoder.SendAndReceive(scratch.data, outFrame)) return true;
   }
 }
 
@@ -354,14 +362,16 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
                              streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
   bool essenceExhausted = false;
+  EssenceElement scratch;
   for (int64_t i = startEditUnit; i <= adjustedTarget; ++i) {
-    if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, *frame)) return nullptr;
+    if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, scratch, *frame)) return nullptr;
   }
   return frame;
 }
 
 void SourceEngine::DecodeThreadMain() {
   bool essenceExhausted = false;
+  EssenceElement scratch;
 
   // Discard the leading `originSkip_` video essence elements (Origin
   // pre-roll/trim, see MxfStreamInfo::origin) before host frame 0 is ever
@@ -383,7 +393,7 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       NormalizedFrame discard;
       for (int64_t i = 0; i < originSkip_; ++i) {
-        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, discard)) {
+        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, discard)) {
           videoBuffer_->SignalError(originError);
           return;
         }
@@ -417,7 +427,7 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       frame = std::make_shared<NormalizedFrame>();
     }
-    if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, *frame)) {
+    if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, *frame)) {
       videoBuffer_->SignalError("MXF essence ended before reaching the declared frame count (" +
                                  std::to_string(streamInfo_.numFrames) + ")");
       return;
