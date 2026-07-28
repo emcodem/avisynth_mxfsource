@@ -395,7 +395,17 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     }
   }
 
-  const int reorderDelay = startEditUnit > 0 ? videoIndex_->EstimateReorderDelay(startEditUnit) : 0;
+  // Previously skipped whenever startEditUnit==0, on the assumption that
+  // decoding continuously from the file's very first element needs no
+  // compensation. Disproven against the real repro file: even its first GOP
+  // has a real reorder delay (EstimateReorderDelay(0) == 2, confirmed via an
+  // independent ffprobe decode), so every frame decoded via this path was
+  // silently coming out shifted by that many positions. Frames within
+  // reorderDelay of edit unit 0 itself remain a known gap (see the walk-back
+  // loop above -- there's no earlier keyframe to borrow runway from when
+  // startEditUnit is already 0), same as any other unreachable-near-keyframe
+  // target.
+  const int reorderDelay = videoIndex_ ? videoIndex_->EstimateReorderDelay(startEditUnit) : 0;
   const int64_t iterations = std::max<int64_t>(1, essenceTarget - startEditUnit - reorderDelay + 1);
   const int64_t adjustedTarget = startEditUnit + iterations - 1;
 
