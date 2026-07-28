@@ -19,6 +19,14 @@
 
 using namespace mxfsrc;
 
+namespace {
+uint64_t PlaneChecksum(const std::vector<uint8_t>& plane) {
+  uint64_t sum = 1469598103934665603ULL;
+  for (uint8_t b : plane) sum = (sum ^ b) * 1099511628211ULL;
+  return sum;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: read_test_mxf <file.mxf> [seek_target_frame | compare <frame>]" << std::endl;
@@ -253,6 +261,18 @@ int main(int argc, char** argv) {
                    << " indexDuration=" << seg.indexDuration << " editUnitByteCount=" << seg.editUnitByteCount
                    << " indexSid=" << seg.indexSid << " bodySid=" << seg.bodySid << " entries=" << seg.entries.size()
                    << " essenceContainerBaseOffset=" << seg.essenceContainerBaseOffset << std::endl;
+        if (argc >= 5) {
+          const int64_t rangeStart = std::stoll(argv[3]);
+          const int64_t rangeEnd = std::stoll(argv[4]);
+          for (size_t i = 0; i < seg.entries.size(); ++i) {
+            const int64_t eu = seg.indexStartPosition + static_cast<int64_t>(i);
+            if (eu < rangeStart || eu >= rangeEnd) continue;
+            const auto& e = seg.entries[i];
+            std::cout << "      editUnit=" << eu << " keyFrameOffset=" << static_cast<int>(e.keyFrameOffset)
+                       << " flags=0x" << std::hex << static_cast<int>(e.flags) << std::dec
+                       << " streamOffset=" << e.streamOffset << std::endl;
+          }
+        }
       }
     }
     std::cout << "total index table segments found: " << totalSegs << std::endl;
@@ -320,7 +340,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   const auto& info = engine.StreamInfo();
-  std::cout << "opened: " << info.width << "x" << info.height << " numFrames=" << info.numFrames << std::endl;
+  std::cout << "opened: " << info.width << "x" << info.height << " numFrames=" << info.numFrames
+            << " origin=" << info.origin << " sourcePackageDuration=" << info.sourcePackageDuration << std::endl;
   std::cout << "essenceIndex: built=" << engine.HasEssenceIndex()
              << " highestCoveredEditUnit=" << engine.EssenceIndexHighestEditUnit() << std::endl;
 
@@ -340,6 +361,9 @@ int main(int argc, char** argv) {
     std::cout << "direct seek to frame " << target << ": status=" << static_cast<int>(st) << " took=" << seconds
                << "s";
     if (st != FetchStatus::kOk) std::cout << " err=" << err;
+    if (frame && !frame->planeData[0].empty())
+      std::cout << " firstByte=" << static_cast<int>(frame->planeData[0][0])
+                 << " checksum=" << PlaneChecksum(frame->planeData[0]);
     std::cout << std::endl;
     std::cout << "indexAssistedSeeks=" << engine.IndexAssistedSeekCount() << " nonBufferedFrames="
                << engine.NonBufferedServedFrames().size() << std::endl;
@@ -357,7 +381,7 @@ int main(int argc, char** argv) {
     std::cout << "frame " << i << " ok, format=" << static_cast<int>(frame->format) << " w=" << frame->width
               << " h=" << frame->height << " plane0size=" << frame->planeData[0].size()
               << " firstByte=" << static_cast<int>(frame->planeData[0].empty() ? 0 : frame->planeData[0][0])
-              << std::endl;
+              << " checksum=" << PlaneChecksum(frame->planeData[0]) << std::endl;
   }
   std::cout << "all frames read ok" << std::endl;
 

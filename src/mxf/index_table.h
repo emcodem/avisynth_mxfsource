@@ -19,15 +19,21 @@ inline constexpr Ul kIndexTableSegmentKey = {0x06, 0x0E, 0x2B, 0x34, 0x02, 0x53,
                                               0x0D, 0x01, 0x02, 0x01, 0x01, 0x10, 0x01, 0x00};
 
 // One IndexEntryArray row (mxfdec.c mxf_read_index_entry_array): the fixed
-// 11-byte prefix (TemporalOffset, KeyFrameOffset, Flags, StreamOffset) --
-// TemporalOffset/KeyFrameOffset are read-and-discarded by FFmpeg's own
-// decoder too (unused by any consumer for a "nearest preceding stored-order
-// keyframe" lookup, only needed for PTS/display-order reordering, which
-// this forward-only engine has no use for) so this project doesn't keep
-// them either. Any trailing SliceOffset[]/PosTable[] bytes (itemLength-11)
-// are skipped via stride arithmetic, never parsed individually -- same as
-// FFmpeg.
+// 11-byte prefix (TemporalOffset, KeyFrameOffset, Flags, StreamOffset).
+// TemporalOffset is still read-and-discarded (unused by any consumer here).
+// KeyFrameOffset IS kept: per SMPTE 377-1, it's the offset in edit units
+// (coded/stored order) from this entry to the anchor/key frame it actually
+// references. Verified against a real Canon XAVC/AVC file: the two leading
+// B pictures of a GOP starting at stored position 600 carry KeyFrameOffset
+// -13/-14 -- pointing at stored position 588, the *previous* GOP's own
+// keyframe (588 = 600 - 12, this file's GOP period), not the nearby
+// keyframe at 600 a naive "-1 or -2" would expect. AVC has no bitstream-
+// level closed_gop flag (unlike MPEG-2) to detect this any other way --
+// see EssenceIndex::NeedsPreviousGop. Any trailing SliceOffset[]/PosTable[]
+// bytes (itemLength-11) are skipped via stride arithmetic, never parsed
+// individually -- same as FFmpeg.
 struct IndexTableEntry {
+  int8_t keyFrameOffset = 0;
   uint8_t flags = 0;
   uint64_t streamOffset = 0;  // relative to this segment's essenceContainerBaseOffset
 };
@@ -154,6 +160,15 @@ struct FlatIndexEntry {
   // distinction IsKeyframeFlags's single bool deliberately throws away,
   // since nothing else needs it.
   uint8_t flags = 0;
+  // SMPTE 377-1 KeyFrameOffset (0 for CBR rows, always intra-only per
+  // FlattenSegmentInto's own doc comment, so never need this): the offset
+  // in edit units (coded/stored order, the same axis `editUnit` itself is
+  // on) from this row to the anchor/key frame it actually references.
+  // `editUnit + keyFrameOffset` is that anchor's own absolute position.
+  // Used by EssenceIndex::NeedsPreviousGop to detect an AVC open-GOP
+  // boundary (no bitstream-level closed_gop flag to read, unlike MPEG-2)
+  // -- see there.
+  int8_t keyFrameOffset = 0;
 };
 
 // A resolved, queryable index for one video track (one BodySID), built once
@@ -202,6 +217,21 @@ class EssenceIndex {
   // file's codec). Returns 0 if `keyframeEditUnit` isn't covered/found, or
   // if the run is empty (no reordering, e.g. I/P-only GOPs).
   int EstimateReorderDelay(int64_t keyframeEditUnit) const;
+
+  // True if a decoder restarted fresh at `keyframeEditUnit` cannot correctly
+  // reconstruct this GOP alone -- an AVC open GOP, whose leading picture(s)
+  // reference the *previous* GOP's own anchor frame for prediction, not
+  // anything within this GOP. Unlike MPEG-2, AVC has no bitstream-level
+  // closed_gop flag to read (and the MXF header carries nothing equivalent
+  // either), so this is inferred the only way available: scanning forward
+  // from the keyframe through this GOP (bounded by the next keyframe) for
+  // any entry whose actual anchor (editUnit + keyFrameOffset, SMPTE 377-1)
+  // falls before keyframeEditUnit itself -- verified against a real file
+  // where the leading two B pictures' KeyFrameOffset (-13/-14) pointed at
+  // the previous GOP's keyframe, 12 edit units back, not the -1/-2 a closed
+  // GOP would carry. Returns false if keyframeEditUnit isn't covered/found,
+  // or (CBR rows, always intra-only) keyFrameOffset is always 0.
+  bool NeedsPreviousGop(int64_t keyframeEditUnit) const;
 
  private:
   std::vector<FlatIndexEntry> entries_;  // sorted ascending & unique by editUnit

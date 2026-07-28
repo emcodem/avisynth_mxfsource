@@ -215,17 +215,33 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
     stats_.RecordBufferedServe();
     return status;
   }
-  if (status != FetchStatus::kEvicted) return status;  // real error/shutdown/end-of-stream: propagate as-is
+  // kEndOfStream: DecodeThreadMain legitimately reached streamInfo_.numFrames
+  // -- nothing to retry. Anything else (kShutdown, if ever added) also
+  // propagates as-is. kEvicted and kError both fall through to the same
+  // fallback below: kError includes DecodeThreadMain's continuous decode
+  // hitting a real decode failure or premature end-of-essence *before*
+  // reaching the declared frame count -- real bug found on a real file
+  // where the continuous background decode lost sync a few frames before
+  // the true end (root cause still not fully understood), while a fresh,
+  // independent SeekAndDecode restart for those exact same frames -- same
+  // codec, same file, just a brand-new decoder instance -- decoded them
+  // correctly every time. Whatever the continuous path's problem is, it
+  // doesn't reproduce on a fresh restart, so falling back here recovers
+  // frames that would otherwise be reported as unreachable even though
+  // they're genuinely decodable.
+  if (status != FetchStatus::kEvicted && status != FetchStatus::kError) return status;
 
-  // Fell outside the ring buffer's window -- rather than failing outright,
-  // fall back to a one-shot re-decode from the start of the file. Slow
-  // (O(n), no keyframe index to jump via) but correct for any codec; the
-  // primary decode thread and ring buffer are left completely untouched.
+  // Fell outside the ring buffer's window (or DecodeThreadMain failed) --
+  // rather than failing outright, fall back to a one-shot re-decode from
+  // the start of the file (or the nearest keyframe the index provides).
+  // Slow without an index (O(n), no keyframe to jump via) but correct for
+  // any codec; the primary decode thread and ring buffer are left
+  // completely untouched.
   auto seeked = SeekAndDecode(n);
   if (!seeked) {
     if (errorOut) {
-      *errorOut = "requested frame fell outside the ring buffer window, and the fallback re-decode "
-                  "from file start also failed to reach it";
+      *errorOut = "requested frame fell outside the ring buffer window (or the background decode failed to "
+                  "reach it), and the fallback re-decode also failed to reach it";
     }
     return FetchStatus::kError;
   }
@@ -322,9 +338,14 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // counting outputs unconditionally landed 2 edit units too far forward on
   // a real long-GOP MPEG-2 camera file -- AVCodecContext::delay wasn't
   // populated for that codec and per-packet pts weren't reliably preserved
-  // through avcodec's own reordering, so neither could recover this number
-  // from the decoder itself. See EssenceIndex::EstimateReorderDelay for how
-  // it's derived from the index's own flags instead.
+  // through avcodec's own reordering (confirmed again directly: explicitly
+  // setting PTS per packet and reading it back off the decoded frame is
+  // *not* reliably preserved through a real H.264 decoder's own internal
+  // reordering either, even though the same technique round-trips correctly
+  // through a real MPEG-2 encode/decode -- codec-specific, and not
+  // something to build a general fix on), so neither could recover this
+  // number from the decoder itself. See EssenceIndex::EstimateReorderDelay
+  // for how it's derived from the index's own flags instead.
   //
   // A target within reorderDelay of its own nearest keyframe can't be
   // reached this way at all -- decoding even the minimum one iteration
@@ -352,6 +373,25 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
       }
       if (seekPoint->editUnit == 0) break;  // can't search earlier than this
       searchFrom = seekPoint->editUnit - 1;
+    }
+
+    // AVC open GOP: this GOP's own leading picture(s) may reference the
+    // *previous* GOP's anchor frame, not anything within this GOP -- a
+    // decoder restarted fresh at startEditUnit alone would be missing that
+    // reference (verified against a real file: every GOP's leading two B
+    // pictures carry a KeyFrameOffset pointing at the previous GOP's own
+    // keyframe, not this one). Extending the restart back exactly one GOP
+    // is sufficient regardless of whether *that* GOP's own leading pictures
+    // have the same issue -- its own keyframe is an intra frame, self-
+    // sufficient by definition, and everything decoded from it before
+    // reaching startEditUnit is discarded by the reorderDelay/iterations
+    // math below anyway, so its correctness doesn't matter, only that
+    // decoding it populates the reference this GOP's leading pictures need.
+    if (startEditUnit > 0 && videoIndex_->NeedsPreviousGop(startEditUnit)) {
+      if (auto prevPoint = videoIndex_->FindPrecedingKeyframe(startEditUnit - 1)) {
+        startOffset = prevPoint->byteOffset;
+        startEditUnit = prevPoint->editUnit;
+      }
     }
   }
 

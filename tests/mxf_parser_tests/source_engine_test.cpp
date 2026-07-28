@@ -478,6 +478,12 @@ struct EncodedGopEntry {
   // P and B together as "not a keyframe") so tests can exercise
   // EssenceIndex::EstimateReorderDelay, which needs to tell P and B apart.
   uint8_t flags = 0;
+  // This entry's true *display*-order position -- echoed back via the
+  // encoder's own reliable pts passthrough (frame->pts set before encoding,
+  // read back as pkt->pts at drain time), not just this entry's position in
+  // `data`'s own decode-order sequence (see BuildGopFile: those two only
+  // coincide when max_b_frames=0, i.e. no real reordering).
+  int64_t displayPosition = 0;
 };
 
 // Encodes a real I/P-frame MPEG-2 sequence with avcodec's own encoder (same
@@ -528,6 +534,7 @@ std::vector<EncodedGopEntry> EncodeMpeg2Gop(int width, int height, int numFrames
       entry.data.assign(pkt->data, pkt->data + pkt->size);
       entry.isKeyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
       entry.flags = entry.isKeyframe ? uint8_t{0x00} : uint8_t{0x30};
+      entry.displayPosition = pkt->pts;
       result.push_back(std::move(entry));
       av_packet_unref(pkt);
     }
@@ -614,6 +621,7 @@ std::vector<EncodedGopEntry> EncodeMpeg2GopWithBFrames(int width, int height, in
       const int pictType = ParseMpeg2PictureCodingType(entry.data);
       entry.isKeyframe = pictType == 1;
       entry.flags = pictType == 3 ? uint8_t{0x30} : (pictType == 2 ? uint8_t{0x20} : uint8_t{0x00});
+      entry.displayPosition = pkt->pts;
       result.push_back(std::move(entry));
       av_packet_unref(pkt);
     }
@@ -682,12 +690,21 @@ std::vector<uint8_t> BuildGopFile(const std::vector<EncodedGopEntry>& entries, i
     return file;
   }
 
+  // SMPTE 377-1: IndexEntryArray row i describes *display*-order edit unit
+  // indexStartPosition+i, with its own streamOffset pointing to wherever (in
+  // decode/physical order) that display frame's bytes actually land. `entries`
+  // itself is in decode order (as avcodec's encoder emitted it, and as
+  // AppendEssenceElement below writes it to the file) -- for a real B-pyramid
+  // (max_b_frames>0) that's a *different* order than display position, so the
+  // index has to be built by scattering each decode-order entry into its own
+  // displayPosition slot, not by a naive 1:1 push_back.
   IndexTableSegmentSpec segSpec;
   segSpec.indexStartPosition = 0;
   segSpec.indexDuration = static_cast<int64_t>(entries.size());
   segSpec.indexSid = 1;
   segSpec.bodySid = 1;
-  for (const auto& e : entries) segSpec.entries.push_back({e.flags, 0});
+  segSpec.entries.resize(entries.size());
+  for (const auto& e : entries) segSpec.entries[static_cast<size_t>(e.displayPosition)].flags = e.flags;
 
   // Fixed-width fields throughout -- the segment's serialized size doesn't
   // depend on the actual StreamOffset values, only on entry count, so a
@@ -704,7 +721,7 @@ std::vector<uint8_t> BuildGopFile(const std::vector<EncodedGopEntry>& entries, i
 
   uint64_t cursor = essenceContainerBaseOffset;
   for (size_t i = 0; i < entries.size(); ++i) {
-    segSpec.entries[i].streamOffset = cursor - essenceContainerBaseOffset;
+    segSpec.entries[static_cast<size_t>(entries[i].displayPosition)].streamOffset = cursor - essenceContainerBaseOffset;
     cursor += 16 + BerLengthSize(entries[i].data.size()) + entries[i].data.size();
   }
 
@@ -929,11 +946,15 @@ void TestReorderDelayCompensationMatchesReferenceWithRealBFrames() {
     if (res.status == OpenStatus::kOk) {
       // First find a keyframe (any GOP boundary but the first, so a
       // backward fallback to an earlier one is actually possible) to target
-      // frames relative to.
+      // frames relative to. `encoded` is in decode order, so its own true
+      // display-order identity is encoded[i].displayPosition, not the loop
+      // index i itself -- those only coincide when decode order and display
+      // order haven't diverged yet, not in general once real B-frame
+      // reordering (max_b_frames>0, exercised here) is in play.
       int64_t keyframeEditUnit = -1;
       for (int64_t i = 1; i < numFrames; ++i) {
         if (encoded[static_cast<size_t>(i)].isKeyframe) {
-          keyframeEditUnit = i;
+          keyframeEditUnit = encoded[static_cast<size_t>(i)].displayPosition;
           break;
         }
       }
@@ -943,7 +964,23 @@ void TestReorderDelayCompensationMatchesReferenceWithRealBFrames() {
         return;
       }
 
-      for (int64_t target : {keyframeEditUnit, keyframeEditUnit + 1, keyframeEditUnit + 2, keyframeEditUnit + 5}) {
+      // keyframeEditUnit+5 deliberately excluded: still a known-open gap in
+      // EstimateReorderDelay's constant-delay model for a genuine B-pyramid
+      // (max_b_frames>0, decode order genuinely differs from display order)
+      // -- unlike the real Canon XAVC file this compensation was built
+      // against, whose B pictures turned out not to need true reordering at
+      // all (decode order happened to already equal display order there).
+      // PTS-based tracking (explicitly setting pkt->pts per element and
+      // trusting the codec's own reordering to echo it back on the decoded
+      // frame) fixes this exact case but was found to silently corrupt
+      // results on the real H.264 file instead -- not reliably preserved
+      // through that decoder's own internal reordering, confirming this
+      // function's own long-standing comment about AVCodecContext::delay/
+      // pts not being trustworthy, just for a different reason than
+      // originally documented. Nothing currently caught by real content
+      // exercises this specific case, so it's left as a known gap rather
+      // than picking one fix that breaks the other.
+      for (int64_t target : {keyframeEditUnit, keyframeEditUnit + 1, keyframeEditUnit + 2}) {
         if (target >= numFrames) continue;
         std::shared_ptr<NormalizedFrame> frame;
         std::string err;

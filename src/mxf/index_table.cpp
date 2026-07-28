@@ -88,7 +88,8 @@ std::vector<IndexTableEntry> GetIndexEntryArray(const LocalTagMap& set, uint16_t
   for (uint32_t i = 0; i < count; ++i) {
     const size_t base = 8 + static_cast<size_t>(i) * itemLen;
     IndexTableEntry e;
-    // b[base+0]=TemporalOffset, b[base+1]=KeyFrameOffset -- both unused (see index_table.h).
+    // b[base+0]=TemporalOffset -- unused (see index_table.h).
+    e.keyFrameOffset = static_cast<int8_t>(b[base + 1]);
     e.flags = b[base + 2];
     uint64_t offset = 0;
     for (int k = 0; k < 8; ++k) offset = (offset << 8) | b[base + 3 + k];
@@ -241,6 +242,16 @@ int EssenceIndex::EstimateReorderDelay(int64_t keyframeEditUnit) const {
   return run;
 }
 
+bool EssenceIndex::NeedsPreviousGop(int64_t keyframeEditUnit) const {
+  auto it = std::lower_bound(entries_.begin(), entries_.end(), keyframeEditUnit,
+                              [](const FlatIndexEntry& e, int64_t t) { return e.editUnit < t; });
+  if (it == entries_.end() || it->editUnit != keyframeEditUnit) return false;
+  for (++it; it != entries_.end() && !it->isKeyframe; ++it) {
+    if (it->editUnit + static_cast<int64_t>(it->keyFrameOffset) < keyframeEditUnit) return true;
+  }
+  return false;
+}
+
 namespace {
 
 struct BodyRange {
@@ -324,7 +335,7 @@ void FlattenSegmentInto(const IndexTableSegment& seg, uint64_t fileSize, const s
         ResolveLogicalEssenceOffset(seg.entries[i].streamOffset, ranges, seg.essenceContainerBaseOffset);
     if (offset >= fileSize) continue;
     out.push_back({seg.indexStartPosition + static_cast<int64_t>(i), offset, IsKeyframeFlags(seg.entries[i].flags),
-                   seg.entries[i].flags});
+                   seg.entries[i].flags, seg.entries[i].keyFrameOffset});
   }
 }
 
