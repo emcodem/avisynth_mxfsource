@@ -159,6 +159,23 @@ class FrameBuffer {
              shutdown_;
     });
 
+    // An already-produced, still-resident frame is servable regardless of
+    // anything that happened afterward -- checked ahead of shutdown_/
+    // error_ so a *later* permanent producer failure can't retroactively
+    // invalidate frames that were already correctly decoded and are still
+    // sitting in the ring buffer. Previously checked after shutdown_/
+    // error_: a background decode failure at, say, ring index 634 set
+    // error_ permanently, which made every already-buffered, genuinely
+    // correct frame from 604 (window start) through 633 spuriously bounce
+    // to the caller's fallback re-decode too, instead of being served
+    // directly -- wasteful, and (combined with the producer racing ahead
+    // of the consumer by up to `margin`) made the exact index where a real
+    // file's failure appeared to start vary run to run with OS thread
+    // scheduling, not anything about the file itself.
+    if (index >= lowestValid_ && index <= highestProduced_) {
+      out = *slots_[SlotOf(index)];
+      return FetchStatus::kOk;
+    }
     if (shutdown_) {
       if (errorOut) *errorOut = "engine shut down";
       return FetchStatus::kError;
@@ -171,11 +188,8 @@ class FrameBuffer {
       if (errorOut) *errorOut = "requested frame fell outside the ring buffer window (increase buffer_frames)";
       return FetchStatus::kEvicted;
     }
-    if (index > highestProduced_) {
-      return FetchStatus::kEndOfStream;
-    }
-    out = *slots_[SlotOf(index)];
-    return FetchStatus::kOk;
+    // index > highestProduced_, endOfStream_ per the wait condition above.
+    return FetchStatus::kEndOfStream;
   }
 
  private:
