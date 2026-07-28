@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <deque>
 #include <vector>
 
 #include "codec/decoder_factory.h"
@@ -463,6 +464,31 @@ void SourceEngine::DecodeThreadMain() {
   // under that caller.
   std::shared_ptr<NormalizedFrame> recycled;
 
+  // Reorder-delay compensation: mirrors SeekAndDecode's reorderDelay math
+  // (see there, EssenceIndex::EstimateReorderDelay) for this from-element-0
+  // continuous path, which previously assumed no compensation was ever
+  // needed here at all -- disproven against a real Canon XAVC file, whose
+  // very first GOP has a genuine reorder delay of 2 (confirmed via an
+  // independent ffprobe decode), so ring index 0 -- and every index after
+  // it, permanently -- was silently getting served content shifted forward
+  // by that many display positions, for the entire file.
+  //
+  // Implemented as a small sliding delay line rather than SeekAndDecode's
+  // one-shot "decode `iterations` outputs, keep only the last" trick, since
+  // this loop must keep producing forever: each newly decoded frame is
+  // pushed onto `pending`; once it holds more than `reorderDelay` frames,
+  // the oldest is popped and served, exactly `reorderDelay` positions
+  // behind the raw decode stream (which is what makes ring index N line up
+  // with display position N once popping starts). The first `reorderDelay`
+  // ring indices have no earlier frame to draw that delay from -- nothing
+  // before element 0 exists to reference -- the same structural gap
+  // SeekAndDecode's own edit-unit-0 restart already accepts, so they're
+  // served the oldest frame decoded so far without popping it: a defensible
+  // best-effort repeat rather than blocking or fabricating content.
+  const int reorderDelay =
+      (videoIndex_ && !IsIntraOnlyCodec(streamInfo_.videoCodec)) ? videoIndex_->EstimateReorderDelay(0) : 0;
+  std::deque<std::shared_ptr<NormalizedFrame>> pending;
+
   for (;;) {
     const int64_t next = videoBuffer_->NextIndex();
     if (next >= streamInfo_.numFrames) {
@@ -482,8 +508,17 @@ void SourceEngine::DecodeThreadMain() {
                                  std::to_string(streamInfo_.numFrames) + ")");
       return;
     }
+    pending.push_back(std::move(frame));
 
-    recycled = videoBuffer_->Put(next, std::move(frame)).value_or(nullptr);
+    std::shared_ptr<NormalizedFrame> outputFrame;
+    if (static_cast<int>(pending.size()) > reorderDelay) {
+      outputFrame = std::move(pending.front());
+      pending.pop_front();
+    } else {
+      outputFrame = pending.front();  // still warming up -- best-effort repeat, not yet consumed
+    }
+
+    recycled = videoBuffer_->Put(next, std::move(outputFrame)).value_or(nullptr);
   }
 }
 
