@@ -16,6 +16,7 @@ extern "C" {
 }
 
 #include "core/source_engine.h"
+#include "core/use_audio_mode.h"
 #include "mxf/index_table.h"
 #include "synthetic_mxf.h"
 
@@ -51,6 +52,155 @@ std::vector<uint8_t> BuildFile(int width, int height, int numFrames) {
   AppendPartitionPack(bytes, PartitionKind::kBody);
   for (int i = 0; i < numFrames; ++i) {
     AppendEssenceElement(bytes, kTrackNumber, MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+  }
+  return bytes;
+}
+
+constexpr uint32_t kAudioTrackNumber = 0x02020200;
+constexpr uint32_t kAudioTrackNumber2 = 0x02020300;
+
+// Byte length of AppendBerLength's encoding for `length`, without writing
+// anything -- needed to predict each essence element's exact absolute file
+// offset before the file is actually built (see BuildFileWithAudio,
+// BuildGopFile).
+size_t BerLengthSize(uint64_t length) {
+  if (length < 0x80) return 1;
+  size_t n = 0;
+  uint64_t v = length;
+  do {
+    ++n;
+    v >>= 8;
+  } while (v != 0);
+  return 1 + n;
+}
+
+// One edit unit's worth of PCM content, distinguishable by edit unit/sample/
+// channel so GetAudioSamples' returned bytes can be checked exactly, not
+// just for the right length.
+std::vector<uint8_t> MakeAudioEditUnitPayload(int editUnit, int sampleCount, int channels) {
+  std::vector<uint8_t> data(static_cast<size_t>(sampleCount) * channels * 2);  // 16-bit
+  size_t idx = 0;
+  for (int s = 0; s < sampleCount; ++s) {
+    for (int c = 0; c < channels; ++c) {
+      const uint8_t v = static_cast<uint8_t>(editUnit * 20 + s * 4 + c);
+      data[idx++] = v;
+      data[idx++] = static_cast<uint8_t>(v + 1);
+    }
+  }
+  return data;
+}
+
+// Builds a synthetic file with one video + one audio track per edit unit,
+// carrying a correctly-populated Index Table Segment (VBR: one entry per
+// edit unit, StreamOffset pointing at that edit unit's video element --
+// its content package's start, matching FlatIndexEntry's own doc comment)
+// ahead of the essence. BuildAudioSampleIndexFromIndexTable requires this
+// full coverage -- per this plugin's supported audio envelope, an MXF file
+// without one simply doesn't get audio (see the comment on that function).
+//
+// audio.sampleRate is set to samplesPerEditUnit * 25 (BuildSyntheticHeader's
+// Track.EditRate is always hardcoded 25/1) so the closed-form cadence
+// BuildAudioSampleIndexFromIndexTable derives from editRate/sampleRate
+// exactly reproduces the caller's chosen samplesPerEditUnit -- an
+// unrealistic sample rate for real audio, same spirit as this file's other
+// deliberately tiny/unrealistic synthetic values (e.g. 4x2 video frames).
+std::vector<uint8_t> BuildFileWithAudio(int width, int height, int numFrames, int samplesPerEditUnit, int channels) {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = numFrames;
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = kTrackNumber;
+  SyntheticAudioTrack audio;
+  audio.trackNumber = kAudioTrackNumber;
+  audio.trackId = 100;
+  audio.channelCount = static_cast<uint32_t>(channels);
+  audio.sampleRate = static_cast<uint32_t>(samplesPerEditUnit) * 25;
+  audio.bitsPerSample = 16;
+  cfg.audioTracks = {audio};
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+
+  std::vector<std::vector<uint8_t>> videoPayloads(static_cast<size_t>(numFrames));
+  std::vector<std::vector<uint8_t>> audioPayloads(static_cast<size_t>(numFrames));
+  for (int i = 0; i < numFrames; ++i) {
+    videoPayloads[static_cast<size_t>(i)] = MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i));
+    audioPayloads[static_cast<size_t>(i)] = MakeAudioEditUnitPayload(i, samplesPerEditUnit, channels);
+  }
+
+  IndexTableSegmentSpec segSpec;
+  segSpec.indexStartPosition = 0;
+  segSpec.indexDuration = numFrames;
+  segSpec.indexSid = 1;
+  segSpec.bodySid = 1;
+  segSpec.entries.resize(static_cast<size_t>(numFrames));
+
+  // Fixed-width fields throughout -- the segment's serialized size doesn't
+  // depend on the actual StreamOffset values, only on entry count, so a
+  // placeholder-offset build (all zero) already tells us exactly how large
+  // the real segment will be, letting us compute essenceContainerBaseOffset
+  // (and therefore every edit unit's correct StreamOffset) before writing
+  // anything's final content (mirrors BuildGopFile's own approach below).
+  std::vector<uint8_t> placeholderSegBytes;
+  AppendIndexTableSegment(placeholderSegBytes, segSpec);
+
+  const uint64_t bodyPartitionOffset = file.size();
+  AppendPartitionPack(file, PartitionKind::kBody, placeholderSegBytes.size(), /*indexSid=*/1);
+  const uint64_t essenceContainerBaseOffset = file.size() + placeholderSegBytes.size();
+
+  uint64_t cursor = essenceContainerBaseOffset;
+  for (int i = 0; i < numFrames; ++i) {
+    segSpec.entries[static_cast<size_t>(i)].streamOffset = cursor - essenceContainerBaseOffset;
+    cursor += 16 + BerLengthSize(videoPayloads[static_cast<size_t>(i)].size()) +
+              videoPayloads[static_cast<size_t>(i)].size();
+    cursor += 16 + BerLengthSize(audioPayloads[static_cast<size_t>(i)].size()) +
+              audioPayloads[static_cast<size_t>(i)].size();
+  }
+
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, segSpec);
+  if (segBytes.size() != placeholderSegBytes.size()) {
+    std::cerr << "BuildFileWithAudio: unexpected Index Table Segment size mismatch" << std::endl;
+  }
+
+  file.insert(file.end(), segBytes.begin(), segBytes.end());
+  for (int i = 0; i < numFrames; ++i) {
+    AppendEssenceElement(file, kTrackNumber, videoPayloads[static_cast<size_t>(i)]);
+    AppendEssenceElement(file, kAudioTrackNumber, audioPayloads[static_cast<size_t>(i)]);
+  }
+
+  // EnumeratePartitionsForIndex only ever knows about the Header Partition
+  // (offset 0) automatically -- discovering the Body Partition (where the
+  // Index Table Segment above actually lives) requires a RIP, exactly like
+  // a real multi-partition file.
+  AppendRandomIndexPack(file, {{1, 0}, {1, bodyPartitionOffset}});
+  return file;
+}
+
+// Two audio tracks that disagree on bit depth (16 vs 24) -- an unsupported
+// configuration per MxfStreamInfo::audioConfigSupported -- used to exercise
+// UseAudioMode's degrade-vs-hard-fail policy.
+std::vector<uint8_t> BuildFileWithMismatchedAudio(int width, int height, int numFrames) {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = numFrames;
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = kTrackNumber;
+  SyntheticAudioTrack a;
+  a.trackNumber = kAudioTrackNumber;
+  a.trackId = 101;
+  a.channelCount = 1;
+  a.bitsPerSample = 16;
+  SyntheticAudioTrack b;
+  b.trackNumber = kAudioTrackNumber2;
+  b.trackId = 102;
+  b.channelCount = 1;
+  b.bitsPerSample = 24;
+  cfg.audioTracks = {a, b};
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+  AppendPartitionPack(bytes, PartitionKind::kBody);
+  for (int i = 0; i < numFrames; ++i) {
+    AppendEssenceElement(bytes, kTrackNumber, MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+    AppendEssenceElement(bytes, kAudioTrackNumber, {0, 0});      // 1 sample, 16-bit
+    AppendEssenceElement(bytes, kAudioTrackNumber2, {0, 0, 0});  // 1 sample, 24-bit
   }
   return bytes;
 }
@@ -652,20 +802,6 @@ std::vector<EncodedGopEntry> EncodeMpeg2GopWithBFrames(int width, int height, in
   return result;
 }
 
-// Byte length of AppendBerLength's encoding for `length`, without writing
-// anything -- needed to predict each essence element's exact absolute file
-// offset before the file is actually built (see BuildGopFile).
-size_t BerLengthSize(uint64_t length) {
-  if (length < 0x80) return 1;
-  size_t n = 0;
-  uint64_t v = length;
-  do {
-    ++n;
-    v >>= 8;
-  } while (v != 0);
-  return 1 + n;
-}
-
 // Builds a GOP-shaped synthetic OP1a file from already-encoded MPEG-2
 // packets. When `includeIndexTable` is true, a Body Partition carries a
 // correctly-populated Index Table Segment (VBR: one entry per essence
@@ -1020,6 +1156,142 @@ void TestUnsupportedCodecFailsOpenCleanly() {
   std::filesystem::remove(path);
 }
 
+// Verifies GetAudioSamples' byte-exact output for a window that doesn't
+// align to an edit unit boundary (spans the tail of edit unit 0 and the
+// head of edit unit 1) -- exercising the multi-edit-unit-spanning loop in
+// SourceEngine::GetAudioSamples, not just a single-block fast path.
+void TestGetAudioSamplesSequentialMatchesExpectedBytes() {
+  const int width = 4, height = 2, numFrames = 4, samplesPerEditUnit = 4, channels = 2;
+  auto path = WriteTempFile(BuildFileWithAudio(width, height, numFrames, samplesPerEditUnit, channels),
+                            "mxfsrc_test_engine_audio_seq.mxf");
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(path.string());
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::cerr << "Open error: " << res.error << std::endl;
+      std::filesystem::remove(path);
+      return;
+    }
+    CHECK(engine.ExposesAudio());
+    CHECK(engine.TotalAudioSamples() == numFrames * samplesPerEditUnit);
+
+    const int bytesPerFrame = channels * 2;
+    std::vector<uint8_t> buf(6 * static_cast<size_t>(bytesPerFrame));
+    std::string err;
+    FetchStatus st = engine.GetAudioSamples(2, 6, buf.data(), &err);
+    CHECK(st == FetchStatus::kOk);
+
+    const auto eu0 = MakeAudioEditUnitPayload(0, samplesPerEditUnit, channels);
+    const auto eu1 = MakeAudioEditUnitPayload(1, samplesPerEditUnit, channels);
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), eu0.begin() + 2 * bytesPerFrame, eu0.end());       // samples 2,3 of edit unit 0
+    expected.insert(expected.end(), eu1.begin(), eu1.begin() + 4 * bytesPerFrame);     // samples 0..3 of edit unit 1
+    CHECK(buf == expected);
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Small buffer_frames forces the audio ring buffer to evict edit unit 0
+// well before it's requested -- GetAudioSamples must still return the
+// correct bytes via FreshReadAudioBlock's independent-reader fallback.
+void TestGetAudioSamplesFreshReadAfterEviction() {
+  const int width = 4, height = 2, numFrames = 6, samplesPerEditUnit = 2, channels = 1;
+  auto path = WriteTempFile(BuildFileWithAudio(width, height, numFrames, samplesPerEditUnit, channels),
+                            "mxfsrc_test_engine_audio_evict.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.buffer_frames = 2;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::cerr << "Open error: " << res.error << std::endl;
+      std::filesystem::remove(path);
+      return;
+    }
+    CHECK(engine.ExposesAudio());
+
+    for (int i = 0; i < numFrames; ++i) {
+      std::shared_ptr<NormalizedFrame> frame;
+      std::string verr;
+      CHECK(engine.GetVideoFrame(i, frame, &verr) == FetchStatus::kOk);
+    }
+
+    std::vector<uint8_t> buf(static_cast<size_t>(samplesPerEditUnit) * channels * 2);
+    std::string err;
+    FetchStatus st = engine.GetAudioSamples(0, samplesPerEditUnit, buf.data(), &err);
+    CHECK(st == FetchStatus::kOk);
+    CHECK(buf == MakeAudioEditUnitPayload(0, samplesPerEditUnit, channels));
+  }
+
+  std::filesystem::remove(path);
+}
+
+// use_audio="supported" (the default): a file whose audio tracks disagree
+// on bit depth must still open successfully for video, just without audio.
+void TestUseAudioModeSupportedDegradesOnMismatch() {
+  auto path =
+      WriteTempFile(BuildFileWithMismatchedAudio(4, 2, 2), "mxfsrc_test_engine_audio_mismatch_supported.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;  // use_audio defaults to UseAudioMode::kSupported
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    CHECK(!engine.ExposesAudio());
+  }
+  std::filesystem::remove(path);
+}
+
+// use_audio="always": the same mismatched-audio file must now hard-fail
+// Open() instead of silently degrading.
+void TestUseAudioModeAlwaysFailsOnMismatch() {
+  auto path = WriteTempFile(BuildFileWithMismatchedAudio(4, 2, 2), "mxfsrc_test_engine_audio_mismatch_always.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.use_audio = UseAudioMode::kAlways;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kUnsupportedCodec);
+  }
+  std::filesystem::remove(path);
+}
+
+// use_audio="never": even a fully-supported audio configuration must be
+// suppressed entirely.
+void TestUseAudioModeNeverSuppressesSupportedAudio() {
+  const int width = 4, height = 2, numFrames = 2, samplesPerEditUnit = 2, channels = 1;
+  auto path = WriteTempFile(BuildFileWithAudio(width, height, numFrames, samplesPerEditUnit, channels),
+                            "mxfsrc_test_engine_audio_never.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.use_audio = UseAudioMode::kNever;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    CHECK(!engine.ExposesAudio());
+    CHECK(engine.TotalAudioSamples() == 0);
+  }
+  std::filesystem::remove(path);
+}
+
+// use_audio="always" must never fail a source that simply has no audio
+// tracks at all -- only "audio present but unsupported" is a hard failure.
+void TestUseAudioModeAlwaysSucceedsOnVideoOnlySource() {
+  auto path = WriteTempFile(BuildFile(4, 2, 3), "mxfsrc_test_engine_audio_always_video_only.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.use_audio = UseAudioMode::kAlways;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    CHECK(!engine.ExposesAudio());
+  }
+  std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -1038,6 +1310,12 @@ int main() {
   TestReorderDelayCompensationMatchesReferenceWithRealBFrames();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
   TestUnsupportedCodecFailsOpenCleanly();
+  TestGetAudioSamplesSequentialMatchesExpectedBytes();
+  TestGetAudioSamplesFreshReadAfterEviction();
+  TestUseAudioModeSupportedDegradesOnMismatch();
+  TestUseAudioModeAlwaysFailsOnMismatch();
+  TestUseAudioModeNeverSuppressesSupportedAudio();
+  TestUseAudioModeAlwaysSucceedsOnVideoOnlySource();
 
   if (g_failures == 0) {
     std::cout << "all source_engine tests passed" << std::endl;

@@ -8,8 +8,10 @@
 #include <vector>
 
 #include "codec/decoder.h"
+#include "codec/pcm_interleave.h"
 #include "core/frame_buffer.h"
 #include "core/options.h"
+#include "mxf/audio_sample_index.h"
 #include "mxf/essence_walker.h"
 #include "mxf/header_parser.h"
 #include "mxf/index_table.h"
@@ -63,9 +65,15 @@ struct OpenResult {
 // source of thread-safety truth (see plan's "core/" section) so neither
 // adapter needs its own locking around the engine.
 //
-// Audio is not wired into a ring buffer yet -- EssenceWalker already yields
-// interleaved audio elements (see StreamInfo().hasAudio), but GetAudioSamples
-// is a follow-up (see plan Phase 4 notes / README).
+// Audio (when ExposesAudio()) is decoded on the same background thread as
+// video -- the essence is physically interleaved per edit unit, so a
+// separate audio reader/thread would re-read (and on HTTP sources,
+// re-transfer) every video KLV a second time just to skip it. Every audio
+// track discovered is summed into one interleaved output stream (see
+// mxf/header_parser.h's MxfStreamInfo::audioTracks); whether that's actually
+// exposed depends on OpenOptions::use_audio and whether the file's audio
+// configuration is one this plugin supports (see UseAudioMode, ul_tables.h
+// CodecFamily::kPcm-only for now).
 class SourceEngine {
  public:
   SourceEngine();
@@ -135,6 +143,35 @@ class SourceEngine {
   bool HasEssenceIndex() const { return videoIndex_.has_value() && !videoIndex_->Empty(); }
   int64_t EssenceIndexHighestEditUnit() const { return videoIndex_ ? videoIndex_->HighestCoveredEditUnit() : -1; }
 
+  // Whether this open file's audio is actually being decoded/exposed --
+  // false for a video-only source, and also false whenever the audio
+  // present is unsupported (mismatched track config, non-PCM codec) and
+  // OpenOptions::use_audio degraded it rather than hard-failing Open(). Both
+  // host adapters gate their VideoInfo/VSAudioInfo audio setup on this.
+  bool ExposesAudio() const { return exposeAudio_; }
+
+  // Total samples-per-channel exposed to the host -- i.e. excluding the
+  // Origin pre-roll trim, the same way StreamInfo().numFrames already
+  // excludes it for video (see audioSampleOriginSkip_). Known exactly at
+  // Open() time (see mxf/audio_sample_index.h) -- both AviSynth's
+  // VideoInfo::num_audio_samples and VapourSynth's VSAudioInfo::numSamples
+  // need this up front. 0 if !ExposesAudio().
+  int64_t TotalAudioSamples() const {
+    return audioSampleIndex_ ? audioSampleIndex_->TotalSamples() - audioSampleOriginSkip_ : 0;
+  }
+
+  // Fills `buf` with `count` samples-per-channel (interleaved across every
+  // summed audio channel, native bit depth -- see MxfStreamInfo::
+  // audioChannels/audioBitsPerSample) starting at sample `start`. Mirrors
+  // GetVideoFrame's ring-buffer-first, fresh-reader-fallback shape, but
+  // keyed by sample position (via audioSampleIndex_) rather than frame
+  // index directly, since a request doesn't generally align to an edit
+  // unit's own sample-block boundary. A request extending past the last
+  // known sample is zero-filled (silence) rather than treated as an error --
+  // defensive only, since both adapters set their total sample count exactly
+  // from TotalAudioSamples(). Only valid when ExposesAudio().
+  FetchStatus GetAudioSamples(int64_t start, int64_t count, void* buf, std::string* errorOut = nullptr);
+
  private:
   void DecodeThreadMain();
 
@@ -149,6 +186,32 @@ class SourceEngine {
   // but O(target) slow, since there is no keyframe index to seek to
   // directly. Returns nullptr if essence runs out before reaching `target`.
   std::shared_ptr<NormalizedFrame> SeekAndDecode(int64_t target);
+
+  // Audio counterparts of GetVideoFrame/SeekAndDecode's ring-buffer-first,
+  // fresh-reader-fallback split: FetchAudioBlock resolves ring index
+  // `hostEditUnit` (host-frame-relative, same space as videoBuffer_/
+  // GetVideoFrame's `n`) from audioBuffer_ (blocking, same as
+  // videoBuffer_->Get) unless it's far enough ahead that waiting would be
+  // as slow as a linear scan, or the buffer reports the index as evicted/
+  // errored -- either case falls through to FreshReadAudioBlock, a one-shot
+  // independent MxfReader/EssenceWalker read starting directly at
+  // `byteOffset` (already resolved by the caller via audioSampleIndex_,
+  // which operates in raw essence-edit-unit space -- see
+  // audioSampleOriginSkip_ -- so FreshReadAudioBlock itself needs no
+  // edit-unit/origin translation at all). Much simpler than SeekAndDecode's
+  // video equivalent: PCM has no GOP/reorder-delay dependencies, so this is
+  // always a direct index-assisted jump.
+  FetchStatus FetchAudioBlock(int64_t hostEditUnit, uint64_t byteOffset, std::shared_ptr<AudioBlock>& out,
+                              std::string* errorOut);
+  std::shared_ptr<AudioBlock> FreshReadAudioBlock(uint64_t byteOffset);
+
+  // Appends `line` to stderr, and to OpenOptions::logfile (if set) prefixed
+  // with a timestamp -- factored out of what was originally ~SourceEngine's
+  // own ServeStats-summary-only logging so an audio-degraded note (see
+  // Open()'s UseAudioMode handling) can share the same "stderr alone is
+  // invisible to GUI hosts" rationale without duplicating the timestamp
+  // formatting.
+  void AppendLogLine(const std::string& line) const;
 
   std::string path_;
   std::string logFile_;
@@ -172,6 +235,28 @@ class SourceEngine {
   std::shared_ptr<NormalizedFrame> firstFrame_;
   std::thread decodeThread_;
   ServeStats stats_;
+
+  // See ExposesAudio(). Decided once in Open() from streamInfo_.hasAudio/
+  // audioConfigSupported and OpenOptions::use_audio; never mutated
+  // afterward (same immutable-after-Open() lifecycle as streamInfo_/
+  // videoIndex_), except that DecodeThreadMain may stop *producing* new
+  // audio blocks after a mid-file audio decode error without touching this
+  // flag -- already-buffered/already-fresh-read audio remains servable, see
+  // FetchAudioBlock/frame_buffer.h's FetchStatus semantics.
+  bool exposeAudio_ = false;
+  // Self-contained sample-position index (mxf/audio_sample_index.h), built
+  // once in Open() when exposeAudio_ -- gives TotalAudioSamples() and
+  // GetAudioSamples() a way to resolve any sample position to an edit unit/
+  // byte offset without a lazy/incremental scan.
+  std::optional<AudioSampleIndex> audioSampleIndex_;
+  std::unique_ptr<FrameBuffer<std::shared_ptr<AudioBlock>>> audioBuffer_;
+  // Audio-space equivalent of originSkip_: how many leading samples (across
+  // audioSampleIndex_'s raw essence edit units [0, originSkip_)) are
+  // trimmed off the front, so audioBuffer_'s host-relative ring index 0 (the
+  // first edit unit DecodeThreadMain actually produces, essence edit unit
+  // originSkip_) lines up with GetAudioSamples' sample position 0. Computed
+  // once in Open() from audioSampleIndex_->CumulativeSamplesBefore(originSkip_).
+  int64_t audioSampleOriginSkip_ = 0;
 };
 
 }  // namespace mxfsrc

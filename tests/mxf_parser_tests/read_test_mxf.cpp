@@ -299,8 +299,9 @@ int main(int argc, char** argv) {
       std::cerr << "ParseMxfHeader failed: " << err << std::endl;
       return 1;
     }
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
-                         info->audioTrackNumber, info->hasAudio);
+    std::vector<std::array<uint8_t, 4>> audioTrackNumbers;
+    for (const auto& t : info->audioTracks) audioTrackNumbers.push_back(t.trackNumber);
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, audioTrackNumbers);
     int videoCount = 0;
     int64_t totalElements = 0;
     while (videoCount < maxVideo) {

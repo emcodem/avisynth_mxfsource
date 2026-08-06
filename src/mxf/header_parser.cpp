@@ -66,6 +66,11 @@ constexpr uint16_t kTrackEditRate = 0x4B01;
 constexpr uint16_t kTrackOrigin = 0x4B02;
 constexpr uint16_t kTrackSequenceRef = 0x4803;
 constexpr uint16_t kTrackNumber = 0x4804;
+constexpr uint16_t kTrackId = 0x4801;
+// GenericDescriptor.LinkedTrackID: binds one sub-descriptor of a
+// MultipleDescriptor to a specific Track when a file has more than one
+// audio track (see ResolveDescriptor).
+constexpr uint16_t kLinkedTrackID = 0x3006;
 constexpr uint16_t kSequenceDuration = 0x0202;
 constexpr uint16_t kSequenceDataDefinition = 0x0201;
 constexpr uint16_t kDescriptorContainerDuration = 0x3002;
@@ -110,44 +115,105 @@ bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   return true;
 }
 
-bool ExtractSoundParams(const LocalTagMap& d, MxfStreamInfo& info) {
+bool ExtractSoundParams(const LocalTagMap& d, AudioTrackInfo& out) {
   uint32_t channels = 0;
   if (!GetU32(d, tag::kDescriptorChannelCount, channels)) return false;
   if (channels == 0) return false;
-  info.audioChannels = channels;
+  out.channelCount = channels;
   Rational sr{};
   if (GetRational32(d, tag::kDescriptorSampleRate, sr) && sr.den > 0) {
-    info.audioSampleRate = static_cast<uint32_t>(sr.num / sr.den);
+    out.sampleRate = static_cast<uint32_t>(sr.num / sr.den);
   }
-  GetU32(d, tag::kDescriptorQuantizationBits, info.audioBitsPerSample);
+  GetU32(d, tag::kDescriptorQuantizationBits, out.bitsPerSample);
   Ul coding{};
   if (GetUl(d, tag::kDescriptorSoundEssenceCompression, coding)) {
-    info.audioCodec = ClassifyCodecUl(coding);
+    out.codec = ClassifyCodecUl(coding);
+  } else {
+    // SoundEssenceCompression is optional per SMPTE 377-1/382: a compressed
+    // format (AC-3/MP2/AAC) has no other way to signal what scheme was used
+    // and always carries it, so its absence reliably means uncompressed
+    // PCM in practice -- confirmed against a real Canon camera file whose
+    // AES3PCMDescriptor sets (SMPTE 382, AES3-wrapped linear PCM) omit this
+    // tag entirely. Defaulting to kUnknown here (as an earlier version of
+    // this code did) misclassified that real file's perfectly valid PCM
+    // audio as an unsupported codec.
+    out.codec = CodecFamily::kPcm;
   }
   return true;
 }
 
 // Resolves a Package's DescriptorRef -- possibly a MultipleDescriptor
-// wrapping one sub-descriptor per essence track -- and fills in whichever of
-// info.hasVideo/hasAudio isn't set yet. MVP matches sub-descriptors by shape
-// (has StoredWidth => picture, has ChannelCount => sound) rather than by
-// LinkedTrackID; see Phase 7 for exact per-track matching.
-void ResolveDescriptor(const Ul& descriptorRef, const RawSets& sets, MxfStreamInfo& info) {
+// wrapping one sub-descriptor per essence track -- for the Track currently
+// being visited in ResolvePackage's loop (identified by `kind`/`trackId`/
+// `trackNumberBytes`). Gated by `kind` so a video Track's call can only ever
+// resolve video and an audio Track's call can only ever resolve audio --
+// without this, since a single-audio-track file's MultipleDescriptor has
+// exactly one sound-shaped sub-descriptor, the *video* Track's call (which
+// runs first, per ResolvePackage's Track order) would otherwise immediately
+// claim it via the sole-candidate fallback below, attributing it to the
+// video Track's TrackNumber instead of the real audio Track's.
+//
+// Audio sub-descriptor binding: a file with exactly one sound-shaped
+// sub-descriptor (the common single-audio-track case) binds it directly --
+// zero behavior change from the original shape-only matching. A file with
+// more than one requires LinkedTrackID (baseline tag 0x3006) to match the
+// current Track's TrackID; if none matches (e.g. an older/lenient writer
+// that omits LinkedTrackID on a multi-audio-track file), this call simply
+// resolves no audio for this Track rather than risk binding the wrong
+// channels to it.
+void ResolveDescriptor(const Ul& descriptorRef, const RawSets& sets, EssenceKind kind, uint32_t trackId,
+                       const std::array<uint8_t, 4>& trackNumberBytes, MxfStreamInfo& info) {
   auto it = sets.byInstanceUid.find(descriptorRef);
   if (it == sets.byInstanceUid.end()) return;
   const LocalTagMap& d = it->second;
 
   std::vector<Ul> subRefs = GetUlArray(d, tag::kMultipleDescriptorFileDescriptors);
   if (subRefs.empty()) {
-    if (!info.hasVideo) info.hasVideo = ExtractPictureParams(d, info);
-    if (!info.hasAudio) info.hasAudio = ExtractSoundParams(d, info);
+    if (kind == EssenceKind::kVideo && !info.hasVideo) info.hasVideo = ExtractPictureParams(d, info);
+    if (kind == EssenceKind::kAudio) {
+      AudioTrackInfo audio;
+      audio.trackNumber = trackNumberBytes;
+      audio.trackId = trackId;
+      if (ExtractSoundParams(d, audio)) info.audioTracks.push_back(audio);
+    }
     return;
   }
-  for (const Ul& sub : subRefs) {
-    auto sit = sets.byInstanceUid.find(sub);
-    if (sit == sets.byInstanceUid.end()) continue;
-    if (!info.hasVideo) info.hasVideo = ExtractPictureParams(sit->second, info);
-    if (!info.hasAudio) info.hasAudio = ExtractSoundParams(sit->second, info);
+
+  if (kind == EssenceKind::kVideo && !info.hasVideo) {
+    for (const Ul& sub : subRefs) {
+      auto sit = sets.byInstanceUid.find(sub);
+      if (sit == sets.byInstanceUid.end()) continue;
+      if (ExtractPictureParams(sit->second, info)) {
+        info.hasVideo = true;
+        break;
+      }
+    }
+  }
+
+  if (kind == EssenceKind::kAudio) {
+    const LocalTagMap* chosen = nullptr;
+    const LocalTagMap* soleCandidate = nullptr;
+    int soundCount = 0;
+    for (const Ul& sub : subRefs) {
+      auto sit = sets.byInstanceUid.find(sub);
+      if (sit == sets.byInstanceUid.end()) continue;
+      uint32_t probeChannels = 0;
+      if (!GetU32(sit->second, tag::kDescriptorChannelCount, probeChannels) || probeChannels == 0) continue;
+      ++soundCount;
+      soleCandidate = &sit->second;
+      uint32_t linkedId = 0;
+      if (GetU32(sit->second, tag::kLinkedTrackID, linkedId) && linkedId == trackId) {
+        chosen = &sit->second;
+      }
+    }
+    if (!chosen && soundCount == 1) chosen = soleCandidate;
+
+    if (chosen) {
+      AudioTrackInfo audio;
+      audio.trackNumber = trackNumberBytes;
+      audio.trackId = trackId;
+      if (ExtractSoundParams(*chosen, audio)) info.audioTracks.push_back(audio);
+    }
   }
 }
 
@@ -190,9 +256,11 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePack
       }
     }
 
-    if ((kind == EssenceKind::kVideo && info.hasVideo) || (kind == EssenceKind::kAudio && info.hasAudio)) {
-      continue;  // already resolved this kind from an earlier package/track
-    }
+    // Video stays single-track: once resolved, later video Tracks are
+    // skipped (multi-video-track detection is separate, not-yet-done work,
+    // see TODO.md Phase 8 item 6). Audio is never skipped here -- every
+    // audio Track is visited so all of them can be summed into one output.
+    if (kind == EssenceKind::kVideo && info.hasVideo) continue;
 
     Rational editRate{};
     const bool haveEditRate = GetRational32(track, tag::kTrackEditRate, editRate);
@@ -200,6 +268,8 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePack
     GetI64(sequence, tag::kSequenceDuration, duration);
     uint32_t trackNumber = 0;
     const bool haveTrackNumber = GetU32(track, tag::kTrackNumber, trackNumber);
+    uint32_t trackId = 0;
+    GetU32(track, tag::kTrackId, trackId);
     const auto trackNumberBytes = [trackNumber]() {
       std::array<uint8_t, 4> b{};
       b[0] = static_cast<uint8_t>(trackNumber >> 24);
@@ -213,10 +283,8 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePack
       if (haveEditRate && editRate.den != 0) info.editRate = editRate;
       if (duration >= 0) info.numFrames = duration;
       if (haveTrackNumber) info.videoTrackNumber = trackNumberBytes;
-    } else {
-      if (haveTrackNumber) info.audioTrackNumber = trackNumberBytes;
     }
-    if (haveDescriptor) ResolveDescriptor(descriptorRef, sets, info);
+    if (haveDescriptor) ResolveDescriptor(descriptorRef, sets, kind, trackId, trackNumberBytes, info);
   }
 }
 
@@ -278,9 +346,50 @@ MxfStreamInfo ResolveStreamInfo(const RawSets& sets) {
     auto isSourceIt = sets.packageIsSource.find(packageUid);
     const bool isSourcePackage = isSourceIt != sets.packageIsSource.end() && isSourceIt->second;
     ResolvePackage(packageUid, sets, isSourcePackage, info);
-    if (info.hasVideo && info.hasAudio) break;
+    // No early-exit here (unlike the old single-video/single-audio version):
+    // audio tracks can be spread across multiple Tracks within a package (or
+    // even across packages), so every package must be scanned to collect
+    // all of them. Cost is trivial -- real files have at most a handful of
+    // packages (MaterialPackage + one or more SourcePackages).
   }
   return info;
+}
+
+// Sums audioTracks' channel counts and validates every track agrees on bit
+// depth, sample rate, and codec family (uncompressed PCM only) -- the only
+// configuration this plugin can output audio for today. Sets info.hasAudio
+// and either audioConfigSupported (populating the singular
+// audioSampleRate/audioBitsPerSample/audioCodec/audioChannels summary
+// fields used for output) or audioUnsupportedReason. Never fails
+// ParseMxfHeader itself -- what to do about unsupported audio (degrade vs.
+// hard-fail) is a playback-policy decision made later by
+// SourceEngine::Open via UseAudioMode, not a parse error.
+void ValidateAndSummarizeAudio(MxfStreamInfo& info) {
+  info.hasAudio = !info.audioTracks.empty();
+  if (!info.hasAudio) return;
+
+  const AudioTrackInfo& first = info.audioTracks.front();
+  uint32_t totalChannels = 0;
+  for (const AudioTrackInfo& t : info.audioTracks) {
+    totalChannels += t.channelCount;
+    if (t.codec != CodecFamily::kPcm) {
+      info.audioUnsupportedReason = "non-PCM audio codec not supported yet";
+      return;
+    }
+    if (t.bitsPerSample != first.bitsPerSample) {
+      info.audioUnsupportedReason = "audio tracks have mismatched bit depth";
+      return;
+    }
+    if (t.sampleRate != first.sampleRate) {
+      info.audioUnsupportedReason = "audio tracks have mismatched sample rate";
+      return;
+    }
+  }
+  info.audioConfigSupported = true;
+  info.audioChannels = totalChannels;
+  info.audioSampleRate = first.sampleRate;
+  info.audioBitsPerSample = first.bitsPerSample;
+  info.audioCodec = CodecFamily::kPcm;
 }
 
 // Attempts to override `info` from the Footer Partition's own redundant
@@ -343,17 +452,7 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   if (!partition) return fail("failed to parse Header Partition Pack");
 
   const uint64_t partitionEnd = partitionKlv.valueOffset + partitionKlv.length;
-  const uint64_t headerMetadataEnd = partitionEnd + partition->headerByteCount;
-
-  RawSets headerSets;
-  if (!ReadMetadataSets(reader, partitionEnd, partition->headerByteCount, headerSets)) {
-    return fail("malformed local-set metadata KLV");
-  }
-
-  MxfStreamInfo info = ResolveStreamInfo(headerSets);
-  info.headerMetadataEnd = headerMetadataEnd;
-  info.footerPartitionPresent = partition->footerPartition != 0;
-  info.bodySid = partition->bodySid;
+  uint64_t headerMetadataEnd = partitionEnd + partition->headerByteCount;
 
   // The Random Index Pack (see mxf/partition.h), if present, is read once
   // and used for two independent fixups below -- both observed on a real
@@ -361,37 +460,49 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   std::optional<std::vector<RandomIndexPackEntry>> rip = ReadRandomIndexPack(reader);
 
   // Fixup 1: HeaderByteCount can itself undercount the metadata actually
-  // written (observed: a trailing Identification set whose value genuinely
-  // extends past partitionEnd+headerByteCount). ReadMetadataSets above
-  // tolerates this silently -- a KLV whose declared value would cross that
-  // boundary is treated as "no more metadata to read" rather than a parse
-  // failure -- but that leaves headerMetadataEnd (EssenceWalker's scan
-  // start point) landing mid-way through real metadata bytes instead of at
-  // the true start of the next partition, which EssenceWalker then reads
-  // as garbage and fails to find any essence in. The RIP is authoritative
-  // here: its entries record every partition's real byte offset in file
-  // order, so the entry right after the Header Partition's own (always
-  // byteOffset 0) entry is exactly where the Header Partition truly ends --
-  // *if* that entry is a separate Body Partition. Some real files (observed:
-  // Atomos Shogun XAVC-Intra/XAVC-L recordings) have no Body Partition at
-  // all -- the Header Partition itself carries the Index Table Segment and
-  // then all essence directly after its Header Metadata, and RIP[1] is the
-  // Footer Partition instead. Blindly trusting RIP[1] there would jump
-  // straight to the Footer and make EssenceWalker skip every essence
-  // element in the file, so this fixup only applies when RIP[1] actually
-  // resolves to a Body Partition Pack.
+  // written (observed: a trailing Identification set, or -- on another real
+  // file -- the video Descriptor set itself, whose value genuinely extends
+  // past partitionEnd+headerByteCount). Applied *before* the metadata read
+  // below, not after: ReadMetadataSets tolerates the undercount silently (a
+  // KLV whose declared value would cross that boundary is treated as "no
+  // more metadata to read" rather than a parse failure), so scanning with
+  // the raw, too-small headerByteCount silently drops whichever sets
+  // happen to live in the undercounted gap -- fatal when that's the
+  // Descriptor carrying StoredWidth/StoredHeight, not just cosmetic like a
+  // dropped Identification set. The RIP is authoritative here: its entries
+  // record every partition's real byte offset in file order, so the entry
+  // right after the Header Partition's own (always byteOffset 0) entry is
+  // exactly where the Header Partition truly ends -- *if* that entry is a
+  // separate Body Partition. Some real files (observed: Atomos Shogun
+  // XAVC-Intra/XAVC-L recordings) have no Body Partition at all -- the
+  // Header Partition itself carries the Index Table Segment and then all
+  // essence directly after its Header Metadata, and RIP[1] is the Footer
+  // Partition instead. Blindly trusting RIP[1] there would jump straight to
+  // the Footer and make both this metadata scan and EssenceWalker skip
+  // every essence element in the file, so this fixup only applies when
+  // RIP[1] actually resolves to a Body Partition Pack.
   if (rip && rip->size() >= 2 && (*rip)[0].byteOffset == 0) {
     const uint64_t nextPartitionOffset = (*rip)[1].byteOffset;
-    if (nextPartitionOffset > info.headerMetadataEnd && nextPartitionOffset < reader.Size() &&
+    if (nextPartitionOffset > headerMetadataEnd && nextPartitionOffset < reader.Size() &&
         reader.Seek(nextPartitionOffset)) {
       KlvHeader nextKlv{};
       PartitionKind nextKind{};
       if (ReadKlvHeader(reader, nextKlv) && IsPartitionPackKey(nextKlv.key, &nextKind) &&
           nextKind == PartitionKind::kBody) {
-        info.headerMetadataEnd = nextPartitionOffset;
+        headerMetadataEnd = nextPartitionOffset;
       }
     }
   }
+
+  RawSets headerSets;
+  if (!ReadMetadataSets(reader, partitionEnd, headerMetadataEnd - partitionEnd, headerSets)) {
+    return fail("malformed local-set metadata KLV");
+  }
+
+  MxfStreamInfo info = ResolveStreamInfo(headerSets);
+  info.headerMetadataEnd = headerMetadataEnd;
+  info.footerPartitionPresent = partition->footerPartition != 0;
+  info.bodySid = partition->bodySid;
 
   // Fixup 2 (footer precedence, SMPTE 377-1: a Closed partition's metadata
   // takes precedence over an Open one): some recorders leave the Header
@@ -413,6 +524,7 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   }
 
   info.durationReliable = info.hasVideo && info.numFrames >= 0 && info.footerPartitionPresent;
+  ValidateAndSummarizeAudio(info);
   return info;
 }
 

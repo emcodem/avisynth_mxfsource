@@ -60,6 +60,8 @@ add_library(mxf_core STATIC
   src/mxf/essence_walker.h
   src/mxf/index_table.cpp
   src/mxf/index_table.h
+  src/mxf/audio_sample_index.cpp
+  src/mxf/audio_sample_index.h
   src/mxf/ul_tables.h
   src/codec/decoder.h
   src/codec/raw_unpack.cpp
@@ -68,8 +70,11 @@ add_library(mxf_core STATIC
   src/codec/avcodec_decoder.h
   src/codec/decoder_factory.cpp
   src/codec/decoder_factory.h
+  src/codec/pcm_interleave.cpp
+  src/codec/pcm_interleave.h
   src/core/frame_buffer.h
   src/core/options.h
+  src/core/use_audio_mode.h
   src/core/source_engine.cpp
   src/core/source_engine.h
 )

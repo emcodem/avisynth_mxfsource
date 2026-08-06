@@ -32,6 +32,20 @@ target_compile_features(mxf_index_table_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_index_table_tests PRIVATE mxf_core)
 add_test(NAME mxf_index_table_tests COMMAND mxf_index_table_tests)
 
+add_executable(mxf_audio_sample_index_tests
+  audio_sample_index_test.cpp
+)
+target_compile_features(mxf_audio_sample_index_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_audio_sample_index_tests PRIVATE mxf_core)
+add_test(NAME mxf_audio_sample_index_tests COMMAND mxf_audio_sample_index_tests)
+
+add_executable(mxf_pcm_interleave_tests
+  pcm_interleave_test.cpp
+)
+target_compile_features(mxf_pcm_interleave_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_pcm_interleave_tests PRIVATE mxf_core)
+add_test(NAME mxf_pcm_interleave_tests COMMAND mxf_pcm_interleave_tests)
+
 add_executable(mxf_decoder_tests
   decoder_test.cpp
 )

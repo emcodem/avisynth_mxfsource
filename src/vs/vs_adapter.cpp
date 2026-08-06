@@ -5,19 +5,23 @@
 // guarantees exclusive execution of our getFrame callback (matches
 // BestSource's own choice for a single logical decode stream that the core
 // still prefetches), so blocking on our internal condvar here is safe.
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "VapourSynth4.h"
 #include "core/options.h"
 #include "core/source_engine.h"
+#include "core/use_audio_mode.h"
 
 using mxfsrc::FetchStatus;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
 using mxfsrc::OpenResult;
 using mxfsrc::OpenStatus;
+using mxfsrc::ParseUseAudioMode;
 using mxfsrc::PixelFormat;
 using mxfsrc::SourceEngine;
 
@@ -121,10 +125,32 @@ void UnpackUyvyToYuv422Planar(const NormalizedFrame& src, VSFrame* dst, const VS
 }
 
 struct MxfSourceData {
-  std::unique_ptr<SourceEngine> engine;
+  // shared_ptr, not unique_ptr: when the file's audio is exposed, a second,
+  // independent VSNode (audio) is created from the same CreateMxfSource
+  // call and needs to share this same SourceEngine -- VapourSynth gives
+  // each VSNode wholly independent instance data with no other mechanism to
+  // share state between them.
+  std::shared_ptr<SourceEngine> engine;
   VSVideoInfo vi{};
   bool isPackedUyvy = false;
   int bytesPerSample = 1;
+};
+
+struct MxfAudioData {
+  std::shared_ptr<SourceEngine> engine;
+  VSAudioInfo ai{};
+  // VSAudioFormat's own container size (always a power of 2, e.g. 4 for a
+  // 24-bit format -- see VapourSynth4.h's bytesPerSample doc comment) --
+  // used only for the destination stride when writing into a VSFrame.
+  int vsBytesPerSample = 2;
+  // MxfStreamInfo::audioBitsPerSample/8 -- SourceEngine::GetAudioSamples
+  // fills its buffer at this native, possibly-narrower size (e.g. 3 for
+  // 24-bit PCM), NOT vsBytesPerSample; conflating the two here previously
+  // caused every sample past the first to read from the wrong offset
+  // (caught via real vspipe verification, see plan Phase 8/audio
+  // real-host-testing task -- an in-process-only test would have missed
+  // this, the two sizes only ever differ for a 24-bit source).
+  int nativeBytesPerSample = 2;
 };
 
 const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instanceData, void** /*frameData*/,
@@ -153,6 +179,64 @@ void VS_CC MxfSourceFree(void* instanceData, VSCore* /*core*/, const VSAPI* /*vs
   delete static_cast<MxfSourceData*>(instanceData);
 }
 
+// VapourSynth's audio model is frame-indexed like video, just with a fixed
+// length per frame (VS_AUDIO_FRAME_SAMPLES) -- `n` here is an audio frame
+// index, not a sample position, so it's translated to a
+// SourceEngine::GetAudioSamples sample range first.
+const VSFrame* VS_CC MxfSourceGetAudioFrame(int n, int activationReason, void* instanceData, void** /*frameData*/,
+                                             VSFrameContext* frameCtx, VSCore* core, const VSAPI* vsapi) {
+  auto* d = static_cast<MxfAudioData*>(instanceData);
+  if (activationReason != arInitial) return nullptr;
+
+  const int64_t start = static_cast<int64_t>(n) * VS_AUDIO_FRAME_SAMPLES;
+  const int64_t count = std::min<int64_t>(VS_AUDIO_FRAME_SAMPLES, d->ai.numSamples - start);
+  if (count <= 0) return nullptr;
+
+  const int numChannels = d->ai.format.numChannels;
+  const int nativeBytesPerSample = d->nativeBytesPerSample;
+  const int vsBytesPerSample = d->vsBytesPerSample;
+
+  // SourceEngine::GetAudioSamples fills one interleaved buffer at the
+  // file's *native* bit depth (matching AviSynth's own GetAudio contract),
+  // which can be narrower than VS's own container size (e.g. 3 bytes for a
+  // 24-bit source vs. VS's 4-byte container) -- sized/strided by
+  // nativeBytesPerSample here, NOT vsBytesPerSample. VapourSynth audio
+  // frames are also planar (one plane per channel, see getWritePtr/
+  // getStride's doc comments), so this de-interleaves on the way in.
+  std::vector<uint8_t> interleaved(static_cast<size_t>(count) * static_cast<size_t>(numChannels) *
+                                    static_cast<size_t>(nativeBytesPerSample));
+  std::string err;
+  if (d->engine->GetAudioSamples(start, count, interleaved.data(), &err) != FetchStatus::kOk) {
+    vsapi->setFilterError(err.empty() ? "MxfSource: failed to decode audio" : ("MxfSource: " + err).c_str(),
+                           frameCtx);
+    return nullptr;
+  }
+
+  VSFrame* out = vsapi->newAudioFrame(&d->ai.format, static_cast<int>(count), nullptr, core);
+  for (int c = 0; c < numChannels; ++c) {
+    uint8_t* dst = vsapi->getWritePtr(out, c);
+    for (int64_t s = 0; s < count; ++s) {
+      const uint8_t* src = interleaved.data() +
+                            (static_cast<size_t>(s) * numChannels + c) * static_cast<size_t>(nativeBytesPerSample);
+      uint8_t* dstSample = dst + static_cast<size_t>(s) * vsBytesPerSample;
+      // Low-justified: the native-width value occupies the low
+      // nativeBytesPerSample bytes of VS's wider container, zero-padded
+      // above -- the natural reading for an unsigned/positive-biased PCM
+      // value and the layout every other VS audio-producing filter assumes
+      // for a sub-container bit depth.
+      if (vsBytesPerSample > nativeBytesPerSample) {
+        std::memset(dstSample, 0, static_cast<size_t>(vsBytesPerSample));
+      }
+      std::memcpy(dstSample, src, static_cast<size_t>(nativeBytesPerSample));
+    }
+  }
+  return out;
+}
+
+void VS_CC MxfAudioFree(void* instanceData, VSCore* /*core*/, const VSAPI* /*vsapi*/) {
+  delete static_cast<MxfAudioData*>(instanceData);
+}
+
 void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCore* core, const VSAPI* vsapi) {
   int err = 0;
   const char* path = vsapi->mapGetData(in, "file", 0, &err);
@@ -179,14 +263,22 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   int handleOriginErr = 0;
   const int64_t handleOriginArg = vsapi->mapGetInt(in, "handle_origin", 0, &handleOriginErr);
   const bool handleOrigin = handleOriginErr ? true : (handleOriginArg != 0);
+  int useAudioErr = 0;
+  const char* useAudioStr = vsapi->mapGetData(in, "use_audio", 0, &useAudioErr);
+  const auto useAudio = ParseUseAudioMode(useAudioErr ? "supported" : useAudioStr);
+  if (!useAudio) {
+    vsapi->mapSetError(out, "MxfSource: use_audio must be 'always', 'never', or 'supported'");
+    return;
+  }
 
-  auto engine = std::make_unique<SourceEngine>();
+  auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
   options.logfile = logFileErr ? "" : logFile;
   options.http_headers = httpHeadersErr ? "" : httpHeaders;
   options.handle_origin = handleOrigin;
+  options.use_audio = *useAudio;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -215,7 +307,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   d->vi.numFrames = static_cast<int>(info.numFrames);
   d->isPackedUyvy = fmtInfo.isPackedUyvy;
   d->bytesPerSample = fmtInfo.bytesPerSample;
-  d->engine = std::move(engine);
+  d->engine = engine;
 
   // Explicitly disabled (cmForceDisable) rather than left at VS core's
   // default cmAuto: SourceEngine already provides its own bounded
@@ -238,6 +330,43 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   vsapi->setCacheMode(node, cmForceDisable);
   vsapi->mapSetNode(out, "clip", node, maAppend);
   vsapi->freeNode(node);
+
+  if (!engine->ExposesAudio()) return;
+
+  // Every discovered audio channel is summed into one raw N-channel layout
+  // -- there's no per-channel semantic assignment (e.g. "5.1") to derive
+  // from an arbitrary set of MXF audio tracks, so this just claims the
+  // lowest N channelLayout bits (VSAudioChannels enum order), which is all
+  // queryAudioFormat needs to accept an N-channel format.
+  const uint32_t numChannels = info.audioChannels;
+  const uint64_t channelLayout = numChannels >= 64 ? ~0ULL : ((1ULL << numChannels) - 1);
+
+  VSAudioFormat audioFormat{};
+  if (!vsapi->queryAudioFormat(&audioFormat, stInteger, static_cast<int>(info.audioBitsPerSample), channelLayout,
+                                core)) {
+    vsapi->mapSetError(out, "MxfSource: unsupported audio format for VapourSynth");
+    return;
+  }
+
+  auto* ad = new MxfAudioData();
+  ad->ai.format = audioFormat;
+  ad->ai.sampleRate = static_cast<int>(info.audioSampleRate);
+  ad->ai.numSamples = engine->TotalAudioSamples();
+  ad->ai.numFrames =
+      static_cast<int>((ad->ai.numSamples + VS_AUDIO_FRAME_SAMPLES - 1) / VS_AUDIO_FRAME_SAMPLES);
+  ad->vsBytesPerSample = audioFormat.bytesPerSample;
+  ad->nativeBytesPerSample = static_cast<int>(info.audioBitsPerSample / 8);
+  ad->engine = engine;
+
+  VSNode* audioNode = vsapi->createAudioFilter2("MxfSource", &ad->ai, MxfSourceGetAudioFrame, MxfAudioFree,
+                                                 fmUnordered, nullptr, 0, ad, core);
+  if (!audioNode) {
+    vsapi->mapSetError(out, "MxfSource: failed to create audio filter node");
+    return;
+  }
+  vsapi->setCacheMode(audioNode, cmForceDisable);
+  vsapi->mapSetNode(out, "audio", audioNode, maAppend);
+  vsapi->freeNode(audioNode);
 }
 
 }  // namespace
@@ -248,6 +377,11 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;",
-      "clip:vnode;", CreateMxfSource, nullptr, plugin);
+      "handle_origin:int:opt;use_audio:data:opt;",
+      // "audio" is only actually present in the output VSMap for files whose
+      // audio is exposed (see CreateMxfSource's early return when
+      // !engine->ExposesAudio()) -- declared here regardless since the
+      // return type spec is fixed for the plugin's whole lifetime, not
+      // per-invocation.
+      "clip:vnode;audio:anode;", CreateMxfSource, nullptr, plugin);
 }

@@ -233,6 +233,10 @@ class EssenceIndex {
   // or (CBR rows, always intra-only) keyFrameOffset is always 0.
   bool NeedsPreviousGop(int64_t keyframeEditUnit) const;
 
+  // Returns all index entries. Used by BuildAudioSampleIndexFromIndexTable to
+  // build audio indices directly from the video index without essence walking.
+  const std::vector<FlatIndexEntry>& GetEntries() const { return entries_; }
+
  private:
   std::vector<FlatIndexEntry> entries_;  // sorted ascending & unique by editUnit
 };

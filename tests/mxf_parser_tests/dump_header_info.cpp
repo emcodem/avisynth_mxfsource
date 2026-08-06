@@ -49,8 +49,18 @@ int main(int argc, char** argv) {
   PrintUl("pictureEssenceCoding", info->pictureEssenceCoding);
   PrintUl("videoTrackNumber(as UL-shaped 4 bytes)", Ul{info->videoTrackNumber[0], info->videoTrackNumber[1],
                                                         info->videoTrackNumber[2], info->videoTrackNumber[3]});
-  std::printf("hasAudio=%d audioSampleRate=%u audioChannels=%u\n", info->hasAudio, info->audioSampleRate,
-              info->audioChannels);
+  std::printf("hasAudio=%d audioConfigSupported=%d audioSampleRate=%u audioChannels=%u audioBitsPerSample=%u\n",
+              info->hasAudio, info->audioConfigSupported, info->audioSampleRate, info->audioChannels,
+              info->audioBitsPerSample);
+  if (info->hasAudio && !info->audioConfigSupported) {
+    std::printf("audioUnsupportedReason: %s\n", info->audioUnsupportedReason.c_str());
+  }
+  std::printf("audioTracks (%zu):\n", info->audioTracks.size());
+  for (const auto& t : info->audioTracks) {
+    std::printf("  trackId=%u trackNumber=%02x%02x%02x%02x channels=%u sampleRate=%u bitsPerSample=%u codec=%d\n",
+                t.trackId, t.trackNumber[0], t.trackNumber[1], t.trackNumber[2], t.trackNumber[3], t.channelCount,
+                t.sampleRate, t.bitsPerSample, static_cast<int>(t.codec));
+  }
   std::printf("headerMetadataEnd=%llu footerPartitionPresent=%d\n",
               static_cast<unsigned long long>(info->headerMetadataEnd), info->footerPartitionPresent);
   std::printf("origin=%lld sourcePackageDuration=%lld\n", static_cast<long long>(info->origin),

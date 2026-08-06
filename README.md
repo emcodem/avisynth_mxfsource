@@ -154,6 +154,42 @@ Current status:
   sequence (avcodec's own encoder) to prove byte-identical output both with
   and without an index present.
 
+## Parameters
+
+`MxfSource(...)` takes the same parameters in both AviSynth+ and VapourSynth
+(VapourSynth spells `handle_origin`/`use_audio` etc. the same way, just via
+keyword args to `core.mxfsource.MxfSource(...)`):
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `file` | string | *(required)* | Path (or `http(s)://` URL) to the `.mxf` file. |
+| `buffer_frames` | int | `300` | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. |
+| `eagerdecode` | int | `32` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
+| `logfile` | string | *(none)* | Path to append a one-line serve-stats summary to when the clip closes (and any audio-degradation note, see below) -- stderr alone is invisible to GUI hosts. |
+| `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
+| `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
+| `use_audio` | string | `"supported"` | Audio fallback policy -- see below. |
+
+### Audio
+
+Every audio track found in the file is summed into one interleaved output
+stream at the file's native bit depth (`SAMPLE_INT16`/`SAMPLE_INT24`/
+`SAMPLE_INT32` in AviSynth+, the equivalent integer format in VapourSynth) --
+no format conversion, no resampling. Only uncompressed PCM is supported today;
+compressed codecs (AC-3/MP2/AAC) and files whose audio tracks disagree on bit
+depth or sample rate are treated as "unsupported audio", governed by
+`use_audio`:
+
+| `use_audio` | Audio present & supported | Audio present & unsupported | No audio at all |
+|---|---|---|---|
+| `"supported"` (default) | exposed | degrades to video-only, no error, note in `logfile` | video-only, no error |
+| `"always"` | exposed | `MxfSource()` throws/fails to open | video-only, no error |
+| `"never"` | suppressed (video-only) | suppressed (video-only) | video-only, no error |
+
+A file with no audio at all never fails under any `use_audio` setting --
+only "audio present but not in a state this plugin can output" is ever a
+hard failure, and only under `"always"`.
+
 ## Build
 
 Requires a C++17 compiler and CMake >= 3.24. FFmpeg's `libavcodec`/`libavutil`

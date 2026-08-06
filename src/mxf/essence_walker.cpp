@@ -9,12 +9,11 @@ bool IsEssenceElementKey(const Ul& key) {
 }
 
 EssenceWalker::EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array<uint8_t, 4> videoTrackNumber,
-                              bool hasVideo, std::array<uint8_t, 4> audioTrackNumber, bool hasAudio)
+                              bool hasVideo, std::vector<std::array<uint8_t, 4>> audioTrackNumbers)
     : reader_(reader),
       videoTrackNumber_(videoTrackNumber),
       hasVideo_(hasVideo),
-      audioTrackNumber_(audioTrackNumber),
-      hasAudio_(hasAudio) {
+      audioTrackNumbers_(std::move(audioTrackNumbers)) {
   reader_.Seek(startOffset);
 }
 
@@ -34,19 +33,22 @@ bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
 
     if (IsEssenceElementKey(klv.key)) {
       const bool matchesVideo = hasVideo_ && std::memcmp(&klv.key[12], videoTrackNumber_.data(), 4) == 0;
-      const bool matchesAudio = hasAudio_ && std::memcmp(&klv.key[12], audioTrackNumber_.data(), 4) == 0;
-      if (matchesVideo || matchesAudio) {
+      int audioTrackIndex = -1;
+      if (!matchesVideo) {
+        for (size_t i = 0; i < audioTrackNumbers_.size(); ++i) {
+          if (std::memcmp(&klv.key[12], audioTrackNumbers_[i].data(), 4) == 0) {
+            audioTrackIndex = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      if (matchesVideo || audioTrackIndex >= 0) {
         out.isVideo = matchesVideo;
-        out.isAudio = matchesAudio && !matchesVideo;
+        out.isAudio = audioTrackIndex >= 0;
+        out.audioTrackIndex = audioTrackIndex;
         out.filePosition = klvStart;
-        // Audio's payload is never read here regardless of `wantData` --
-        // nothing in this codebase decodes it yet (see TODO Phase 8 item 1,
-        // GetAudio always returns silence), so every audio element on a real
-        // file with an audio track was otherwise being read off disk/network
-        // and heap-allocated into `out.data` only to be immediately
-        // discarded by every current caller (SourceEngine::DecodeNextFrame's
-        // `if (!element.isVideo) continue;`).
-        if (!wantData || !matchesVideo) {
+        out.length = klv.length;
+        if (!wantData) {
           out.data.clear();
           if (!reader_.Skip(klv.length)) return false;
           return true;

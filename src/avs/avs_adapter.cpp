@@ -9,12 +9,14 @@
 #include "avisynth.h"
 #include "core/options.h"
 #include "core/source_engine.h"
+#include "core/use_audio_mode.h"
 
 using mxfsrc::FetchStatus;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
 using mxfsrc::OpenResult;
 using mxfsrc::OpenStatus;
+using mxfsrc::ParseUseAudioMode;
 using mxfsrc::PixelFormat;
 using mxfsrc::SourceEngine;
 
@@ -123,7 +125,23 @@ class MxfSource final : public IClip {
     vi_.fps_denominator = info.editRate.den > 0 ? static_cast<unsigned>(info.editRate.den) : 1;
     vi_.num_frames = static_cast<int>(info.numFrames);
     vi_.pixel_type = pixelType;
-    vi_.audio_samples_per_second = 0;  // audio ring buffer not wired yet, see plan Phase 4 notes
+
+    if (engine_->ExposesAudio()) {
+      int sampleType = 0;
+      switch (info.audioBitsPerSample) {
+        case 16: sampleType = SAMPLE_INT16; break;
+        case 24: sampleType = SAMPLE_INT24; break;
+        case 32: sampleType = SAMPLE_INT32; break;
+        default:
+          env->ThrowError("MxfSource: unsupported audio bit depth (%u)", info.audioBitsPerSample);
+      }
+      vi_.audio_samples_per_second = static_cast<int>(info.audioSampleRate);
+      vi_.sample_type = sampleType;
+      vi_.nchannels = static_cast<int>(info.audioChannels);
+      vi_.num_audio_samples = engine_->TotalAudioSamples();
+    } else {
+      vi_.audio_samples_per_second = 0;  // no audio exposed -- see OpenOptions::use_audio
+    }
   }
 
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override {
@@ -144,8 +162,11 @@ class MxfSource final : public IClip {
     return out;
   }
 
-  void __stdcall GetAudio(void* buf, int64_t /*start*/, int64_t count, IScriptEnvironment* /*env*/) override {
-    std::memset(buf, 0, static_cast<size_t>(count) * static_cast<size_t>(vi_.BytesPerAudioSample()));
+  void __stdcall GetAudio(void* buf, int64_t start, int64_t count, IScriptEnvironment* env) override {
+    std::string err;
+    if (engine_->GetAudioSamples(start, count, buf, &err) != FetchStatus::kOk) {
+      env->ThrowError("MxfSource: %s", err.empty() ? "failed to decode audio" : err.c_str());
+    }
   }
 
   bool __stdcall GetParity(int /*n*/) override { return false; }
@@ -188,6 +209,9 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const char* logFile = args[3].AsString("");
   const char* httpHeaders = args[4].AsString("");
   const bool handleOrigin = args[5].AsBool(true);
+  const char* useAudioStr = args[6].AsString("supported");
+  const auto useAudio = ParseUseAudioMode(useAudioStr);
+  if (!useAudio) env->ThrowError("MxfSource: use_audio must be 'always', 'never', or 'supported'");
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
@@ -196,6 +220,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   options.logfile = logFile;
   options.http_headers = httpHeaders;
   options.handle_origin = handleOrigin;
+  options.use_audio = *useAudio;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -217,8 +242,9 @@ const AVS_Linkage* AVS_linkage = nullptr;
 extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
     IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
-  env->AddFunction("MxfSource",
-                    "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b",
-                    CreateMxfSource, nullptr);
+  env->AddFunction(
+      "MxfSource",
+      "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s",
+      CreateMxfSource, nullptr);
   return "MXF forward-only source plugin";
 }

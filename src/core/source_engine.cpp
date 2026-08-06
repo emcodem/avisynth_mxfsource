@@ -1,7 +1,9 @@
 #include "core/source_engine.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <vector>
@@ -30,8 +32,14 @@ namespace {
 // frame. Same "recycle instead of reallocate" rationale as
 // SourceEngine::DecodeThreadMain's NormalizedFrame recycling, just applied
 // to the input (compressed essence) side instead of the output side.
+// `audioElementsOut`, when non-null, collects every audio element seen
+// since the last successful video decode -- regardless of whether a given
+// edit unit's audio KLVs come before or after its video KLV in file order,
+// everything collected between two successful returns belongs to the edit
+// unit that just finished (see SourceEngine::DecodeThreadMain, which clears
+// this vector each iteration before calling in).
 bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhausted, EssenceElement& scratch,
-                     NormalizedFrame& outFrame) {
+                     NormalizedFrame& outFrame, std::vector<EssenceElement>* audioElementsOut) {
   for (;;) {
     if (essenceExhausted) {
       return decoder.SendAndReceive({}, outFrame);
@@ -40,7 +48,11 @@ bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhau
       essenceExhausted = true;
       continue;
     }
-    if (!scratch.isVideo) continue;  // audio elements: not wired into a ring buffer yet
+    if (scratch.isAudio) {
+      if (audioElementsOut) audioElementsOut->push_back(scratch);
+      continue;
+    }
+    if (!scratch.isVideo) continue;
     if (decoder.SendAndReceive(scratch.data, outFrame)) return true;
   }
 }
@@ -65,8 +77,34 @@ bool SkipNextVideoElement(EssenceWalker& walker) {
 
 SourceEngine::SourceEngine() = default;
 
+void SourceEngine::AppendLogLine(const std::string& line) const {
+  fprintf(stderr, "%s\n", line.c_str());
+  fflush(stderr);
+
+  // Also append to a user-specified log file (MxfSource(..., logfile=...))
+  // if one was given -- stderr alone is invisible for GUI hosts (e.g.
+  // AvsPmod) that don't surface a console window. Appended rather than
+  // overwritten so the file accumulates a history across repeated runs;
+  // silently skipped (not fatal) if the path can't be opened.
+  if (logFile_.empty()) return;
+  if (FILE* f = fopen(logFile_.c_str(), "a")) {
+    const time_t now = time(nullptr);
+    struct tm tmBuf{};
+#if defined(_WIN32)
+    localtime_s(&tmBuf, &now);
+#else
+    localtime_r(&now, &tmBuf);
+#endif
+    char timeBuf[32] = {};
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &tmBuf);
+    fprintf(f, "[%s] %s\n", timeBuf, line.c_str());
+    fclose(f);
+  }
+}
+
 SourceEngine::~SourceEngine() {
   if (videoBuffer_) videoBuffer_->Shutdown();
+  if (audioBuffer_) audioBuffer_->Shutdown();
   if (decodeThread_.joinable()) decodeThread_.join();
 
   if (videoBuffer_) {
@@ -84,30 +122,7 @@ SourceEngine::~SourceEngine() {
         }
       }
     }
-
-    fprintf(stderr, "%s\n", summary.c_str());
-    fflush(stderr);
-
-    // Also append to a user-specified log file (MxfSource(..., logfile=...))
-    // if one was given -- stderr alone is invisible for GUI hosts (e.g.
-    // AvsPmod) that don't surface a console window. Appended rather than
-    // overwritten so the file accumulates a history across repeated runs;
-    // silently skipped (not fatal) if the path can't be opened.
-    if (!logFile_.empty()) {
-      if (FILE* f = fopen(logFile_.c_str(), "a")) {
-        const time_t now = time(nullptr);
-        struct tm tmBuf{};
-#if defined(_WIN32)
-        localtime_s(&tmBuf, &now);
-#else
-        localtime_r(&now, &tmBuf);
-#endif
-        char timeBuf[32] = {};
-        strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &tmBuf);
-        fprintf(f, "[%s] %s\n", timeBuf, summary.c_str());
-        fclose(f);
-      }
-    }
+    AppendLogLine(summary);
   }
 }
 
@@ -164,18 +179,61 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
               "essence-count fallback not yet implemented, see plan Phase 1 Duration fallback chain step 5)"};
     }
   }
+  // Raw, untrimmed essence-edit-unit-space frame count -- the coordinate
+  // space videoIndex_'s own entries live in (see
+  // BuildAudioSampleIndexFromIndexTable's doc comment). streamInfo_.numFrames
+  // is now fully finalized (Header Metadata Duration, SourcePackage-Origin
+  // override, or the Index Table fallback above), so this is safe to derive.
+  const int64_t rawFrameCount = originSkip_ + streamInfo_.numFrames;
 
   videoDecoder_ = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
                                       static_cast<int>(streamInfo_.height));
   if (!videoDecoder_) return {OpenStatus::kUnsupportedCodec, "unsupported or unavailable video codec"};
 
+  // Decide whether this file's audio is actually exposed. Never an error
+  // for a video-only source (no audio tracks at all); for a file that does
+  // have audio, OpenOptions::use_audio governs what happens when the
+  // configuration isn't one this plugin supports (mismatched track bit
+  // depth/sample rate, non-PCM codec) or when the essence-level sample
+  // index fails to build (malformed/truncated audio) -- see UseAudioMode.
+  if (streamInfo_.hasAudio && options.use_audio != UseAudioMode::kNever) {
+    if (!streamInfo_.audioConfigSupported) {
+      if (options.use_audio == UseAudioMode::kAlways) {
+        return {OpenStatus::kUnsupportedCodec, "audio configuration not supported: " + streamInfo_.audioUnsupportedReason};
+      }
+      AppendLogLine("[MxfSource] " + path_ + ": audio configuration not supported (" +
+                    streamInfo_.audioUnsupportedReason + "), continuing video-only");
+    } else {
+      audioSampleIndex_ = videoIndex_ ? BuildAudioSampleIndexFromIndexTable(*videoIndex_, streamInfo_, rawFrameCount)
+                                       : std::nullopt;
+      if (!audioSampleIndex_) {
+        if (options.use_audio == UseAudioMode::kAlways) {
+          return {OpenStatus::kUnsupportedCodec,
+                  "audio not fully covered by the video Index Table (or invalid edit-rate/sample-rate metadata)"};
+        }
+        AppendLogLine("[MxfSource] " + path_ + ": failed to build audio sample index, continuing video-only");
+      } else {
+        exposeAudio_ = true;
+        audioSampleOriginSkip_ = audioSampleIndex_->CumulativeSamplesBefore(originSkip_);
+        AppendLogLine("[MxfSource] " + path_ + ": audio sample index built from video Index Table (" +
+                      std::to_string(rawFrameCount) + " edit units, no essence scan)");
+      }
+    }
+  }
+
+  std::vector<std::array<uint8_t, 4>> audioTrackNumbersForWalker;
+  if (exposeAudio_) {
+    for (const AudioTrackInfo& t : streamInfo_.audioTracks) audioTrackNumbersForWalker.push_back(t.trackNumber);
+  }
   walker_ = std::make_unique<EssenceWalker>(*reader_, streamInfo_.headerMetadataEnd, streamInfo_.videoTrackNumber,
-                                             streamInfo_.hasVideo, streamInfo_.audioTrackNumber,
-                                             streamInfo_.hasAudio);
+                                             streamInfo_.hasVideo, audioTrackNumbersForWalker);
 
   const int capacity = options.buffer_frames > 0 ? options.buffer_frames : 300;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : 32;
   videoBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<NormalizedFrame>>>(capacity, margin);
+  if (exposeAudio_) {
+    audioBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<AudioBlock>>>(capacity, margin);
+  }
 
   decodeThread_ = std::thread(&SourceEngine::DecodeThreadMain, this);
 
@@ -294,9 +352,9 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     }
     // EssenceWalker is constructed here (not shared with the GOP branch
     // below) since it holds a reference member and can't be reassigned
-    // once the branch's own start offset is known.
-    EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
-                               streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
+    // once the branch's own start offset is known. Video-only fallback --
+    // audio has its own independent fresh-reader path, FreshReadAudioBlock.
+    EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
     for (int64_t i = startEditUnit; i < essenceTarget; ++i) {
       if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
     }
@@ -410,12 +468,11 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   const int64_t iterations = std::max<int64_t>(1, essenceTarget - startEditUnit - reorderDelay + 1);
   const int64_t adjustedTarget = startEditUnit + iterations - 1;
 
-  EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo,
-                             streamInfo_.audioTrackNumber, streamInfo_.hasAudio);
+  EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
   bool essenceExhausted = false;
   EssenceElement scratch;
   for (int64_t i = startEditUnit; i <= adjustedTarget; ++i) {
-    if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, scratch, *frame)) return nullptr;
+    if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, scratch, *frame, nullptr)) return nullptr;
   }
   return frame;
 }
@@ -444,7 +501,7 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       NormalizedFrame discard;
       for (int64_t i = 0; i < originSkip_; ++i) {
-        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, discard)) {
+        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, discard, nullptr)) {
           videoBuffer_->SignalError(originError);
           return;
         }
@@ -489,13 +546,48 @@ void SourceEngine::DecodeThreadMain() {
       (videoIndex_ && !IsIntraOnlyCodec(streamInfo_.videoCodec)) ? videoIndex_->EstimateReorderDelay(0) : 0;
   std::deque<std::shared_ptr<NormalizedFrame>> pending;
 
+  // Audio's counterpart of `pending`: PCM decode itself has zero internal
+  // reordering (unlike avcodec's B-frame pipeline), but the audio elements
+  // collected during loop iteration K are consumed in lockstep with that
+  // same iteration's video decode -- and that iteration's VIDEO output only
+  // gets assigned to ring index K after `reorderDelay` more iterations (via
+  // `pending` above). Without an identical delay line, audio for essence
+  // position K would be paired with ring index K's video, whose actual
+  // content came from essence position K-reorderDelay -- reorderDelay edit
+  // units of audio/video desync. Only matters for GOP-based codecs
+  // (reorderDelay > 0); intra-only/PCM-friendly codecs pop every iteration
+  // immediately, same as `pending` does.
+  std::deque<std::shared_ptr<AudioBlock>> pendingAudio;
+  // Once an audio decode genuinely fails, stop producing further audio for
+  // the rest of this thread's life -- video keeps going unaffected. The one
+  // SignalError() call already makes every future Get() beyond the last
+  // successfully-Put index report the error; already-buffered audio stays
+  // servable (see frame_buffer.h's error-check ordering).
+  bool audioFailed = false;
+
   for (;;) {
     const int64_t next = videoBuffer_->NextIndex();
     if (next >= streamInfo_.numFrames) {
       videoBuffer_->SignalEndOfStream();
+      if (audioBuffer_) audioBuffer_->SignalEndOfStream();
       return;
     }
     if (!videoBuffer_->WaitForCapacity(next)) return;  // shutdown requested
+    // audioBuffer_ deliberately has no WaitForCapacity gate of its own: it's
+    // produced by this same loop in lockstep with video, at exactly video's
+    // own pace -- gating on audioBuffer_'s independent watermark as well
+    // would stall video production (and thus the whole thread, since both
+    // come from one shared walker) the moment audio's watermark fell behind
+    // video's, e.g. a host that reads video frames without ever calling
+    // GetAudioSamples (or reads audio in far larger/rarer chunks) -- audio's
+    // watermark_ starts at 0 and margin_ can be as small as 1, so without
+    // this, DecodeThreadMain would deadlock waiting for an audio consumer
+    // that may never come. Put() below still evicts audioBuffer_'s oldest
+    // entry once full on its own (eviction doesn't depend on
+    // WaitForCapacity, see FrameBuffer::Put) -- a genuinely slow/absent
+    // audio consumer just falls back to FreshReadAudioBlock for anything
+    // that fell outside the window, exactly like a slow video consumer
+    // already falls back to SeekAndDecode.
 
     std::shared_ptr<NormalizedFrame> frame;
     if (recycled && recycled.use_count() == 1) {
@@ -503,12 +595,27 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       frame = std::make_shared<NormalizedFrame>();
     }
-    if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, *frame)) {
-      videoBuffer_->SignalError("MXF essence ended before reaching the declared frame count (" +
-                                 std::to_string(streamInfo_.numFrames) + ")");
+    std::vector<EssenceElement> audioScratch;
+    if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, *frame,
+                         (audioBuffer_ && !audioFailed) ? &audioScratch : nullptr)) {
+      const std::string err =
+          "MXF essence ended before reaching the declared frame count (" + std::to_string(streamInfo_.numFrames) + ")";
+      videoBuffer_->SignalError(err);
+      if (audioBuffer_) audioBuffer_->SignalError(err);
       return;
     }
     pending.push_back(std::move(frame));
+
+    if (audioBuffer_ && !audioFailed) {
+      auto block = std::make_shared<AudioBlock>();
+      std::string audioErr;
+      if (!InterleaveAudioEditUnit(audioScratch, streamInfo_.audioTracks, *block, &audioErr)) {
+        audioBuffer_->SignalError("audio decode error near ring index " + std::to_string(next) + ": " + audioErr);
+        audioFailed = true;
+      } else {
+        pendingAudio.push_back(std::move(block));
+      }
+    }
 
     std::shared_ptr<NormalizedFrame> outputFrame;
     if (static_cast<int>(pending.size()) > reorderDelay) {
@@ -517,9 +624,130 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       outputFrame = pending.front();  // still warming up -- best-effort repeat, not yet consumed
     }
-
     recycled = videoBuffer_->Put(next, std::move(outputFrame)).value_or(nullptr);
+
+    if (audioBuffer_ && !audioFailed) {
+      std::shared_ptr<AudioBlock> outputAudio;
+      if (static_cast<int>(pendingAudio.size()) > reorderDelay) {
+        outputAudio = std::move(pendingAudio.front());
+        pendingAudio.pop_front();
+      } else if (!pendingAudio.empty()) {
+        outputAudio = pendingAudio.front();  // still warming up -- same best-effort repeat as video
+      }
+      if (outputAudio) audioBuffer_->Put(next, std::move(outputAudio));
+    }
   }
+}
+
+FetchStatus SourceEngine::GetAudioSamples(int64_t start, int64_t count, void* buf, std::string* errorOut) {
+  if (!exposeAudio_ || !audioSampleIndex_) {
+    if (errorOut) *errorOut = "audio not available";
+    return FetchStatus::kError;
+  }
+  if (count <= 0) return FetchStatus::kOk;
+
+  const uint32_t bytesPerFrame = streamInfo_.audioChannels * (streamInfo_.audioBitsPerSample / 8);
+  uint8_t* dst = static_cast<uint8_t*>(buf);
+  int64_t remaining = count;
+  int64_t hostSamplePos = start;
+
+  while (remaining > 0) {
+    // audioSampleIndex_ operates in raw essence-edit-unit/sample space
+    // (like videoIndex_'s EssenceIndex); audioSampleOriginSkip_ translates
+    // the host-relative `hostSamplePos` GetAudio callers use into that raw
+    // space -- see MxfStreamInfo::origin / SeekAndDecode's analogous
+    // `originSkip_ + target` translation for video.
+    const auto loc = audioSampleIndex_->Locate(hostSamplePos + audioSampleOriginSkip_);
+    if (!loc) {
+      // Past the last known sample -- a well-behaved host should never ask
+      // for this, since both adapters set their total sample count exactly
+      // from TotalAudioSamples(); zero-fill defensively rather than error.
+      std::memset(dst, 0, static_cast<size_t>(remaining) * bytesPerFrame);
+      return FetchStatus::kOk;
+    }
+    const int64_t hostEditUnit = loc->editUnit - originSkip_;
+
+    std::shared_ptr<AudioBlock> block;
+    const FetchStatus status = FetchAudioBlock(hostEditUnit, loc->byteOffset, block, errorOut);
+    if (status != FetchStatus::kOk) return status;
+
+    const int64_t available = block->sampleCount - loc->sampleOffsetInEditUnit;
+    const int64_t toCopy = std::min<int64_t>(available, remaining);
+    const uint8_t* src = block->data.data() + static_cast<size_t>(loc->sampleOffsetInEditUnit) * bytesPerFrame;
+    std::memcpy(dst, src, static_cast<size_t>(toCopy) * bytesPerFrame);
+    dst += toCopy * bytesPerFrame;
+    hostSamplePos += toCopy;
+    remaining -= toCopy;
+  }
+  return FetchStatus::kOk;
+}
+
+FetchStatus SourceEngine::FetchAudioBlock(int64_t hostEditUnit, uint64_t byteOffset, std::shared_ptr<AudioBlock>& out,
+                                          std::string* errorOut) {
+  // Mirrors GetVideoFrame's forward-seek bypass: a request far enough ahead
+  // of what's actually been produced so far would otherwise block on the
+  // background thread sequentially producing every intervening edit unit --
+  // go straight to the fresh-reader fallback instead.
+  if (hostEditUnit > audioBuffer_->HighestProduced() + audioBuffer_->Capacity()) {
+    out = FreshReadAudioBlock(byteOffset);
+    if (!out) {
+      if (errorOut) {
+        *errorOut = "requested audio is far ahead of the current decode position, and the fallback re-read failed "
+                    "to reach it";
+      }
+      return FetchStatus::kError;
+    }
+    return FetchStatus::kOk;
+  }
+
+  const FetchStatus status = audioBuffer_->Get(hostEditUnit, out, errorOut);
+  if (status == FetchStatus::kOk) return status;
+  if (status != FetchStatus::kEvicted && status != FetchStatus::kError) return status;  // kEndOfStream propagates
+
+  out = FreshReadAudioBlock(byteOffset);
+  if (!out) {
+    if (errorOut) {
+      *errorOut = "requested audio fell outside the ring buffer window (or the background decode failed to reach "
+                  "it), and the fallback re-read also failed to reach it";
+    }
+    return FetchStatus::kError;
+  }
+  return FetchStatus::kOk;
+}
+
+std::shared_ptr<AudioBlock> SourceEngine::FreshReadAudioBlock(uint64_t byteOffset) {
+  MxfReader freshReader(path_, httpHeaders_);
+  if (!freshReader.IsOpen()) return nullptr;
+
+  std::vector<std::array<uint8_t, 4>> audioTrackNumbers;
+  audioTrackNumbers.reserve(streamInfo_.audioTracks.size());
+  for (const AudioTrackInfo& t : streamInfo_.audioTracks) audioTrackNumbers.push_back(t.trackNumber);
+
+  // hasVideo=false: video (and any other track) is skipped over cheaply via
+  // EssenceWalker's generic unmatched-KLV path, no different from any other
+  // untracked track -- this fallback only ever needs audio.
+  EssenceWalker freshWalker(freshReader, byteOffset, /*videoTrackNumber=*/{}, /*hasVideo=*/false, audioTrackNumbers);
+
+  const size_t numTracks = audioTrackNumbers.size();
+  std::vector<EssenceElement> group(numTracks);
+  std::vector<bool> seen(numTracks, false);
+  size_t seenCount = 0;
+
+  EssenceElement element;
+  while (seenCount < numTracks) {
+    if (!freshWalker.Next(element)) return nullptr;
+    if (!element.isAudio || element.audioTrackIndex < 0) continue;
+    const size_t idx = static_cast<size_t>(element.audioTrackIndex);
+    if (!seen[idx]) {
+      group[idx] = element;
+      seen[idx] = true;
+      ++seenCount;
+    }
+  }
+
+  auto block = std::make_shared<AudioBlock>();
+  if (!InterleaveAudioEditUnit(group, streamInfo_.audioTracks, *block, nullptr)) return nullptr;
+  return block;
 }
 
 }  // namespace mxfsrc

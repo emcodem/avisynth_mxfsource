@@ -57,8 +57,7 @@ void TestWalksVideoElementsInOrderSkippingOthers() {
     }
     CHECK(info->numFrames == 4);
 
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
-                          info->audioTrackNumber, info->hasAudio);
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
 
     int64_t count = 0;
     EssenceElement element;
@@ -113,8 +112,7 @@ void TestNoBodyPartitionEssenceFollowsHeaderDirectly() {
     // for the "next partition" and jumping headerMetadataEnd there.
     CHECK(info->headerMetadataEnd < footerOffset);
 
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
-                          info->audioTrackNumber, info->hasAudio);
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
     int64_t count = 0;
     EssenceElement element;
     while (walker.Next(element)) {
@@ -160,8 +158,7 @@ void TestSkipsNonCompliantZeroBytePadding() {
       return;
     }
 
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
-                          info->audioTrackNumber, info->hasAudio);
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
     int64_t count = 0;
     EssenceElement element;
     while (walker.Next(element)) {
@@ -195,10 +192,83 @@ void TestEmptyBodyPartitionYieldsNoElements() {
       return;
     }
 
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo,
-                          info->audioTrackNumber, info->hasAudio);
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
     EssenceElement element;
     CHECK(!walker.Next(element));
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Two audio tracks summed into one walk: verifies each matched audio
+// element's audioTrackIndex correctly identifies which of the two
+// TrackNumbers it came from, and that video/audio interleave in file order
+// is preserved regardless of which track's element appears first per edit
+// unit.
+constexpr uint32_t kAudioTrackNumberA = 0x02020200;
+constexpr uint32_t kAudioTrackNumberB = 0x02020300;
+
+void TestMultiTrackAudioFiltering() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 2;
+  cfg.videoTrackNumber = kVideoTrackNumber;
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+
+  AppendPartitionPack(bytes, PartitionKind::kBody);
+  // Edit unit 0: video, then track A, then track B.
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xAA, 0});
+  AppendEssenceElement(bytes, kAudioTrackNumberA, {0x0A, 0});
+  AppendEssenceElement(bytes, kAudioTrackNumberB, {0x0B, 0});
+  // Edit unit 1: same order.
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xAA, 1});
+  AppendEssenceElement(bytes, kAudioTrackNumberA, {0x0A, 1});
+  AppendEssenceElement(bytes, kAudioTrackNumberB, {0x0B, 1});
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_essence_walk_multi_audio.mxf");
+  {
+    MxfReader reader(path.string());
+    CHECK(reader.IsOpen());
+
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (!info) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    auto trackNumberBytes = [](uint32_t n) {
+      return std::array<uint8_t, 4>{static_cast<uint8_t>(n >> 24), static_cast<uint8_t>(n >> 16),
+                                     static_cast<uint8_t>(n >> 8), static_cast<uint8_t>(n)};
+    };
+    std::vector<std::array<uint8_t, 4>> audioTrackNumbers = {trackNumberBytes(kAudioTrackNumberA),
+                                                               trackNumberBytes(kAudioTrackNumberB)};
+
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, audioTrackNumbers);
+
+    int videoCount = 0, audioACount = 0, audioBCount = 0;
+    EssenceElement element;
+    while (walker.Next(element)) {
+      if (element.isVideo) {
+        CHECK(element.data[0] == 0xAA);
+        CHECK(element.data[1] == static_cast<uint8_t>(videoCount));
+        ++videoCount;
+      } else {
+        CHECK(element.isAudio);
+        if (element.audioTrackIndex == 0) {
+          CHECK(element.data[0] == 0x0A);
+          CHECK(element.data[1] == static_cast<uint8_t>(audioACount));
+          ++audioACount;
+        } else {
+          CHECK(element.audioTrackIndex == 1);
+          CHECK(element.data[0] == 0x0B);
+          CHECK(element.data[1] == static_cast<uint8_t>(audioBCount));
+          ++audioBCount;
+        }
+      }
+    }
+    CHECK(videoCount == 2);
+    CHECK(audioACount == 2);
+    CHECK(audioBCount == 2);
   }
 
   std::filesystem::remove(path);
@@ -211,6 +281,7 @@ int main() {
   TestNoBodyPartitionEssenceFollowsHeaderDirectly();
   TestSkipsNonCompliantZeroBytePadding();
   TestEmptyBodyPartitionYieldsNoElements();
+  TestMultiTrackAudioFiltering();
 
   if (g_failures == 0) {
     std::cout << "all mxf essence_walker tests passed" << std::endl;

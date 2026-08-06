@@ -114,6 +114,32 @@ inline const Ul kPictureDataDefinition = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x
 // Uncompressed 4:2:2 8-bit PictureEssenceCoding UL from ul_tables.h.
 inline const Ul kRawVideoCoding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A,
                                     0x04, 0x01, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00};
+// Data Definition (Sound) UL from ul_tables.h's kDataDefinitionUls[1].
+inline const Ul kAudioDataDefinition = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+                                         0x01, 0x03, 0x02, 0x02, 0x02, 0x00, 0x00, 0x00};
+// Uncompressed PCM SoundEssenceCompression UL from ul_tables.h.
+inline const Ul kPcmCoding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+                              0x04, 0x02, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00};
+// AC-3 SoundEssenceCompression UL from ul_tables.h -- used by tests that
+// exercise the non-PCM-audio-not-supported path.
+inline const Ul kAc3Coding = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+                              0x04, 0x02, 0x02, 0x02, 0x03, 0x02, 0x01, 0x00};
+
+// One synthetic audio Track's worth of config: a Track+Sequence+Sound
+// Descriptor triple, wired into a MultipleDescriptor alongside the video
+// CDCI Descriptor (see BuildHeaderMetadataBlock) whenever
+// SyntheticFile::audioTracks is non-empty. LinkedTrackID (tag 0x3006) is
+// always written equal to trackId, matching a well-formed multi-audio-track
+// file -- see header_parser.cpp's ResolveDescriptor for why this binding
+// matters once there's more than one sound-shaped sub-descriptor.
+struct SyntheticAudioTrack {
+  uint32_t trackNumber = 0x02020200;
+  uint32_t trackId = 100;
+  uint32_t channelCount = 2;
+  uint32_t sampleRate = 48000;
+  uint32_t bitsPerSample = 24;
+  Ul soundEssenceCoding = kPcmCoding;
+};
 
 struct SyntheticFile {
   int64_t sequenceDuration = 10;
@@ -132,6 +158,13 @@ struct SyntheticFile {
   bool includeSourcePackage = false;
   int64_t sourcePackageDuration = 10;  // SP's raw/untrimmed Sequence.Duration
   int64_t sourcePackageOrigin = 0;     // SP's Track.Origin (0x4B02)
+
+  // Empty (the default) => no audio at all, exactly today's single-video
+  // file shape (Package.Descriptor points directly at the CDCI Descriptor,
+  // no MultipleDescriptor) -- zero behavior change for every existing test.
+  // Non-empty => the CDCI Descriptor and every audio track's Sound
+  // Descriptor are wrapped in a MultipleDescriptor instead.
+  std::vector<SyntheticAudioTrack> audioTracks;
 };
 
 // Builds just the Header Metadata local-set KLVs (Primer Pack ->
@@ -150,6 +183,7 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
   const Ul uidSourcePackage = MakeUid(6);
   const Ul uidSourceTrack = MakeUid(7);
   const Ul uidSourceSequence = MakeUid(8);
+  const Ul uidMultipleDescriptor = MakeUid(9);
 
   std::vector<uint8_t> metadata;  // everything from right after the Partition Pack KLV onward
 
@@ -167,15 +201,33 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagUlArray(entries, 0x1901, packageUids);
     AppendLocalSet(metadata, 0x18, 0x00, entries);
   }
+
+  // Empty audioTracks (the default/regression case) => Package.Descriptor
+  // points directly at the CDCI Descriptor, exactly as before. Non-empty =>
+  // wrapped in a MultipleDescriptor alongside each audio track's own Sound
+  // Descriptor.
+  const bool useMultipleDescriptor = !cfg.audioTracks.empty();
+  const Ul packageDescriptorRef = useMultipleDescriptor ? uidMultipleDescriptor : uidDescriptor;
+
+  std::vector<Ul> audioTrackUids, audioSequenceUids, audioDescriptorUids;
+  for (size_t i = 0; i < cfg.audioTracks.size(); ++i) {
+    const uint8_t base = static_cast<uint8_t>(20 + i * 3);
+    audioTrackUids.push_back(MakeUid(base));
+    audioSequenceUids.push_back(MakeUid(static_cast<uint8_t>(base + 1)));
+    audioDescriptorUids.push_back(MakeUid(static_cast<uint8_t>(base + 2)));
+  }
+
   // MaterialPackage
   {
     std::vector<uint8_t> entries;
     AppendTagUl(entries, 0x3C0A, uidPackage);
-    AppendTagUlArray(entries, 0x4403, {uidTrack});
-    AppendTagUl(entries, 0x4701, uidDescriptor);
+    std::vector<Ul> trackUids = {uidTrack};
+    trackUids.insert(trackUids.end(), audioTrackUids.begin(), audioTrackUids.end());
+    AppendTagUlArray(entries, 0x4403, trackUids);
+    AppendTagUl(entries, 0x4701, packageDescriptorRef);
     AppendLocalSet(metadata, 0x36, 0x00, entries);
   }
-  // Track (Generic Track)
+  // Track (Generic Track) -- video
   {
     std::vector<uint8_t> entries;
     AppendTagUl(entries, 0x3C0A, uidTrack);
@@ -184,7 +236,7 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagU32(entries, 0x4804, cfg.videoTrackNumber);
     AppendLocalSet(metadata, 0x3B, 0x00, entries);
   }
-  // Sequence
+  // Sequence -- video
   {
     std::vector<uint8_t> entries;
     AppendTagUl(entries, 0x3C0A, uidSequence);
@@ -200,6 +252,46 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagU32(entries, 0x3202, cfg.height);
     AppendTagUl(entries, 0x3201, cfg.pictureEssenceCoding);
     AppendLocalSet(metadata, 0x28, 0x00, entries);
+  }
+
+  // Audio tracks: one Track+Sequence+Sound Descriptor triple each.
+  for (size_t i = 0; i < cfg.audioTracks.size(); ++i) {
+    const SyntheticAudioTrack& at = cfg.audioTracks[i];
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, audioTrackUids[i]);
+      AppendTagU32(entries, 0x4801, at.trackId);
+      AppendTagUl(entries, 0x4803, audioSequenceUids[i]);
+      AppendTagU32(entries, 0x4804, at.trackNumber);
+      AppendLocalSet(metadata, 0x3B, 0x00, entries);
+    }
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, audioSequenceUids[i]);
+      AppendTagUl(entries, 0x0201, kAudioDataDefinition);
+      AppendTagI64(entries, 0x0202, cfg.sequenceDuration);
+      AppendLocalSet(metadata, 0x0F, 0x00, entries);
+    }
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, audioDescriptorUids[i]);
+      AppendTagU32(entries, 0x3006, at.trackId);  // LinkedTrackID
+      AppendTagU32(entries, 0x3D07, at.channelCount);
+      AppendTagRational(entries, 0x3D03, static_cast<int32_t>(at.sampleRate), 1);
+      AppendTagU32(entries, 0x3D01, at.bitsPerSample);
+      AppendTagUl(entries, 0x3D06, at.soundEssenceCoding);
+      AppendLocalSet(metadata, 0x42, 0x00, entries);  // SetType::kSoundDescriptor (code 0x4200)
+    }
+  }
+
+  // MultipleDescriptor wrapping the CDCI Descriptor + every Sound Descriptor.
+  if (useMultipleDescriptor) {
+    std::vector<uint8_t> entries;
+    AppendTagUl(entries, 0x3C0A, uidMultipleDescriptor);
+    std::vector<Ul> subDescriptors = {uidDescriptor};
+    subDescriptors.insert(subDescriptors.end(), audioDescriptorUids.begin(), audioDescriptorUids.end());
+    AppendTagUlArray(entries, 0x3F01, subDescriptors);
+    AppendLocalSet(metadata, 0x44, 0x00, entries);  // SetType::kMultipleDescriptor (code 0x4400)
   }
 
   if (cfg.includeSourcePackage) {

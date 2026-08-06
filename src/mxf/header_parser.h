@@ -4,12 +4,31 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "mxf/klv.h"
 #include "mxf/metadata_sets.h"
 #include "mxf/ul_tables.h"
 
 namespace mxfsrc {
+
+// One discovered audio Track. Unlike video, real files can carry more than
+// one (stereo pairs, per-language tracks) -- all are summed into one
+// interleaved output stream when every track agrees on format (see
+// MxfStreamInfo::audioConfigSupported).
+struct AudioTrackInfo {
+  // Track.TrackNumber (baseline tag 0x4804) -- same role as
+  // MxfStreamInfo::videoTrackNumber, see its comment.
+  std::array<uint8_t, 4> trackNumber{};
+  // Track.TrackID (baseline tag 0x4801), used to bind this track to its
+  // MultipleDescriptor sub-descriptor via LinkedTrackID when a file has more
+  // than one audio track (see header_parser.cpp's ResolveDescriptor).
+  uint32_t trackId = 0;
+  uint32_t channelCount = 0;
+  uint32_t sampleRate = 0;
+  uint32_t bitsPerSample = 0;
+  CodecFamily codec = CodecFamily::kUnknown;
+};
 
 struct MxfStreamInfo {
   bool hasVideo = false;
@@ -26,11 +45,23 @@ struct MxfStreamInfo {
   std::array<uint8_t, 4> videoTrackNumber{};
 
   bool hasAudio = false;
+  // Resolved, validated, uniform values actually used for output -- only
+  // meaningful when audioConfigSupported is true (see ParseMxfHeader's
+  // validation pass and SourceEngine::Open's UseAudioMode handling).
   uint32_t audioSampleRate = 0;
-  uint32_t audioChannels = 0;
+  uint32_t audioChannels = 0;  // sum of every audioTracks[].channelCount
   uint32_t audioBitsPerSample = 0;
   CodecFamily audioCodec = CodecFamily::kUnknown;
-  std::array<uint8_t, 4> audioTrackNumber{};
+
+  // Every discovered audio Track, in TrackID order.
+  std::vector<AudioTrackInfo> audioTracks;
+  // True when every entry in audioTracks agrees on bit depth and sample
+  // rate, and all are uncompressed PCM -- the only configuration this
+  // plugin can output audio for today (compressed codecs need a separate
+  // avcodec decode wrapper, not yet implemented).
+  bool audioConfigSupported = false;
+  // Human-readable reason audioConfigSupported is false; empty otherwise.
+  std::string audioUnsupportedReason;
 
   uint64_t headerMetadataEnd = 0;  // byte offset where Header Metadata ends; Phase 2's essence
                                     // walk starts scanning for the first Body Partition from here.

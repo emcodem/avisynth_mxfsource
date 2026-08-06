@@ -258,6 +258,159 @@ void TestXavcLongGopUlClassification() {
   CHECK(IsIntraOnlyCodec(CodecFamily::kH264));
 }
 
+// Single audio track, via a MultipleDescriptor wrapping the CDCI Descriptor
+// + one Sound Descriptor -- the common real-world case. Binds directly
+// (sole-candidate fallback) even though LinkedTrackID/TrackID default to 0
+// here, matching a lazy writer that omits LinkedTrackID entirely when
+// there's nothing ambiguous to resolve.
+void TestSingleAudioTrackResolved() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 10;
+  SyntheticAudioTrack audio;
+  audio.channelCount = 2;
+  audio.sampleRate = 48000;
+  audio.bitsPerSample = 24;
+  cfg.audioTracks = {audio};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_single_audio.mxf");
+
+  {
+    MxfReader reader(path.string());
+    std::string err;
+    auto info = ParseMxfHeader(reader, &err);
+    CHECK(info.has_value());
+    if (!info) {
+      std::cerr << "ParseMxfHeader error: " << err << std::endl;
+    } else {
+      CHECK(info->hasVideo);
+      CHECK(info->hasAudio);
+      CHECK(info->audioTracks.size() == 1);
+      CHECK(info->audioConfigSupported);
+      CHECK(info->audioChannels == 2);
+      CHECK(info->audioSampleRate == 48000);
+      CHECK(info->audioBitsPerSample == 24);
+      CHECK(info->audioCodec == CodecFamily::kPcm);
+      CHECK(info->audioUnsupportedReason.empty());
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Two audio tracks (e.g. two mono language tracks), each carrying a
+// distinct TrackID/LinkedTrackID pair -- exercises the LinkedTrackID-based
+// sub-descriptor binding (see header_parser.cpp's ResolveDescriptor) rather
+// than the single-sound-descriptor sole-candidate fallback. Total
+// audioChannels must be the sum across both tracks.
+void TestMultiAudioTrackSummedAndBoundByLinkedTrackId() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 10;
+  SyntheticAudioTrack a;
+  a.trackNumber = 0x02020200;
+  a.trackId = 101;
+  a.channelCount = 1;
+  a.sampleRate = 48000;
+  a.bitsPerSample = 16;
+  SyntheticAudioTrack b;
+  b.trackNumber = 0x02020300;
+  b.trackId = 102;
+  b.channelCount = 1;
+  b.sampleRate = 48000;
+  b.bitsPerSample = 16;
+  cfg.audioTracks = {a, b};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_multi_audio.mxf");
+
+  {
+    MxfReader reader(path.string());
+    std::string err;
+    auto info = ParseMxfHeader(reader, &err);
+    CHECK(info.has_value());
+    if (!info) {
+      std::cerr << "ParseMxfHeader error: " << err << std::endl;
+    } else {
+      CHECK(info->hasAudio);
+      CHECK(info->audioTracks.size() == 2);
+      CHECK(info->audioConfigSupported);
+      CHECK(info->audioChannels == 2);  // 1 + 1 summed
+      CHECK(info->audioBitsPerSample == 16);
+      // Each resolved track kept its own distinct TrackNumber -- confirms
+      // LinkedTrackID bound each Sound Descriptor to the correct Track
+      // rather than both collapsing onto the same one.
+      auto trackNumberBytes = [](uint32_t n) {
+        return std::array<uint8_t, 4>{static_cast<uint8_t>(n >> 24), static_cast<uint8_t>(n >> 16),
+                                       static_cast<uint8_t>(n >> 8), static_cast<uint8_t>(n)};
+      };
+      const auto aBytes = trackNumberBytes(a.trackNumber);
+      const auto bBytes = trackNumberBytes(b.trackNumber);
+      bool sawA = false, sawB = false;
+      for (const auto& t : info->audioTracks) {
+        if (t.trackNumber == aBytes) sawA = true;
+        if (t.trackNumber == bBytes) sawB = true;
+      }
+      CHECK(sawA);
+      CHECK(sawB);
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
+// Mismatched bit depth across audio tracks must NOT fail ParseMxfHeader
+// itself -- it's flagged via audioConfigSupported/audioUnsupportedReason,
+// with the playback policy (degrade vs. hard-fail) decided later by
+// SourceEngine::Open via UseAudioMode.
+void TestMismatchedBitDepthMarksAudioUnsupported() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 10;
+  SyntheticAudioTrack a;
+  a.trackNumber = 0x02020200;
+  a.trackId = 101;
+  a.bitsPerSample = 16;
+  SyntheticAudioTrack b;
+  b.trackNumber = 0x02020300;
+  b.trackId = 102;
+  b.bitsPerSample = 24;
+  cfg.audioTracks = {a, b};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_mismatched_bitdepth.mxf");
+
+  {
+    MxfReader reader(path.string());
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (info) {
+      CHECK(info->hasAudio);
+      CHECK(info->audioTracks.size() == 2);
+      CHECK(!info->audioConfigSupported);
+      CHECK(!info->audioUnsupportedReason.empty());
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
+// A non-PCM audio codec (AC-3) must likewise flag audioConfigSupported=false
+// with a descriptive reason, not fail ParseMxfHeader.
+void TestNonPcmCodecMarksAudioUnsupported() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 10;
+  SyntheticAudioTrack a;
+  a.soundEssenceCoding = kAc3Coding;
+  cfg.audioTracks = {a};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_ac3_unsupported.mxf");
+
+  {
+    MxfReader reader(path.string());
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (info) {
+      CHECK(info->hasAudio);
+      CHECK(!info->audioConfigSupported);
+      CHECK(!info->audioUnsupportedReason.empty());
+    }
+  }
+
+  std::filesystem::remove(path);
+}
+
 void TestRejectsNonMxfFile() {
   std::vector<uint8_t> garbage = {'n', 'o', 't', ' ', 'm', 'x', 'f'};
   auto path = WriteTempFile(garbage, "mxfsrc_test_garbage.mxf");
@@ -284,6 +437,10 @@ int main() {
   TestRipFallbackLocatesFooterWhenHeaderFieldIsZero();
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
   TestXavcLongGopUlClassification();
+  TestSingleAudioTrackResolved();
+  TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
+  TestMismatchedBitDepthMarksAudioUnsupported();
+  TestNonPcmCodecMarksAudioUnsupported();
   TestRejectsNonMxfFile();
 
   if (g_failures == 0) {

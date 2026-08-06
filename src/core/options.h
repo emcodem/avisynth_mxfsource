@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "core/use_audio_mode.h"
+
 namespace mxfsrc {
 
 // Open-time options shared by both host adapters. Wired into the real
@@ -58,6 +60,11 @@ struct OpenOptions {
   // the untrimmed source essence directly. Exposed to scripts as
   // MxfSource(..., handle_origin=true/false).
   bool handle_origin = true;
+
+  // Policy for audio that's present but not in a state this plugin can
+  // output (see UseAudioMode). Exposed to scripts as
+  // MxfSource(..., use_audio="always"/"never"/"supported").
+  UseAudioMode use_audio = UseAudioMode::kSupported;
 };
 
 } // namespace mxfsrc
