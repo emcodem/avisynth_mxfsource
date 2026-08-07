@@ -18,6 +18,12 @@ using Ul = std::array<uint8_t, 16>;
 bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen);
 bool UlEquals(const Ul& a, const Ul& b);
 
+// True if `path` has an http:// or https:// scheme prefix (case-insensitive).
+// Shared by MxfReader's own FileByteSource/HttpByteSource dispatch and
+// mxf/index_transport.h's identical local-path-vs-URL dispatch for
+// publishing/fetching a shared essence index.
+bool IsHttpUrl(const std::string& path);
+
 // Underlying byte-access backend for MxfReader -- one implementation reads a
 // local file (FileByteSource, src/mxf/file_byte_source.h), another streams
 // over HTTP/HTTPS (HttpByteSource, src/net/http_byte_source.h) so the same

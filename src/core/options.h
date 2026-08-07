@@ -65,6 +65,21 @@ struct OpenOptions {
   // output (see UseAudioMode). Exposed to scripts as
   // MxfSource(..., use_audio="always"/"never"/"supported").
   UseAudioMode use_audio = UseAudioMode::kSupported;
+
+  // URL (or local path) to fetch a previously published essence index JSON
+  // document from -- see mxf/index_transport.h -- instead of building the
+  // index locally via mxf/index_table.h's BuildEssenceIndex. Published by
+  // the separate MxfExtractIndex host function; for distributed setups (one
+  // instance scans the file, e.g. AWS slave instances working off a
+  // byte-identical copy of the same source) where repeating that scan on
+  // every instance is pure redundant I/O. Any failure -- network error,
+  // malformed JSON, version/bodySid mismatch, or the byte-offset-vs-file-
+  // size plausibility check -- fails Open() outright; there is deliberately
+  // no silent fallback to a local rebuild, since masking a real mismatch
+  // risks seeking into the wrong bytes. Ignored (always builds its own
+  // index locally, without writing anything to disk) when empty, the
+  // default. Exposed to scripts as MxfSource(..., indexurl="...").
+  std::string index_url;
 };
 
 } // namespace mxfsrc

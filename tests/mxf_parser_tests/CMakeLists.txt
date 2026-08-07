@@ -32,6 +32,13 @@ target_compile_features(mxf_index_table_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_index_table_tests PRIVATE mxf_core)
 add_test(NAME mxf_index_table_tests COMMAND mxf_index_table_tests)
 
+add_executable(mxf_index_serialization_tests
+  index_serialization_test.cpp
+)
+target_compile_features(mxf_index_serialization_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_index_serialization_tests PRIVATE mxf_core)
+add_test(NAME mxf_index_serialization_tests COMMAND mxf_index_serialization_tests)
+
 add_executable(mxf_audio_sample_index_tests
   audio_sample_index_test.cpp
 )

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "codec/decoder_factory.h"
+#include "mxf/index_transport.h"
 #include "mxf/ul_tables.h"
 
 namespace mxfsrc {
@@ -160,11 +161,25 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   originSkip_ = options.handle_origin ? streamInfo_.origin : 0;
   if (originSkip_ < 0) originSkip_ = 0;
 
-  // Best-effort: absent/failed index building degrades silently to
-  // videoIndex_ staying nullopt, which SeekAndDecode already treats as "no
-  // index available, use the from-essence-element-0 fallback" -- never a
-  // hard Open() failure.
-  videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
+  if (!options.index_url.empty()) {
+    // Fail loud: unlike the local-build path below, a slave asked to reuse a
+    // shared index has no reason to expect one might be unavailable, so any
+    // problem here (network error, version/bodySid mismatch, implausible
+    // byte offsets -- see mxf/index_transport.h) is reported as a hard
+    // Open() failure rather than silently degrading to a local rebuild.
+    std::string indexError;
+    videoIndex_ = FetchEssenceIndex(options.index_url, streamInfo_.bodySid, reader_->Size(), &indexError);
+    if (!videoIndex_) {
+      return {OpenStatus::kParseError, "failed to fetch shared index from '" + options.index_url + "': " + indexError};
+    }
+  } else {
+    // Best-effort, and never written to disk (see MxfExtractIndex for the
+    // separate host function that does that): absent/failed index building
+    // degrades silently to videoIndex_ staying nullopt, which SeekAndDecode
+    // already treats as "no index available, use the
+    // from-essence-element-0 fallback" -- never a hard Open() failure.
+    videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
+  }
 
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
   if (streamInfo_.numFrames < 0) {

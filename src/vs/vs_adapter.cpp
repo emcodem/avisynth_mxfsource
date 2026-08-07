@@ -12,10 +12,13 @@
 #include <vector>
 
 #include "VapourSynth4.h"
+#include "core/index_extract.h"
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
 
+using mxfsrc::ExtractAndPublishIndex;
+using mxfsrc::ExtractIndexResult;
 using mxfsrc::FetchStatus;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
@@ -270,6 +273,8 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
     vsapi->mapSetError(out, "MxfSource: use_audio must be 'always', 'never', or 'supported'");
     return;
   }
+  int indexUrlErr = 0;
+  const char* indexUrl = vsapi->mapGetData(in, "indexurl", 0, &indexUrlErr);
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
@@ -279,6 +284,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   options.http_headers = httpHeadersErr ? "" : httpHeaders;
   options.handle_origin = handleOrigin;
   options.use_audio = *useAudio;
+  options.index_url = indexUrlErr ? "" : indexUrl;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -369,6 +375,31 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   vsapi->freeNode(audioNode);
 }
 
+void VS_CC CreateMxfExtractIndex(const VSMap* in, VSMap* out, void* /*userData*/, VSCore* /*core*/,
+                                  const VSAPI* vsapi) {
+  int err = 0;
+  const char* path = vsapi->mapGetData(in, "file", 0, &err);
+  if (err || !path || !*path) {
+    vsapi->mapSetError(out, "MxfExtractIndex: a file path is required");
+    return;
+  }
+  int targetErr = 0;
+  const char* targetUrl = vsapi->mapGetData(in, "targeturl", 0, &targetErr);
+  if (targetErr || !targetUrl || !*targetUrl) {
+    vsapi->mapSetError(out, "MxfExtractIndex: a target URL/path is required");
+    return;
+  }
+  int httpHeadersErr = 0;
+  const char* httpHeaders = vsapi->mapGetData(in, "httpheaders", 0, &httpHeadersErr);
+
+  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders);
+  if (!result.ok) {
+    vsapi->mapSetError(out, ("MxfExtractIndex: " + result.error).c_str());
+    return;
+  }
+  vsapi->mapSetInt(out, "result", 1, maAppend);
+}
+
 }  // namespace
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
@@ -377,11 +408,13 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the
       // return type spec is fixed for the plugin's whole lifetime, not
       // per-invocation.
       "clip:vnode;audio:anode;", CreateMxfSource, nullptr, plugin);
+  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;", "result:int;",
+                            CreateMxfExtractIndex, nullptr, plugin);
 }

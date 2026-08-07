@@ -30,14 +30,6 @@ constexpr int kMaxRetries = 2;  // up to 3 attempts total per logical transfer
 
 std::once_flag g_curlInitFlag;
 
-void EnsureCurlGlobalInit() {
-  std::call_once(g_curlInitFlag, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
-  // curl_global_cleanup() is deliberately never called -- see header comment:
-  // this is a plugin loaded into an arbitrary host process, and tearing down
-  // libcurl's global state on our own DLL unload could race any other user
-  // of libcurl already loaded in that same process.
-}
-
 curl_slist* BuildHeaderList(const std::string& rawHeaders) {
   curl_slist* list = nullptr;
   std::istringstream stream(rawHeaders);
@@ -99,6 +91,14 @@ void ApplyCommonOptions(CURL* easy, const std::string& url, curl_slist* headerLi
 }
 
 }  // namespace
+
+void EnsureCurlGlobalInit() {
+  std::call_once(g_curlInitFlag, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+  // curl_global_cleanup() is deliberately never called -- see header comment:
+  // this is a plugin loaded into an arbitrary host process, and tearing down
+  // libcurl's global state on our own DLL unload could race any other user
+  // of libcurl already loaded in that same process.
+}
 
 HttpByteSource::HttpByteSource(const std::string& url, const std::string& rawHeaders) : url_(url) {
   EnsureCurlGlobalInit();

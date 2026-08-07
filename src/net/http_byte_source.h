@@ -14,6 +14,14 @@ struct curl_slist;
 
 namespace mxfsrc {
 
+// Ensures curl_global_init() has been called exactly once for this process
+// (idempotent, safe to call from any HTTP-using translation unit -- e.g.
+// net/http_put.h's one-shot PUT/GET helpers share this instead of each
+// calling curl_global_init() themselves, since it isn't meant to be invoked
+// more than once). curl_global_cleanup() is deliberately never called -- see
+// HttpByteSource's own class comment below for why.
+void EnsureCurlGlobalInit();
+
 // IByteSource backend that streams an MXF file over HTTP/HTTPS via libcurl --
 // this is what lets MxfSource(url) work against a plain HTTP(S) link or an
 // S3 presigned URL exactly like it works against a local path.

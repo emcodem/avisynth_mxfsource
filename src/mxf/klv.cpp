@@ -18,9 +18,9 @@ bool HasSchemePrefix(const std::string& path, const char* scheme) {
                      [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; });
 }
 
-bool IsHttpUrl(const std::string& path) { return HasSchemePrefix(path, "http://") || HasSchemePrefix(path, "https://"); }
-
 }  // namespace
+
+bool IsHttpUrl(const std::string& path) { return HasSchemePrefix(path, "http://") || HasSchemePrefix(path, "https://"); }
 
 bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen) {
   if (prefixLen > key.size()) return false;

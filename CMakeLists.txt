@@ -50,6 +50,8 @@ add_library(mxf_core STATIC
   src/mxf/file_byte_source.h
   src/net/http_byte_source.cpp
   src/net/http_byte_source.h
+  src/net/http_put.cpp
+  src/net/http_put.h
   src/mxf/partition.cpp
   src/mxf/partition.h
   src/mxf/metadata_sets.cpp
@@ -60,6 +62,10 @@ add_library(mxf_core STATIC
   src/mxf/essence_walker.h
   src/mxf/index_table.cpp
   src/mxf/index_table.h
+  src/mxf/index_serialization.cpp
+  src/mxf/index_serialization.h
+  src/mxf/index_transport.cpp
+  src/mxf/index_transport.h
   src/mxf/audio_sample_index.cpp
   src/mxf/audio_sample_index.h
   src/mxf/ul_tables.h
@@ -75,6 +81,8 @@ add_library(mxf_core STATIC
   src/core/frame_buffer.h
   src/core/options.h
   src/core/use_audio_mode.h
+  src/core/index_extract.cpp
+  src/core/index_extract.h
   src/core/source_engine.cpp
   src/core/source_engine.h
 )

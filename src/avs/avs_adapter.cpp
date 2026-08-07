@@ -7,10 +7,13 @@
 #include <string>
 
 #include "avisynth.h"
+#include "core/index_extract.h"
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
 
+using mxfsrc::ExtractAndPublishIndex;
+using mxfsrc::ExtractIndexResult;
 using mxfsrc::FetchStatus;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
@@ -212,6 +215,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const char* useAudioStr = args[6].AsString("supported");
   const auto useAudio = ParseUseAudioMode(useAudioStr);
   if (!useAudio) env->ThrowError("MxfSource: use_audio must be 'always', 'never', or 'supported'");
+  const char* indexUrl = args[7].AsString("");
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
@@ -221,12 +225,26 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   options.http_headers = httpHeaders;
   options.handle_origin = handleOrigin;
   options.use_audio = *useAudio;
+  options.index_url = indexUrl;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
   }
 
   return new MxfSource(std::move(engine), env);
+}
+
+AVSValue __cdecl CreateMxfExtractIndex(AVSValue args, void* /*user_data*/, IScriptEnvironment* env) {
+  const char* path = args[0].AsString(nullptr);
+  if (!path || !*path) env->ThrowError("MxfExtractIndex: a file path is required");
+  const char* targetUrl = args[1].AsString(nullptr);
+  if (!targetUrl || !*targetUrl) env->ThrowError("MxfExtractIndex: a target URL/path is required");
+  const char* httpHeaders = args[2].AsString("");
+
+  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders);
+  if (!result.ok) env->ThrowError("MxfExtractIndex: %s", result.error.c_str());
+
+  return AVSValue(true);
 }
 
 }  // namespace
@@ -244,7 +262,9 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
   AVS_linkage = vectors;
   env->AddFunction(
       "MxfSource",
-      "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s",
+      "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
+      "[indexurl]s",
       CreateMxfSource, nullptr);
+  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s", CreateMxfExtractIndex, nullptr);
   return "MXF forward-only source plugin";
 }
