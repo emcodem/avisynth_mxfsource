@@ -41,10 +41,28 @@ enum class FetchStatus { kOk, kEvicted, kEndOfStream, kError };
 template <typename T>
 class FrameBuffer {
  public:
-  FrameBuffer(int capacity, int eagerReadaheadMargin)
+  // `startIndex` (default 0) seeds the ring's first-ever index: `watermark_`,
+  // `lowestValid_`, and `highestProduced_+1` (i.e. the first index NextIndex()
+  // returns) all start there instead of 0, so a producer given a start-frame
+  // hint (see OpenOptions::start_frame_hint) can begin filling the buffer at
+  // an arbitrary absolute frame number instead of always at 0 -- consumers
+  // address frames by that same absolute number throughout this class
+  // (SourceEngine::GetVideoFrame passes its own `n` straight through as
+  // `index`), so the ring has to be told where production will actually
+  // begin, not just how big its window is. Any index below startIndex
+  // behaves exactly like an already-evicted one (see GetImpl's
+  // `index < lowestValid_` branch) -- correct, since nothing before
+  // startIndex will ever be produced by this buffer's own producer; a
+  // caller that genuinely needs one of those (e.g. SourceEngine::
+  // GetVideoFrame/FetchAudioBlock for a frame before the hint) already falls
+  // back to a fresh one-shot re-decode for an evicted index, same as today.
+  FrameBuffer(int capacity, int eagerReadaheadMargin, int64_t startIndex = 0)
       : capacity_(capacity),
         margin_(std::min(capacity, eagerReadaheadMargin)),
-        slots_(static_cast<size_t>(capacity)) {}
+        slots_(static_cast<size_t>(capacity)),
+        lowestValid_(startIndex),
+        highestProduced_(startIndex - 1),
+        watermark_(startIndex) {}
 
   // --- producer side (single decode thread only) ---
 

@@ -880,6 +880,84 @@ std::vector<uint8_t> BuildGopFile(const std::vector<EncodedGopEntry>& entries, i
   return file;
 }
 
+// Same shape as BuildGopFile, but with one audio track interleaved into
+// every content package -- needed to exercise DecodeThreadMain's hinted
+// warm-up audio path (see the hint's own doc comment there) against real
+// GOP reordering. Each content package's audio payload is tagged by its
+// PHYSICAL/decode-order position `i` (matching MakeAudioEditUnitPayload(i,
+// ...)), not `entries[i].displayPosition` -- mirroring how DecodeThreadMain
+// itself collects audioScratch in lockstep with each decode-order video
+// element, before its own reorder-delay compensation re-aligns it to
+// display order (real MXF interleaves audio into the same content package
+// as whichever video element -- decode order for GOP video -- physically
+// sits there).
+std::vector<uint8_t> BuildGopFileWithAudio(const std::vector<EncodedGopEntry>& entries, int width, int height,
+                                             uint32_t videoTrackNumber, uint32_t audioTrackNumber,
+                                             int samplesPerEditUnit, int channels) {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = static_cast<int64_t>(entries.size());
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = videoTrackNumber;
+  cfg.pictureEssenceCoding = kMpeg2LongGopCoding;
+  SyntheticAudioTrack audio;
+  audio.trackNumber = audioTrackNumber;
+  audio.trackId = 100;
+  audio.channelCount = static_cast<uint32_t>(channels);
+  audio.sampleRate = static_cast<uint32_t>(samplesPerEditUnit) * 25;
+  audio.bitsPerSample = 16;
+  cfg.audioTracks = {audio};
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+
+  std::vector<std::vector<uint8_t>> audioPayloads(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    audioPayloads[i] = MakeAudioEditUnitPayload(static_cast<int>(i), samplesPerEditUnit, channels);
+  }
+
+  // See BuildGopFile's own doc comment: IndexEntryArray row i describes
+  // display-order edit unit i, streamOffset pointing at wherever (in
+  // decode/physical order) that display frame's video KLV actually lands --
+  // only the video element's offset matters here, exactly like BuildGopFile,
+  // since BuildAudioSampleIndexFromIndexTable derives audio locations from
+  // the video Index Table alone (see its own doc comment).
+  IndexTableSegmentSpec segSpec;
+  segSpec.indexStartPosition = 0;
+  segSpec.indexDuration = static_cast<int64_t>(entries.size());
+  segSpec.indexSid = 1;
+  segSpec.bodySid = 1;
+  segSpec.entries.resize(entries.size());
+  for (const auto& e : entries) segSpec.entries[static_cast<size_t>(e.displayPosition)].flags = e.flags;
+
+  std::vector<uint8_t> placeholderSegBytes;
+  AppendIndexTableSegment(placeholderSegBytes, segSpec);
+
+  const uint64_t bodyPartitionOffset = file.size();
+  AppendPartitionPack(file, PartitionKind::kBody, placeholderSegBytes.size(), /*indexSid=*/1);
+  const uint64_t essenceContainerBaseOffset = file.size() + placeholderSegBytes.size();
+
+  uint64_t cursor = essenceContainerBaseOffset;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    segSpec.entries[static_cast<size_t>(entries[i].displayPosition)].streamOffset = cursor - essenceContainerBaseOffset;
+    cursor += 16 + BerLengthSize(entries[i].data.size()) + entries[i].data.size();
+    cursor += 16 + BerLengthSize(audioPayloads[i].size()) + audioPayloads[i].size();
+  }
+
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, segSpec);
+  if (segBytes.size() != placeholderSegBytes.size()) {
+    std::cerr << "BuildGopFileWithAudio: unexpected Index Table Segment size mismatch" << std::endl;
+  }
+
+  file.insert(file.end(), segBytes.begin(), segBytes.end());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    AppendEssenceElement(file, videoTrackNumber, entries[i].data);
+    AppendEssenceElement(file, audioTrackNumber, audioPayloads[i]);
+  }
+
+  AppendRandomIndexPack(file, {{1, 0}, {1, bodyPartitionOffset}});
+  return file;
+}
+
 // Decodes every frame [0, count) sequentially via the normal ring-buffer
 // path (ample buffer_frames, no eviction) -- the ground-truth reference
 // this test compares targeted/seek-driven decodes against.
@@ -906,12 +984,16 @@ std::vector<std::vector<uint8_t>> DecodeAllSequentially(const std::string& path,
 constexpr uint32_t kGopTrackNumber = 0x02020200;
 constexpr int kGopWidth = 16, kGopHeight = 16, kGopSize = 5, kGopNumFrames = 15;
 
-// Baseline: with no Index Table Segment at all, SeekAndDecode's GOP branch
-// must still behave exactly as before this feature -- a full forward
-// decode from essence element 0 -- and produce pixel-identical output to
-// sequential playback for a real, genuinely inter-predicted (long-GOP)
-// codec, not just the uncompressed intra-only synthetic files the rest of
-// this file's tests use.
+// With no real Index Table Segment at all, SourceEngine::Open now builds a
+// fallback index straight from the essence's own MPEG-2 bitstream headers
+// (mxf/bitstream_index.h) rather than leaving SeekAndDecode's GOP branch
+// with nothing to jump to -- this file's real closed-GOP MPEG-2 content is
+// exactly the case that fallback is for, so an eviction-triggered seek here
+// is now index-assisted (IndexAssistedSeekCount() > 0) instead of the old
+// from-essence-element-0 full decode. Still verifies pixel-identical output
+// against sequential playback for a real, genuinely inter-predicted
+// (long-GOP) codec, not just the uncompressed intra-only synthetic files
+// the rest of this file's tests use.
 void TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex() {
   auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
   CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
@@ -938,7 +1020,7 @@ void TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex() {
       CHECK(st == FetchStatus::kOk);
       if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
       CHECK(!engine.NonBufferedServedFrames().empty());  // confirms the fallback path was genuinely exercised
-      CHECK(engine.IndexAssistedSeekCount() == 0);        // no Index Table in this file -- never index-assisted
+      CHECK(engine.IndexAssistedSeekCount() > 0);  // bitstream-derived fallback index found real keyframes to use
     }
   }
   std::filesystem::remove(path);
@@ -1027,6 +1109,143 @@ void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
       if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
       CHECK(!engine.NonBufferedServedFrames().empty());  // proves the fast path, not the sequential wait, was used
       CHECK(engine.IndexAssistedSeekCount() > 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Exercises OpenOptions::start_frame_hint end to end for a GOP-based codec
+// with a real Index Table Segment: DecodeThreadMain should jump-start
+// production at a keyframe near the hint (via ResolveSeekStart -- the same
+// lookup SeekAndDecode's own fallback uses) instead of at essence element 0,
+// so every requested frame from the hint onward is served from the ring
+// buffer (not SeekAndDecode's one-shot fallback) and still matches a
+// from-frame-0 reference decode exactly. This is the exact scenario the
+// hint exists for: a caller that opens a fresh SourceEngine and immediately
+// requests a range far from frame 0 (see the sibling aws_lambda_qtgmc_chunked
+// project's per-chunk usage).
+void TestStartFrameHintGopServesFromBufferViaIndexAssistedJump() {
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
+  if (encoded.size() != static_cast<size_t>(kGopNumFrames)) return;
+
+  auto referenceBytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_hint_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kGopNumFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_hint.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    // kGopSize == 5 -> keyframes at edit units 0, 5, 10. 7 is two edit units
+    // past the keyframe at 5, so ResolveSeekStart should land the jump-start
+    // there (plenty of runway; this file has no B frames, so reorderDelay is
+    // always 0 and every hop of ResolveSeekStart's backward walk is moot),
+    // not at essence element 0.
+    opts.start_frame_hint = 7;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      // FirstFrame() is Open()'s own Peek() at the ring buffer's very first
+      // index -- now firstHostFrame_ (7) instead of 0 -- so this alone
+      // proves DecodeThreadMain produced hint-relative content there, not
+      // essence element 0's.
+      CHECK(engine.FirstFrame().planeData[0] == reference[7]);
+
+      for (int64_t i = 7; i < kGopNumFrames; ++i) {
+        std::shared_ptr<NormalizedFrame> frame;
+        std::string err;
+        FetchStatus st = engine.GetVideoFrame(i, frame, &err);
+        CHECK(st == FetchStatus::kOk);
+        if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[i]);
+        else std::cerr << "frame " << i << " failed: " << err << std::endl;
+      }
+      // Every frame from the hint onward came from the ring buffer's normal
+      // production, never SeekAndDecode's one-shot fallback -- the whole
+      // point of the hint.
+      CHECK(engine.NonBufferedServedFrames().empty());
+      // Confirms ResolveSeekStart's keyframe lookup was actually consulted
+      // (once, at Open() time) rather than silently falling back to essence
+      // element 0.
+      CHECK(engine.IndexAssistedSeekCount() > 0);
+
+      // A frame *before* the hint is still reachable -- via the existing
+      // SeekAndDecode fallback, since the ring buffer's own window starts at
+      // the hint and reports anything earlier as evicted -- just not from
+      // the buffer.
+      std::shared_ptr<NormalizedFrame> early;
+      CHECK(engine.GetVideoFrame(2, early, nullptr) == FetchStatus::kOk);
+      if (early) CHECK(early->planeData[0] == reference[2]);
+      CHECK(!engine.NonBufferedServedFrames().empty());
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Same scenario as above but for an intra-only codec (the plain
+// uncompressed-UYVY synthetic file every other test in this file uses) --
+// exercises DecodeThreadMain's SkipNextVideoElement discard branch (cheap
+// skip, no decode) instead of the GOP branch's decode-and-discard, and
+// confirms it interacts correctly with OpenOptions::handle_origin's own
+// pre-roll skip (both are in effect here: the hint is relative to the
+// origin-trimmed host frame space, same as every other frame index this
+// engine hands a caller).
+void TestStartFrameHintIntraOnlyStartsProductionAtHint() {
+  const int width = 4, height = 2, numFrames = 10;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_hint_intra.mxf");
+
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.start_frame_hint = 6;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      CHECK(!engine.FirstFrame().planeData[0].empty());
+      if (!engine.FirstFrame().planeData[0].empty()) {
+        CHECK(engine.FirstFrame().planeData[0][0] == static_cast<uint8_t>(0x10 + 6));
+      }
+
+      for (int i = 6; i < numFrames; ++i) {
+        std::shared_ptr<NormalizedFrame> frame;
+        std::string err;
+        FetchStatus st = engine.GetVideoFrame(i, frame, &err);
+        CHECK(st == FetchStatus::kOk);
+        if (st == FetchStatus::kOk && !frame->planeData[0].empty()) {
+          CHECK(frame->planeData[0][0] == static_cast<uint8_t>(0x10 + i));
+        }
+      }
+      CHECK(engine.NonBufferedServedFrames().empty());  // all served from the buffer, not the fallback
+
+      // A frame before the hint still works, via the fallback.
+      std::shared_ptr<NormalizedFrame> early;
+      CHECK(engine.GetVideoFrame(2, early, nullptr) == FetchStatus::kOk);
+      if (early && !early->planeData[0].empty()) CHECK(early->planeData[0][0] == static_cast<uint8_t>(0x10 + 2));
+      CHECK(!engine.NonBufferedServedFrames().empty());
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// An out-of-range hint (at/past the file's own frame count) must be ignored,
+// not fail Open() -- same as the field's own default (0).
+void TestStartFrameHintOutOfRangeIgnored() {
+  const int width = 4, height = 2, numFrames = 5;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_hint_oor.mxf");
+
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.start_frame_hint = numFrames;  // at, not past, the frame count -- still out of range
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      CHECK(!engine.FirstFrame().planeData[0].empty());
+      if (!engine.FirstFrame().planeData[0].empty()) {
+        CHECK(engine.FirstFrame().planeData[0][0] == static_cast<uint8_t>(0x10));  // fell back to frame 0
+      }
     }
   }
   std::filesystem::remove(path);
@@ -1133,6 +1352,100 @@ void TestReorderDelayCompensationMatchesReferenceWithRealBFrames() {
         if (st != FetchStatus::kOk) std::cerr << "target=" << target << " failed: " << err << std::endl;
       }
       CHECK(engine.IndexAssistedSeekCount() > 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Regression test: DecodeThreadMain's hinted warm-up block (the discard/
+// decode loop from hintStartEditUnit_ through the hint's target, see its own
+// doc comment) pre-fills the video `pending` deque with real lead-in content
+// so ring index firstHostFrame_'s video comes out already delay-compensated
+// -- but originally discarded the audio it walked past along the way
+// (DecodeNextFrame's audioElementsOut was nullptr there) instead of using it
+// to warm up pendingAudio the same way. That left pendingAudio starting from
+// empty in the main loop, so the first hintReorderDelay_ ring indices after
+// a hinted seek got the "still warming up" undelayed repeat instead of real
+// delay-compensated audio, self-correcting only once pendingAudio genuinely
+// accumulated past reorderDelay entries. Needs a GOP codec with real B-frame
+// reordering (reorderDelay > 0) to exercise at all -- EncodeMpeg2Gop's
+// max_b_frames=0 stream can't touch this, same trap noted on
+// TestReorderDelayCompensationMatchesReferenceWithRealBFrames above.
+void TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference() {
+  constexpr int width = 32, height = 32, gopSize = 6, maxBFrames = 2, numFrames = 30;
+  constexpr int samplesPerEditUnit = 4, channels = 2;
+  auto encoded = EncodeMpeg2GopWithBFrames(width, height, numFrames, gopSize, maxBFrames);
+  CHECK(encoded.size() == static_cast<size_t>(numFrames));
+  if (encoded.size() != static_cast<size_t>(numFrames)) return;
+
+  const bool hasBFrames = std::any_of(encoded.begin(), encoded.end(), [](const EncodedGopEntry& e) {
+    return e.flags == 0x30;
+  });
+  CHECK(hasBFrames);
+  if (!hasBFrames) return;
+
+  constexpr uint32_t kHintVideoTrackNumber = 0x04040400;
+  constexpr uint32_t kHintAudioTrackNumber = 0x04040500;
+  auto bytes = BuildGopFileWithAudio(encoded, width, height, kHintVideoTrackNumber, kHintAudioTrackNumber,
+                                      samplesPerEditUnit, channels);
+
+  // Ground truth: sequential decode from frame 0, no hint at all.
+  auto referencePath = WriteTempFile(bytes, "mxfsrc_test_gop_hint_audio_reference.mxf");
+  std::vector<uint8_t> referenceAudio;
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(referencePath.string());
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      const int64_t totalSamples = static_cast<int64_t>(numFrames) * samplesPerEditUnit;
+      referenceAudio.resize(static_cast<size_t>(totalSamples) * channels * 2);
+      std::string err;
+      FetchStatus st = engine.GetAudioSamples(0, totalSamples, referenceAudio.data(), &err);
+      CHECK(st == FetchStatus::kOk);
+      if (st != FetchStatus::kOk) std::cerr << "reference audio failed: " << err << std::endl;
+    }
+  }
+  std::filesystem::remove(referencePath);
+  if (referenceAudio.empty()) return;
+
+  // Deliberately inside the FIRST GOP (whose own keyframe is display/decode
+  // position 0) rather than at some later GOP's keyframe: ResolveSeekStart's
+  // backward-walk short-circuits to startEditUnit==0 the moment it reaches
+  // edit unit 0 (see its own "needs no compensation, proven above" comment),
+  // so hintStartEditUnit_/hintReorderDelay_ end up identical to what the
+  // ordinary non-hinted path itself anchors at (element 0). That isolates
+  // this test to purely the fixed warm-up-audio-collection gap -- a target
+  // anchored at a *different* keyframe would also fold in
+  // EstimateReorderDelay's own known accuracy gap for arbitrary B-pyramid
+  // GOPs (see TestReorderDelayCompensationMatchesReferenceWithRealBFrames's
+  // doc comment), which is a separate, pre-existing, already-acknowledged
+  // limitation this test isn't targeting.
+  const int64_t target = 3;
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_hint_audio.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.start_frame_hint = target;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      const int64_t startSample = target * samplesPerEditUnit;
+      const int64_t sampleCount = (numFrames - target) * static_cast<int64_t>(samplesPerEditUnit);
+      std::vector<uint8_t> got(static_cast<size_t>(sampleCount) * channels * 2);
+      std::string err;
+      FetchStatus st = engine.GetAudioSamples(startSample, sampleCount, got.data(), &err);
+      CHECK(st == FetchStatus::kOk);
+      if (st == FetchStatus::kOk) {
+        // Regression: before the fix, ring indices `target` and `target + 1`
+        // (the first hintReorderDelay_ positions after the hint) came out as
+        // an undelayed repeat instead of this real, delay-compensated
+        // content -- self-correcting from edit unit `target + 2` onward.
+        const uint8_t* expected = referenceAudio.data() + static_cast<size_t>(startSample) * channels * 2;
+        CHECK(std::memcmp(got.data(), expected, got.size()) == 0);
+      } else {
+        std::cerr << "hinted audio failed: " << err << std::endl;
+      }
     }
   }
   std::filesystem::remove(path);
@@ -1308,7 +1621,11 @@ int main() {
   TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex();
   TestIndexTableAssistedSeekUsesIndexAndMatchesReference();
   TestReorderDelayCompensationMatchesReferenceWithRealBFrames();
+  TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
+  TestStartFrameHintGopServesFromBufferViaIndexAssistedJump();
+  TestStartFrameHintIntraOnlyStartsProductionAtHint();
+  TestStartFrameHintOutOfRangeIgnored();
   TestUnsupportedCodecFailsOpenCleanly();
   TestGetAudioSamplesSequentialMatchesExpectedBytes();
   TestGetAudioSamplesFreshReadAfterEviction();

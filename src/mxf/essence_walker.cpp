@@ -1,5 +1,6 @@
 #include "mxf/essence_walker.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace mxfsrc {
@@ -17,7 +18,7 @@ EssenceWalker::EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array
   reader_.Seek(startOffset);
 }
 
-bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
+bool EssenceWalker::Next(EssenceElement& out, bool wantData, size_t maxBytes) {
   while (reader_.Tell() + 17 <= reader_.Size()) {
     const uint64_t klvStart = reader_.Tell();
     KlvHeader klv{};
@@ -53,8 +54,10 @@ bool EssenceWalker::Next(EssenceElement& out, bool wantData) {
           if (!reader_.Skip(klv.length)) return false;
           return true;
         }
-        out.data.resize(klv.length);
-        if (klv.length > 0 && !reader_.ReadBytes(out.data.data(), klv.length)) return false;
+        const uint64_t readLen = std::min<uint64_t>(klv.length, maxBytes);
+        out.data.resize(readLen);
+        if (readLen > 0 && !reader_.ReadBytes(out.data.data(), readLen)) return false;
+        if (!reader_.Seek(valueEnd)) return false;
         return true;
       }
     }

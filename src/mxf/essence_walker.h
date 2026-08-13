@@ -64,7 +64,19 @@ class EssenceWalker {
   // data across the network only to discard all of it, because Next()
   // unconditionally read each skipped video element's payload even though
   // nothing was ever going to look at it.
-  bool Next(EssenceElement& out, bool wantData = true);
+  //
+  // `maxBytes` (only consulted when wantData=true) bounds how many of the
+  // matched element's Value bytes actually get read into out.data -- the
+  // remainder is Seek()'d past, never transferred. out.data.size() can
+  // therefore be smaller than out.length when this is used; out.length is
+  // always the element's true, full size regardless. For
+  // mxf/bitstream_index.h's fallback keyframe detection, which only needs
+  // to see a frame's leading MPEG-2/H.264 headers (a few KB at most) to
+  // classify it, this avoids paying for every frame's full compressed
+  // payload just to peek at its first bytes -- same rationale as
+  // wantData=false, just for callers that need *some* leading bytes rather
+  // than none.
+  bool Next(EssenceElement& out, bool wantData = true, size_t maxBytes = SIZE_MAX);
 
   uint64_t Position() const { return reader_.Tell(); }
 

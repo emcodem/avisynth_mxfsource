@@ -66,6 +66,12 @@ add_library(mxf_core STATIC
   src/mxf/index_serialization.h
   src/mxf/index_transport.cpp
   src/mxf/index_transport.h
+  src/mxf/mpeg2_bitstream.cpp
+  src/mxf/mpeg2_bitstream.h
+  src/mxf/h264_bitstream.cpp
+  src/mxf/h264_bitstream.h
+  src/mxf/bitstream_index.cpp
+  src/mxf/bitstream_index.h
   src/mxf/audio_sample_index.cpp
   src/mxf/audio_sample_index.h
   src/mxf/ul_tables.h

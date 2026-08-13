@@ -275,6 +275,9 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   }
   int indexUrlErr = 0;
   const char* indexUrl = vsapi->mapGetData(in, "indexurl", 0, &indexUrlErr);
+  int startFrameErr = 0;
+  const int64_t startFrameArg = vsapi->mapGetInt(in, "start_frame", 0, &startFrameErr);
+  const int64_t startFrame = startFrameErr ? 0 : startFrameArg;
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
@@ -285,6 +288,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   options.handle_origin = handleOrigin;
   options.use_audio = *useAudio;
   options.index_url = indexUrlErr ? "" : indexUrl;
+  options.start_frame_hint = startFrame;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -408,7 +412,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the

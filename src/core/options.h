@@ -80,6 +80,33 @@ struct OpenOptions {
   // index locally, without writing anything to disk) when empty, the
   // default. Exposed to scripts as MxfSource(..., indexurl="...").
   std::string index_url;
+
+  // Frame the background decode thread (SourceEngine::DecodeThreadMain)
+  // should start producing from, instead of always starting at frame 0
+  // (Origin pre-roll aside -- see originSkip_) and self-throttling near
+  // there until some caller's first real request eventually drags it
+  // forward. 0 (the default) means "no hint, start at frame 0" -- byte-for-
+  // byte unchanged behavior for any existing caller that never sets this.
+  //
+  // Set by a caller that already knows every frame it will ever request
+  // lies at or after some other point -- e.g. a per-chunk transcode
+  // pipeline that opens a fresh SourceEngine per chunk and immediately
+  // requests frames [chunkStart, chunkStart+N) far from frame 0. Without
+  // this, every one of those requests independently falls outside
+  // SourceEngine::GetVideoFrame's ring-buffer window (the producer thread
+  // never learns the real access point moved) and pays its own full
+  // SeekAndDecode() fallback cost; with it, the producer jump-starts once,
+  // at Open() time, via the same Index Table-assisted keyframe lookup
+  // SeekAndDecode() itself uses, and serves the whole requested range from
+  // the ring buffer cheaply instead.
+  //
+  // A value at or past the file's own frame count is ignored (logged, not
+  // a hard Open() failure) and falls back to the frame-0 default, same as
+  // 0 -- this is purely a performance hint, never a correctness requirement
+  // (a request for a frame before the hint still works, via the existing
+  // SeekAndDecode fallback, just without this optimization). Exposed to
+  // scripts as MxfSource(..., start_frame=N).
+  int64_t start_frame_hint = 0;
 };
 
 } // namespace mxfsrc

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "codec/decoder_factory.h"
+#include "mxf/bitstream_index.h"
 #include "mxf/index_transport.h"
 #include "mxf/ul_tables.h"
 
@@ -179,6 +180,20 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     // already treats as "no index available, use the
     // from-essence-element-0 fallback" -- never a hard Open() failure.
     videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
+    if ((!videoIndex_ || videoIndex_->Empty())) {
+      // No real SMPTE Index Table Segment at all (e.g. a truncated file
+      // with no RIP/footer) -- try recovering a fallback index straight
+      // from the essence's own bitstream headers (mxf/bitstream_index.h),
+      // still best-effort: an unsupported codec or no video elements at
+      // all just leaves videoIndex_ unset, same as today.
+      if (auto fallback = BuildEssenceIndexFromBitstream(*reader_, streamInfo_)) {
+        if (!fallback->Empty()) {
+          AppendLogLine("[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
+                        "bitstream headers (" + std::to_string(fallback->GetEntries().size()) + " edit units)");
+          videoIndex_ = std::move(fallback);
+        }
+      }
+    }
   }
 
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
@@ -200,6 +215,18 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   // is now fully finalized (Header Metadata Duration, SourcePackage-Origin
   // override, or the Index Table fallback above), so this is safe to derive.
   const int64_t rawFrameCount = originSkip_ + streamInfo_.numFrames;
+
+  // OpenOptions::start_frame_hint: see its own doc comment. Clamp/ignore
+  // (never a hard Open() failure) anything non-positive or at/past the
+  // file's own frame count -- both are equivalent to "no hint", the field's
+  // own default.
+  if (options.start_frame_hint > 0 && options.start_frame_hint < streamInfo_.numFrames) {
+    firstHostFrame_ = options.start_frame_hint;
+  } else if (options.start_frame_hint > 0) {
+    AppendLogLine("[MxfSource] " + path_ + ": start_frame hint " + std::to_string(options.start_frame_hint) +
+                  " is out of range for a " + std::to_string(streamInfo_.numFrames) +
+                  "-frame file, ignoring (starting at frame 0 as usual)");
+  }
 
   videoDecoder_ = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
                                       static_cast<int>(streamInfo_.height));
@@ -240,20 +267,44 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   if (exposeAudio_) {
     for (const AudioTrackInfo& t : streamInfo_.audioTracks) audioTrackNumbersForWalker.push_back(t.trackNumber);
   }
-  walker_ = std::make_unique<EssenceWalker>(*reader_, streamInfo_.headerMetadataEnd, streamInfo_.videoTrackNumber,
+  // See OpenOptions::start_frame_hint / firstHostFrame_'s doc comments: when
+  // a hint is in effect, resolve the nearest usable keyframe at or before
+  // its target now (via ResolveSeekStart -- the exact same Index
+  // Table-assisted lookup SeekAndDecode's own one-shot fallback uses), and
+  // start walker_ reading from there instead of from the very first essence
+  // element. DecodeThreadMain replays hintStartEditUnit_/hintReorderDelay_ to
+  // discard-and-warm-up from that point up through the hint's own target
+  // before it ever starts actually filling the ring buffer -- see there.
+  uint64_t walkerStartOffset = streamInfo_.headerMetadataEnd;
+  if (firstHostFrame_ > 0) {
+    const SeekStartPoint seek = ResolveSeekStart(originSkip_ + firstHostFrame_);
+    walkerStartOffset = seek.byteOffset;
+    hintStartEditUnit_ = seek.editUnit;
+    hintReorderDelay_ = seek.reorderDelay;
+  }
+  walker_ = std::make_unique<EssenceWalker>(*reader_, walkerStartOffset, streamInfo_.videoTrackNumber,
                                              streamInfo_.hasVideo, audioTrackNumbersForWalker);
 
   const int capacity = options.buffer_frames > 0 ? options.buffer_frames : 300;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : 32;
-  videoBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<NormalizedFrame>>>(capacity, margin);
+  // firstHostFrame_ (0 unless a start_frame hint is in effect) re-anchors
+  // both ring buffers so their very first produced index is the hint's
+  // target, not 0 -- see FrameBuffer's startIndex constructor param and
+  // DecodeThreadMain, which produces ring index firstHostFrame_ first in
+  // exactly the same way it produces ring index 0 first today.
+  videoBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<NormalizedFrame>>>(capacity, margin, firstHostFrame_);
   if (exposeAudio_) {
-    audioBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<AudioBlock>>>(capacity, margin);
+    audioBuffer_ = std::make_unique<FrameBuffer<std::shared_ptr<AudioBlock>>>(capacity, margin, firstHostFrame_);
   }
 
   decodeThread_ = std::thread(&SourceEngine::DecodeThreadMain, this);
 
+  // Peek() at firstHostFrame_ (0 unless hinted) rather than always 0 -- the
+  // ring buffer's very first produced index moved there too (see just
+  // above), so that's the index Open() needs to inspect for pixel format,
+  // exactly like Peek(0, ...) already did for the un-hinted case.
   std::string peekError;
-  if (videoBuffer_->Peek(0, firstFrame_, &peekError) != FetchStatus::kOk) {
+  if (videoBuffer_->Peek(firstHostFrame_, firstFrame_, &peekError) != FetchStatus::kOk) {
     return {OpenStatus::kDecodeError, "failed to decode first frame: " + peekError};
   }
   return {OpenStatus::kOk, ""};
@@ -324,20 +375,7 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   return FetchStatus::kOk;
 }
 
-std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
-  MxfReader freshReader(path_, httpHeaders_);
-  if (!freshReader.IsOpen()) return nullptr;
-
-  auto freshDecoder = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
-                                          static_cast<int>(streamInfo_.height));
-  if (!freshDecoder) return nullptr;
-
-  auto frame = std::make_shared<NormalizedFrame>();
-
-  // Host frame index `target` maps to essence video element index
-  // `originSkip_ + target` -- see MxfStreamInfo::origin / originSkip_.
-  const int64_t essenceTarget = originSkip_ + target;
-
+SourceEngine::SeekStartPoint SourceEngine::ResolveSeekStart(int64_t essenceTarget) {
   if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
     // No frame depends on any other for these codecs -- every essence
     // element already *is* its own anchor. Every Index Table entry for an
@@ -345,17 +383,17 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     // FlattenSegmentInto's CBR branch and IsKeyframeFlags for VBR), so
     // FindPrecedingKeyframe(essenceTarget) -- when the index covers it --
     // resolves to the target's *own* byte offset directly, with zero
-    // backward walk. Consulting it turns this into an O(1) direct seek
-    // instead of the O(target) skip loop below, which -- even though it
-    // never decodes the skipped frames -- still pays for reading every one
-    // of their full compressed payloads off disk/network on its way to the
-    // target (SkipNextVideoElement's own wantData=false only removes that
-    // cost when this direct jump isn't available). Real bug found on a
-    // real 93GB XAVC-Intra file over an SMB share: seeking to frame 5000
-    // with no index-assisted jump dragged several GB of essence data
-    // across the network merely to skip past it. Absent/inapplicable index
-    // (e.g. a gap, or no Index Table Segment at all) -> unchanged
-    // from-essence-element-0 skip-walk behavior.
+    // backward walk and zero reorder delay. Consulting it turns a caller's
+    // seek into an O(1) direct jump instead of an O(target) skip loop,
+    // which -- even though it never decodes the skipped frames -- still
+    // pays for reading every one of their full compressed payloads off
+    // disk/network on its way to the target (SkipNextVideoElement's own
+    // wantData=false only removes that cost when this direct jump isn't
+    // available). Real bug found on a real 93GB XAVC-Intra file over an SMB
+    // share: seeking to frame 5000 with no index-assisted jump dragged
+    // several GB of essence data across the network merely to skip past
+    // it. Absent/inapplicable index (e.g. a gap, or no Index Table Segment
+    // at all) -> unchanged from-essence-element-0 behavior.
     uint64_t startOffset = streamInfo_.headerMetadataEnd;
     int64_t startEditUnit = 0;
     if (videoIndex_) {
@@ -365,28 +403,7 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
         stats_.RecordIndexAssistedSeek();
       }
     }
-    // EssenceWalker is constructed here (not shared with the GOP branch
-    // below) since it holds a reference member and can't be reassigned
-    // once the branch's own start offset is known. Video-only fallback --
-    // audio has its own independent fresh-reader path, FreshReadAudioBlock.
-    EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
-    for (int64_t i = startEditUnit; i < essenceTarget; ++i) {
-      if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
-    }
-    // The loop above discarded every video element between startEditUnit
-    // and essenceTarget (zero iterations when the index jumped straight to
-    // the target itself); the next one the walker yields is the target,
-    // and this time we keep its bytes to actually decode.
-    EssenceElement targetElement;
-    for (;;) {
-      if (!freshWalker.Next(targetElement)) return nullptr;
-      if (targetElement.isVideo) break;
-    }
-    if (!freshDecoder->SendAndReceive(targetElement.data, *frame) &&
-        !freshDecoder->SendAndReceive({}, *frame)) {  // defensive drain in case of any decoder-internal latency
-      return nullptr;
-    }
-    return frame;
+    return {startOffset, startEditUnit, 0};
   }
 
   // GOP-based codec (e.g. XDCAM long-GOP MPEG-2, XAVC-L): consult the Index
@@ -394,7 +411,7 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // offset closer than essence element 0 -- FindPrecedingKeyframe only ever
   // returns an actual I-frame's offset, so restarting a brand-new decoder
   // there is valid; startEditUnit is handed back alongside startOffset so
-  // the decode-forward loop below knows exactly how many more frames it
+  // a caller's decode-forward loop knows exactly how many more frames it
   // still needs (rather than needing to infer it from the byte offset).
   // Absent/inapplicable index -> unchanged from-essence-element-0 behavior.
   uint64_t startOffset = streamInfo_.headerMetadataEnd;
@@ -403,23 +420,24 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // restart would land some number of edit units too far forward -- a
   // decoder restarted fresh needs its B-picture reordering pipeline to fill
   // before its Nth output genuinely corresponds to input element N, unlike
-  // decoding continuously from edit unit 0 (this engine's other two decode
-  // paths, DecodeThreadMain and the startEditUnit==0 fallback below), which
-  // is exactly as warmed-up at any point as the main pipeline itself and
-  // needs no compensation at all. `iterations` (computed below, once
-  // startEditUnit/reorderDelay are final) already subtracts this out; real
-  // bug found via content comparison against an independent ffmpeg decode:
-  // counting outputs unconditionally landed 2 edit units too far forward on
-  // a real long-GOP MPEG-2 camera file -- AVCodecContext::delay wasn't
-  // populated for that codec and per-packet pts weren't reliably preserved
-  // through avcodec's own reordering (confirmed again directly: explicitly
-  // setting PTS per packet and reading it back off the decoded frame is
-  // *not* reliably preserved through a real H.264 decoder's own internal
-  // reordering either, even though the same technique round-trips correctly
-  // through a real MPEG-2 encode/decode -- codec-specific, and not
-  // something to build a general fix on), so neither could recover this
-  // number from the decoder itself. See EssenceIndex::EstimateReorderDelay
-  // for how it's derived from the index's own flags instead.
+  // decoding continuously from edit unit 0 (this engine's other decode
+  // paths: DecodeThreadMain, and this function's own startEditUnit==0
+  // fallback), which is exactly as warmed-up at any point as the main
+  // pipeline itself and needs no compensation at all. SeekAndDecode's own
+  // `iterations` (computed there, once startEditUnit/reorderDelay are
+  // final) already subtracts this out; real bug found via content
+  // comparison against an independent ffmpeg decode: counting outputs
+  // unconditionally landed 2 edit units too far forward on a real long-GOP
+  // MPEG-2 camera file -- AVCodecContext::delay wasn't populated for that
+  // codec and per-packet pts weren't reliably preserved through avcodec's
+  // own reordering (confirmed again directly: explicitly setting PTS per
+  // packet and reading it back off the decoded frame is *not* reliably
+  // preserved through a real H.264 decoder's own internal reordering
+  // either, even though the same technique round-trips correctly through a
+  // real MPEG-2 encode/decode -- codec-specific, and not something to
+  // build a general fix on), so neither could recover this number from the
+  // decoder itself. See EssenceIndex::EstimateReorderDelay for how it's
+  // derived from the index's own flags instead.
   //
   // A target within reorderDelay of its own nearest keyframe can't be
   // reached this way at all -- decoding even the minimum one iteration
@@ -458,9 +476,10 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     // is sufficient regardless of whether *that* GOP's own leading pictures
     // have the same issue -- its own keyframe is an intra frame, self-
     // sufficient by definition, and everything decoded from it before
-    // reaching startEditUnit is discarded by the reorderDelay/iterations
-    // math below anyway, so its correctness doesn't matter, only that
-    // decoding it populates the reference this GOP's leading pictures need.
+    // reaching startEditUnit is discarded by the caller's own
+    // reorderDelay/iterations math anyway, so its correctness doesn't
+    // matter, only that decoding it populates the reference this GOP's
+    // leading pictures need.
     if (startEditUnit > 0 && videoIndex_->NeedsPreviousGop(startEditUnit)) {
       if (auto prevPoint = videoIndex_->FindPrecedingKeyframe(startEditUnit - 1)) {
         startOffset = prevPoint->byteOffset;
@@ -480,13 +499,56 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   // startEditUnit is already 0), same as any other unreachable-near-keyframe
   // target.
   const int reorderDelay = videoIndex_ ? videoIndex_->EstimateReorderDelay(startEditUnit) : 0;
-  const int64_t iterations = std::max<int64_t>(1, essenceTarget - startEditUnit - reorderDelay + 1);
-  const int64_t adjustedTarget = startEditUnit + iterations - 1;
+  return {startOffset, startEditUnit, reorderDelay};
+}
 
-  EssenceWalker freshWalker(freshReader, startOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
+std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
+  MxfReader freshReader(path_, httpHeaders_);
+  if (!freshReader.IsOpen()) return nullptr;
+
+  auto freshDecoder = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
+                                          static_cast<int>(streamInfo_.height));
+  if (!freshDecoder) return nullptr;
+
+  auto frame = std::make_shared<NormalizedFrame>();
+
+  // Host frame index `target` maps to essence video element index
+  // `originSkip_ + target` -- see MxfStreamInfo::origin / originSkip_.
+  const int64_t essenceTarget = originSkip_ + target;
+  const SeekStartPoint seek = ResolveSeekStart(essenceTarget);
+
+  if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
+    // EssenceWalker is constructed here (not shared with the GOP branch
+    // below) since it holds a reference member and can't be reassigned
+    // once the branch's own start offset is known. Video-only fallback --
+    // audio has its own independent fresh-reader path, FreshReadAudioBlock.
+    EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
+    for (int64_t i = seek.editUnit; i < essenceTarget; ++i) {
+      if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
+    }
+    // The loop above discarded every video element between seek.editUnit
+    // and essenceTarget (zero iterations when the index jumped straight to
+    // the target itself); the next one the walker yields is the target,
+    // and this time we keep its bytes to actually decode.
+    EssenceElement targetElement;
+    for (;;) {
+      if (!freshWalker.Next(targetElement)) return nullptr;
+      if (targetElement.isVideo) break;
+    }
+    if (!freshDecoder->SendAndReceive(targetElement.data, *frame) &&
+        !freshDecoder->SendAndReceive({}, *frame)) {  // defensive drain in case of any decoder-internal latency
+      return nullptr;
+    }
+    return frame;
+  }
+
+  const int64_t iterations = std::max<int64_t>(1, essenceTarget - seek.editUnit - seek.reorderDelay + 1);
+  const int64_t adjustedTarget = seek.editUnit + iterations - 1;
+
+  EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
   bool essenceExhausted = false;
   EssenceElement scratch;
-  for (int64_t i = startEditUnit; i <= adjustedTarget; ++i) {
+  for (int64_t i = seek.editUnit; i <= adjustedTarget; ++i) {
     if (!DecodeNextFrame(freshWalker, *freshDecoder, essenceExhausted, scratch, *frame, nullptr)) return nullptr;
   }
   return frame;
@@ -496,14 +558,23 @@ void SourceEngine::DecodeThreadMain() {
   bool essenceExhausted = false;
   EssenceElement scratch;
 
+  // See OpenOptions::start_frame_hint / firstHostFrame_'s doc comments.
+  // false (the default, no hint given) keeps every block below byte-for-
+  // byte identical to before this was added; true replaces the ordinary
+  // Origin-skip discard just below with the hinted discard/warm-up block
+  // further down instead (walker_ already starts at hintStartEditUnit_, a
+  // keyframe near the hint's own target, resolved once in Open()).
+  const bool hinted = firstHostFrame_ > 0;
+
   // Discard the leading `originSkip_` video essence elements (Origin
   // pre-roll/trim, see MxfStreamInfo::origin) before host frame 0 is ever
   // produced, so ring-buffer index 0 lines up with essence element
   // `originSkip_`. Mirrors SeekAndDecode's intra-only-vs-GOP branching:
   // intra-only codecs can skip the raw bytes without decoding them at all;
   // GOP-based codecs must actually decode (and discard) each one, since a
-  // later frame may depend on it as a reference.
-  if (originSkip_ > 0) {
+  // later frame may depend on it as a reference. Skipped entirely when
+  // hinted -- see above.
+  if (!hinted && originSkip_ > 0) {
     const std::string originError = "MXF essence ended before reaching the Origin offset (" +
                                      std::to_string(originSkip_) + ")";
     if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
@@ -557,8 +628,16 @@ void SourceEngine::DecodeThreadMain() {
   // SeekAndDecode's own edit-unit-0 restart already accepts, so they're
   // served the oldest frame decoded so far without popping it: a defensible
   // best-effort repeat rather than blocking or fabricating content.
-  const int reorderDelay =
-      (videoIndex_ && !IsIntraOnlyCodec(streamInfo_.videoCodec)) ? videoIndex_->EstimateReorderDelay(0) : 0;
+  //
+  // When hinted, the reorder delay is instead based at hintStartEditUnit_
+  // (the keyframe walker_ actually starts from) rather than edit unit 0 --
+  // see the hinted discard/warm-up block below, which pre-fills `pending`
+  // with real lead-in frames from that keyframe before production ever
+  // starts, so the hinted case doesn't need (and doesn't get) the
+  // best-effort-repeat gap described above at all.
+  const int reorderDelay = hinted
+      ? hintReorderDelay_
+      : ((videoIndex_ && !IsIntraOnlyCodec(streamInfo_.videoCodec)) ? videoIndex_->EstimateReorderDelay(0) : 0);
   std::deque<std::shared_ptr<NormalizedFrame>> pending;
 
   // Audio's counterpart of `pending`: PCM decode itself has zero internal
@@ -579,6 +658,76 @@ void SourceEngine::DecodeThreadMain() {
   // successfully-Put index report the error; already-buffered audio stays
   // servable (see frame_buffer.h's error-check ordering).
   bool audioFailed = false;
+
+  // Hinted jump-start: walker_ already begins at hintStartEditUnit_ (a
+  // keyframe at or before essenceTarget = originSkip_ + firstHostFrame_,
+  // resolved once in Open() via ResolveSeekStart() -- the exact same Index
+  // Table-assisted lookup SeekAndDecode's own one-shot fallback uses).
+  // Decode-and-discard from there through essenceTarget - 1 using the SAME
+  // pending-deque reorder-delay mechanics the main loop below uses for its
+  // own from-file-start warm-up, so production genuinely starts already
+  // warmed up: unlike essence element 0 (no earlier keyframe exists to draw
+  // real reorder-delay runway from, hence the main loop's own best-effort
+  // placeholder repeat for its first `reorderDelay` ring indices), a hinted
+  // start always has real lead-in frames available back to
+  // hintStartEditUnit_ -- ResolveSeekStart() only ever settles on a keyframe
+  // with enough runway before essenceTarget (see its own backward walk), so
+  // ring index firstHostFrame_ itself gets fully correct content with no
+  // placeholder needed, not just the frames after it.
+  //
+  // Audio is simply discarded here (nullptr audioElementsOut), matching the
+  // ordinary Origin-skip discard above -- neither path attempts
+  // reorder-delay compensation for audio during its own discard phase;
+  // both leave that (already independently accepted, see pendingAudio's own
+  // doc comment above) warm-up gap to pendingAudio's first few Put() calls
+  // in the main loop below.
+  if (hinted) {
+    const int64_t essenceTarget = originSkip_ + firstHostFrame_;
+    const std::string hintError =
+        "MXF essence ended before reaching the start_frame hint's target position (" +
+        std::to_string(firstHostFrame_) + ")";
+    if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
+      for (int64_t i = hintStartEditUnit_; i < essenceTarget; ++i) {
+        if (!SkipNextVideoElement(*walker_)) {
+          videoBuffer_->SignalError(hintError);
+          return;
+        }
+      }
+    } else {
+      for (int64_t i = hintStartEditUnit_; i < essenceTarget; ++i) {
+        auto discardFrame = std::make_shared<NormalizedFrame>();
+        std::vector<EssenceElement> audioScratch;
+        if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, *discardFrame,
+                             (audioBuffer_ && !audioFailed) ? &audioScratch : nullptr)) {
+          videoBuffer_->SignalError(hintError);
+          return;
+        }
+        pending.push_back(std::move(discardFrame));
+        if (static_cast<int>(pending.size()) > reorderDelay) pending.pop_front();  // discard -- before the target
+
+        // Mirror `pending`'s own warm-up above: this loop's video-only
+        // discard isn't the only thing with real lead-in content available
+        // back to hintStartEditUnit_ -- the audio walked past here is just
+        // as real, and feeding it into pendingAudio now is what lets ring
+        // index firstHostFrame_'s audio come out already delay-compensated,
+        // instead of falling into the "still warming up" repeat branch
+        // below (which is only meant for the genuinely-unreachable gap at
+        // essence element 0, see pendingAudio's own doc comment).
+        if (audioBuffer_ && !audioFailed) {
+          auto block = std::make_shared<AudioBlock>();
+          std::string audioErr;
+          if (!InterleaveAudioEditUnit(audioScratch, streamInfo_.audioTracks, *block, &audioErr)) {
+            audioBuffer_->SignalError("audio decode error near ring index " + std::to_string(firstHostFrame_) +
+                                       ": " + audioErr);
+            audioFailed = true;
+          } else {
+            pendingAudio.push_back(std::move(block));
+            if (static_cast<int>(pendingAudio.size()) > reorderDelay) pendingAudio.pop_front();
+          }
+        }
+      }
+    }
+  }
 
   for (;;) {
     const int64_t next = videoBuffer_->NextIndex();

@@ -39,6 +39,27 @@ target_compile_features(mxf_index_serialization_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_index_serialization_tests PRIVATE mxf_core)
 add_test(NAME mxf_index_serialization_tests COMMAND mxf_index_serialization_tests)
 
+add_executable(mxf_mpeg2_bitstream_tests
+  mpeg2_bitstream_test.cpp
+)
+target_compile_features(mxf_mpeg2_bitstream_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_mpeg2_bitstream_tests PRIVATE mxf_core)
+add_test(NAME mxf_mpeg2_bitstream_tests COMMAND mxf_mpeg2_bitstream_tests)
+
+add_executable(mxf_h264_bitstream_tests
+  h264_bitstream_test.cpp
+)
+target_compile_features(mxf_h264_bitstream_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_h264_bitstream_tests PRIVATE mxf_core)
+add_test(NAME mxf_h264_bitstream_tests COMMAND mxf_h264_bitstream_tests)
+
+add_executable(mxf_bitstream_index_tests
+  bitstream_index_test.cpp
+)
+target_compile_features(mxf_bitstream_index_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_bitstream_index_tests PRIVATE mxf_core)
+add_test(NAME mxf_bitstream_index_tests COMMAND mxf_bitstream_index_tests)
+
 add_executable(mxf_audio_sample_index_tests
   audio_sample_index_test.cpp
 )

@@ -274,6 +274,60 @@ void TestMultiTrackAudioFiltering() {
   std::filesystem::remove(path);
 }
 
+// Regression/feature test for mxf/bitstream_index.h's use of Next()'s
+// bounded-prefix-read mode: a maxBytes smaller than an element's true
+// length must return only that many bytes (while still reporting the full
+// `length`), and the reader must still land correctly on the *next*
+// element afterward -- proving the un-read remainder was actually skipped,
+// not left for the next ReadKlvHeader to misparse.
+void TestBoundedPrefixReadSkipsRemainder() {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = 2;
+  cfg.videoTrackNumber = kVideoTrackNumber;
+  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+
+  AppendPartitionPack(bytes, PartitionKind::kBody);
+  std::vector<uint8_t> firstPayload = {0xEE, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9};  // 11 bytes
+  AppendEssenceElement(bytes, kVideoTrackNumber, firstPayload);
+  AppendEssenceElement(bytes, kVideoTrackNumber, {0xEE, 1});
+
+  auto path = WriteTempFile(bytes, "mxfsrc_test_essence_walk_bounded_prefix.mxf");
+  {
+    MxfReader reader(path.string());
+    CHECK(reader.IsOpen());
+
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (!info) {
+      std::filesystem::remove(path);
+      return;
+    }
+
+    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
+
+    EssenceElement first;
+    CHECK(walker.Next(first, /*wantData=*/true, /*maxBytes=*/4));
+    CHECK(first.isVideo);
+    CHECK(first.length == firstPayload.size());  // true size still reported...
+    CHECK(first.data.size() == 4);               // ...even though only the prefix was read
+    CHECK(first.data[0] == 0xEE);
+    CHECK(first.data[1] == 0);
+    CHECK(first.data[2] == 1);
+    CHECK(first.data[3] == 2);
+
+    EssenceElement second;
+    CHECK(walker.Next(second));  // default wantData/maxBytes -- must land cleanly on element 2
+    CHECK(second.isVideo);
+    CHECK(second.data.size() == 2);
+    CHECK(second.data[0] == 0xEE);
+    CHECK(second.data[1] == 1);
+
+    CHECK(!walker.Next(second));  // EOF
+  }
+
+  std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -282,6 +336,7 @@ int main() {
   TestSkipsNonCompliantZeroBytePadding();
   TestEmptyBodyPartitionYieldsNoElements();
   TestMultiTrackAudioFiltering();
+  TestBoundedPrefixReadSkipsRemainder();
 
   if (g_failures == 0) {
     std::cout << "all mxf essence_walker tests passed" << std::endl;

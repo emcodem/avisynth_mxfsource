@@ -1,5 +1,6 @@
 #include "core/index_extract.h"
 
+#include "mxf/bitstream_index.h"
 #include "mxf/header_parser.h"
 #include "mxf/index_table.h"
 #include "mxf/index_transport.h"
@@ -28,7 +29,14 @@ ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const s
 
   auto index = BuildEssenceIndex(reader, info->bodySid);
   if (!index || index->Empty()) {
-    return {false, "no usable Index Table Segment found for this file's video BodySID " +
+    // No real SMPTE Index Table Segment (e.g. a truncated file with no
+    // RIP/footer) -- fall back to walking the essence directly, see
+    // mxf/bitstream_index.h for exactly what this can and can't recover.
+    index = BuildEssenceIndexFromBitstream(reader, *info);
+  }
+  if (!index || index->Empty()) {
+    return {false, "no usable Index Table Segment, and no recognizable bitstream keyframes found, for this "
+                   "file's video BodySID " +
                        std::to_string(info->bodySid)};
   }
 

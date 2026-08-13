@@ -187,6 +187,32 @@ class SourceEngine {
   // directly. Returns nullptr if essence runs out before reaching `target`.
   std::shared_ptr<NormalizedFrame> SeekAndDecode(int64_t target);
 
+  // Resolved restart point for essence element `essenceTarget`: the byte
+  // offset an EssenceWalker should start at, the edit unit that offset
+  // corresponds to, and the reorder delay (see EssenceIndex::
+  // EstimateReorderDelay) a decoder restarted there needs before its Nth
+  // output genuinely corresponds to input element N (always 0 for
+  // intra-only codecs). {streamInfo_.headerMetadataEnd, 0, 0} when no
+  // usable videoIndex_ exists -- callers get the same from-essence-element-0
+  // behavior as always in that case.
+  struct SeekStartPoint {
+    uint64_t byteOffset;
+    int64_t editUnit;
+    int reorderDelay;
+  };
+
+  // Shared by SeekAndDecode's one-shot fallback and DecodeThreadMain's
+  // start-frame-hint jump start (see firstHostFrame_) so both apply the
+  // exact same Index Table-assisted keyframe/reorder-delay logic --
+  // factored out of what was originally SeekAndDecode's own inline code,
+  // byte-for-byte identical to it (see its call sites below), just callable
+  // from more than one place. See SeekAndDecode's own (former, now moved
+  // here) doc comments for the full real-file rationale behind each step:
+  // the intra-only direct-jump case, the GOP-based backward keyframe walk
+  // for reorder-delay runway, and the AVC open-GOP one-more-GOP-back
+  // extension.
+  SeekStartPoint ResolveSeekStart(int64_t essenceTarget);
+
   // Audio counterparts of GetVideoFrame/SeekAndDecode's ring-buffer-first,
   // fresh-reader-fallback split: FetchAudioBlock resolves ring index
   // `hostEditUnit` (host-frame-relative, same space as videoBuffer_/
@@ -220,6 +246,23 @@ class SourceEngine {
   // element 0 becomes host frame 0 -- OpenOptions::handle_origin ?
   // streamInfo_.origin : 0. See DecodeThreadMain/SeekAndDecode.
   int64_t originSkip_ = 0;
+  // OpenOptions::start_frame_hint, validated/clamped once in Open() -- 0
+  // (the default) means no hint was given (or it was out of range), so
+  // DecodeThreadMain's behavior is byte-for-byte unchanged from before this
+  // was added. When > 0, it's both the ring buffer's very first index (see
+  // FrameBuffer's startIndex constructor param, used for videoBuffer_/
+  // audioBuffer_/Open()'s own Peek() call) and the host frame
+  // DecodeThreadMain jump-starts production at, instead of frame 0.
+  int64_t firstHostFrame_ = 0;
+  // Set alongside firstHostFrame_ in Open() (via ResolveSeekStart(originSkip_
+  // + firstHostFrame_)) when firstHostFrame_ > 0: the essence edit unit
+  // walker_ was actually constructed to start reading from (a keyframe at or
+  // before that target), and the reorder delay a decoder starting there
+  // needs. Unused (left at their defaults) when firstHostFrame_ == 0, since
+  // that path keeps walker_ starting at streamInfo_.headerMetadataEnd exactly
+  // as before. See DecodeThreadMain's hinted discard/warm-up block.
+  int64_t hintStartEditUnit_ = 0;
+  int hintReorderDelay_ = 0;
   std::unique_ptr<MxfReader> reader_;
   MxfStreamInfo streamInfo_;
   // Best-effort Index Table lookup (mxf/index_table.h), built once in
