@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -736,22 +737,38 @@ void SourceEngine::DecodeThreadMain() {
       if (audioBuffer_) audioBuffer_->SignalEndOfStream();
       return;
     }
-    if (!videoBuffer_->WaitForCapacity(next)) return;  // shutdown requested
-    // audioBuffer_ deliberately has no WaitForCapacity gate of its own: it's
-    // produced by this same loop in lockstep with video, at exactly video's
-    // own pace -- gating on audioBuffer_'s independent watermark as well
-    // would stall video production (and thus the whole thread, since both
-    // come from one shared walker) the moment audio's watermark fell behind
-    // video's, e.g. a host that reads video frames without ever calling
-    // GetAudioSamples (or reads audio in far larger/rarer chunks) -- audio's
-    // watermark_ starts at 0 and margin_ can be as small as 1, so without
-    // this, DecodeThreadMain would deadlock waiting for an audio consumer
-    // that may never come. Put() below still evicts audioBuffer_'s oldest
-    // entry once full on its own (eviction doesn't depend on
-    // WaitForCapacity, see FrameBuffer::Put) -- a genuinely slow/absent
-    // audio consumer just falls back to FreshReadAudioBlock for anything
-    // that fell outside the window, exactly like a slow video consumer
-    // already falls back to SeekAndDecode.
+    // audioBuffer_ deliberately has no unconditional WaitForCapacity gate of
+    // its own: it's produced by this same loop in lockstep with video, at
+    // exactly video's own pace -- gating on audioBuffer_'s independent
+    // watermark as well would stall video production (and thus the whole
+    // thread, since both come from one shared walker) the moment audio's
+    // watermark fell behind video's, e.g. a host that reads video frames
+    // without ever calling GetAudioSamples (or reads audio in far
+    // larger/rarer chunks) -- audio's watermark_ starts at 0 and margin_ can
+    // be as small as 1, so without this, DecodeThreadMain would deadlock
+    // waiting for an audio consumer that may never come. Put() below still
+    // evicts audioBuffer_'s oldest entry once full on its own (eviction
+    // doesn't depend on WaitForCapacity, see FrameBuffer::Put) -- a
+    // genuinely slow/absent audio consumer just falls back to
+    // FreshReadAudioBlock for anything that fell outside the window, exactly
+    // like a slow video consumer already falls back to SeekAndDecode.
+    //
+    // But the reverse case needs its own gate too: a caller that only ever
+    // reads AUDIO and never calls GetVideoFrame (e.g. extracting just the
+    // audio track) leaves videoBuffer_'s watermark_ parked at its initial
+    // value forever, so an unconditional videoBuffer_->WaitForCapacity(next)
+    // would block permanently once video's own eager-readahead margin filled
+    // -- capping audio at whatever was produced during that initial window
+    // and hanging every later audio request. Real bug, found via a hung
+    // audio-only ffmpeg extraction of this same file. Poll video's gate with
+    // a short timeout and also accept audioBuffer_ still wanting more as an
+    // alternative reason to keep producing -- either consumer's real
+    // progress is enough to justify continuing.
+    for (;;) {
+      if (videoBuffer_->WaitForCapacityOrTimeout(next, std::chrono::milliseconds(20))) break;
+      if (videoBuffer_->IsShutdown()) return;
+      if (audioBuffer_ && audioBuffer_->WantsMore(next)) break;
+    }
 
     std::shared_ptr<NormalizedFrame> frame;
     if (recycled && recycled.use_count() == 1) {
@@ -796,7 +813,25 @@ void SourceEngine::DecodeThreadMain() {
         outputAudio = std::move(pendingAudio.front());
         pendingAudio.pop_front();
       } else if (!pendingAudio.empty()) {
-        outputAudio = pendingAudio.front();  // still warming up -- same best-effort repeat as video
+        // Still warming up. Unlike video (pending.front() above), which
+        // genuinely has no correct content for these leading ring indices
+        // (the true decode-order source would be a negative essence
+        // position -- nothing exists before element 0, so a repeat really
+        // is the best video can do), PCM audio has zero reordering of its
+        // own: this iteration's own just-decoded block (pendingAudio.back()
+        // -- pushed immediately above, nothing else pushes between there and
+        // here) is genuinely this ring index's real audio content. Serving
+        // it directly instead of repeating an older buffered block (which
+        // .front() would do here) fixes real, repeated-audio output for the
+        // leading reorderDelay ring indices of any non-hinted decode from
+        // essence element 0 -- confirmed via a real file, byte-compared
+        // against ffmpeg's own independent MXF demux (which needs no such
+        // compensation for audio at all). Once past this warm-up window
+        // (the `if` branch above), popping the oldest buffered block is
+        // still exactly the delay compensation audio/video sync needs (see
+        // this function's own comment on why pendingAudio mirrors `pending`
+        // at all) -- only this leading window's fallback changes.
+        outputAudio = pendingAudio.back();
       }
       if (outputAudio) audioBuffer_->Put(next, std::move(outputAudio));
     }
@@ -836,6 +871,27 @@ FetchStatus SourceEngine::GetAudioSamples(int64_t start, int64_t count, void* bu
     if (status != FetchStatus::kOk) return status;
 
     const int64_t available = block->sampleCount - loc->sampleOffsetInEditUnit;
+    if (available <= 0) {
+      // audioSampleIndex_'s per-edit-unit sample count is a closed-form
+      // estimate (BuildAudioSampleIndexFromIndexTable's floor(i*sampleRate*
+      // den/num) cadence, e.g. NTSC's 1601/1602 pattern) -- a real file's
+      // actual decoded block for this edit unit can disagree by a sample or
+      // two if its own rounding phase differs from the formula's. When that
+      // happens, `loc->sampleOffsetInEditUnit` lands at or past this edit
+      // unit's real `sampleCount`, and every field above (loc, block,
+      // available) would be identical on the next iteration too --
+      // `remaining`/`hostSamplePos` must still advance, or this loop never
+      // terminates (confirmed via a live hang: Locate() called forever with
+      // the exact same samplePos). Treat the unreachable sample(s) as
+      // silence and move on one sample at a time -- self-correcting within
+      // an edit unit or two, same as the analogous hinted-audio warm-up gap.
+      const int64_t skip = std::min<int64_t>(remaining, 1);
+      std::memset(dst, 0, static_cast<size_t>(skip) * bytesPerFrame);
+      dst += skip * bytesPerFrame;
+      hostSamplePos += skip;
+      remaining -= skip;
+      continue;
+    }
     const int64_t toCopy = std::min<int64_t>(available, remaining);
     const uint8_t* src = block->data.data() + static_cast<size_t>(loc->sampleOffsetInEditUnit) * bytesPerFrame;
     std::memcpy(dst, src, static_cast<size_t>(toCopy) * bytesPerFrame);

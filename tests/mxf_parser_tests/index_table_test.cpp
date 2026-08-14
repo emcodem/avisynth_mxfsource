@@ -112,16 +112,46 @@ void TestIsKeyframeFlagsTruthTable() {
 // undercounts the GOP's true reorder depth and SeekAndDecode lands on the
 // wrong frame right after this GOP's keyframe.
 void TestEstimateReorderDelayCountsBackwardOnlyBFrames() {
+  // byteOffsets for 101/102 deliberately NOT monotonic with editUnit (102
+  // physically stored *before* 101) -- this is what actually makes this a
+  // genuine-reordering scenario needing EstimateReorderDelay's real,
+  // non-zero return: monotonically-increasing byteOffsets (matching
+  // editUnit order) are the exact signal for "low-delay" B-pictures that
+  // need NO reorder-delay compensation at all (see EstimateReorderDelay's
+  // own doc comment, root-caused against a real broadcast file whose Index
+  // Table byte offsets increase strictly with editUnit throughout).
   EssenceIndex index(std::vector<FlatIndexEntry>{
       {100, 1000, true, 0x40},   // I
-      {101, 1100, false, 0x13},  // backward-only B (the real file's anomaly)
-      {102, 1200, false, 0x13},  // backward-only B
+      {101, 1200, false, 0x13},  // backward-only B (the real file's anomaly) -- physically after 102
+      {102, 1100, false, 0x13},  // backward-only B -- physically before 101 (non-monotonic -> genuine reorder)
       {103, 1300, false, 0x26},  // P
       {104, 1400, false, 0x33},  // ordinary B
       {105, 1500, false, 0x33},  // ordinary B
       {106, 1600, false, 0x26},  // P
   });
   CHECK(index.EstimateReorderDelay(100) == 2);
+}
+
+// Regression test: a real broadcast MXF file (D:\Vistek_DMX_-1ms.mxf,
+// MPEG-2 long-GOP) has B pictures whose Index Table byteOffsets increase
+// strictly with editUnit for the file's entire length -- confirmed via
+// read_test_mxf's index-scan tool directly against the real file -- meaning
+// decode order already equals display order (a "low-delay" bi-predictive
+// structure, same class of file as the Canon XAVC repro documented in
+// handoff.md's Handoff 1/2). EstimateReorderDelay's original run-length
+// count (purely flag-based, blind to actual physical ordering) returned a
+// nonzero delay for this file anyway, causing DecodeThreadMain's
+// `pending`/`pendingAudio` position-shifting to misalign BOTH audio and
+// video for the file's *entire* length, not just its leading edge --
+// confirmed via byte-comparison against ffmpeg's own independent MXF demux.
+void TestEstimateReorderDelayReturnsZeroForLowDelayMonotonicByteOffsets() {
+  EssenceIndex index(std::vector<FlatIndexEntry>{
+      {200, 2000, true, 0x40},   // I
+      {201, 2100, false, 0x33},  // B -- physically stored in display order (monotonic)
+      {202, 2200, false, 0x33},  // B -- still monotonic
+      {203, 2300, false, 0x26},  // P
+  });
+  CHECK(index.EstimateReorderDelay(200) == 0);
 }
 
 void TestFindPrecedingKeyframeTargetIsAlreadyKeyframe() {
@@ -479,6 +509,7 @@ int main() {
   TestIndexEntryArrayItemLength15SkipsTrailingBytes();
   TestIsKeyframeFlagsTruthTable();
   TestEstimateReorderDelayCountsBackwardOnlyBFrames();
+  TestEstimateReorderDelayReturnsZeroForLowDelayMonotonicByteOffsets();
   TestFindPrecedingKeyframeTargetIsAlreadyKeyframe();
   TestFindPrecedingKeyframeWalksBackToEarlierKeyframe();
   TestFindPrecedingKeyframeNoKeyframeBeforeTarget();

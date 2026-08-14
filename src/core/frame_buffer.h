@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -81,6 +82,39 @@ class FrameBuffer {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] { return shutdown_ || index < watermark_ + margin_; });
     return !shutdown_;
+  }
+
+  // Like WaitForCapacity, but wakes after `timeout` even if the condition
+  // hasn't been met -- for a producer that shares one decode loop between
+  // this buffer and a second, independently-watermarked one (see
+  // SourceEngine::DecodeThreadMain, which combines videoBuffer_'s own gate
+  // with audioBuffer_->WantsMore() so a caller that only ever reads audio,
+  // and never calls GetVideoFrame, doesn't stall production forever once
+  // video's own eager-readahead margin is exhausted -- real bug found via a
+  // hung audio-only ffmpeg extraction: video's watermark_ never advances
+  // when nothing ever calls Get()/Peek() on videoBuffer_, so the unconditional
+  // WaitForCapacity(next) that used to gate this loop blocked permanently
+  // after only `margin` frames, capping audio at whatever was produced
+  // during that initial window). Returns whether the condition is true at
+  // return time (not just "not shut down") so a caller can tell a timeout
+  // apart from real progress.
+  bool WaitForCapacityOrTimeout(int64_t index, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_for(lock, timeout, [&] { return shutdown_ || index < watermark_ + margin_; });
+    return !shutdown_ && index < watermark_ + margin_;
+  }
+
+  // Non-blocking counterpart of WaitForCapacity's predicate -- see
+  // WaitForCapacityOrTimeout's doc comment for why a producer needs to poll
+  // a second buffer's watermark without blocking on it.
+  bool WantsMore(int64_t index) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return index < watermark_ + margin_;
+  }
+
+  bool IsShutdown() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutdown_;
   }
 
   // The next index the producer should decode (highest produced so far, plus one).

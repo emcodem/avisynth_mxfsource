@@ -3,6 +3,7 @@
 // so the whole pipeline -- header parse, essence walk, decode, ring buffer,
 // background thread -- runs end to end without needing a real sample file.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -35,6 +36,42 @@ int g_failures = 0;
       ++g_failures;                                                             \
     }                                                                           \
   } while (0)
+
+// A caller that keeps a SourceEngine alive past this call's own scope (e.g.
+// via a shared_ptr also captured by a RunWithTimeout thread) may still have
+// the file open when cleaning up -- the throwing std::filesystem::remove
+// overload would then throw filesystem_error (uncaught -> std::terminate)
+// on Windows, where an open file can't be deleted. Use the non-throwing
+// overload for those call sites instead of the plain remove() the rest of
+// this file's braces-scoped tests can safely use.
+void RemoveTempFileIgnoringErrors(const std::filesystem::path& path) {
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+// Runs `fn` on a separate thread and waits up to `timeout` for it to
+// complete -- for regression tests against a genuine infinite-loop/deadlock
+// bug, failing the CHECK and returning promptly is far more useful than
+// actually hanging the whole test binary/CI run forever. The thread is
+// detached: if `fn` never returns (i.e. the bug being tested for is back),
+// callers must keep everything `fn` touches alive via shared_ptr rather
+// than references/locals, so a timed-out run leaks a thread instead of
+// leaving it holding a dangling reference into a since-destroyed stack frame.
+template <typename Fn>
+bool RunWithTimeout(Fn fn, std::chrono::milliseconds timeout) {
+  auto done = std::make_shared<std::atomic<bool>>(false);
+  std::thread t([fn, done] {
+    fn();
+    done->store(true);
+  });
+  t.detach();
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!done->load()) {
+    if (std::chrono::steady_clock::now() > deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return true;
+}
 
 constexpr uint32_t kTrackNumber = 0x01010100;
 
@@ -171,6 +208,81 @@ std::vector<uint8_t> BuildFileWithAudio(int width, int height, int numFrames, in
   // (offset 0) automatically -- discovering the Body Partition (where the
   // Index Table Segment above actually lives) requires a RIP, exactly like
   // a real multi-partition file.
+  AppendRandomIndexPack(file, {{1, 0}, {1, bodyPartitionOffset}});
+  return file;
+}
+
+// Like BuildFileWithAudio, but each edit unit's REAL essence sample count is
+// given explicitly via `sampleCounts` instead of always being the uniform
+// `nominalSamplesPerEditUnit`. The Index Table-derived AudioSampleIndex (see
+// BuildAudioSampleIndexFromIndexTable) still assumes the uniform nominal
+// count throughout (audio.sampleRate = nominalSamplesPerEditUnit * 25, same
+// as BuildFileWithAudio) -- so an edit unit whose `sampleCounts` entry is
+// smaller than nominal reproduces, deterministically and without needing a
+// genuinely non-integer editRate/sampleRate ratio, the real-world mismatch
+// a file with its own NTSC 1601/1602-style rounding phase can hit: the
+// index's estimated per-edit-unit sample boundary disagreeing with the
+// edit unit's actual decoded block size (see
+// TestGetAudioSamplesDoesNotHangOnEditUnitSampleCountMismatch).
+std::vector<uint8_t> BuildFileWithAudioCustomCounts(int width, int height, int numFrames,
+                                                     int nominalSamplesPerEditUnit, int channels,
+                                                     const std::vector<int>& sampleCounts) {
+  SyntheticFile cfg;
+  cfg.sequenceDuration = numFrames;
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = kTrackNumber;
+  SyntheticAudioTrack audio;
+  audio.trackNumber = kAudioTrackNumber;
+  audio.trackId = 100;
+  audio.channelCount = static_cast<uint32_t>(channels);
+  audio.sampleRate = static_cast<uint32_t>(nominalSamplesPerEditUnit) * 25;
+  audio.bitsPerSample = 16;
+  cfg.audioTracks = {audio};
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+
+  std::vector<std::vector<uint8_t>> videoPayloads(static_cast<size_t>(numFrames));
+  std::vector<std::vector<uint8_t>> audioPayloads(static_cast<size_t>(numFrames));
+  for (int i = 0; i < numFrames; ++i) {
+    videoPayloads[static_cast<size_t>(i)] = MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i));
+    audioPayloads[static_cast<size_t>(i)] = MakeAudioEditUnitPayload(i, sampleCounts[static_cast<size_t>(i)], channels);
+  }
+
+  IndexTableSegmentSpec segSpec;
+  segSpec.indexStartPosition = 0;
+  segSpec.indexDuration = numFrames;
+  segSpec.indexSid = 1;
+  segSpec.bodySid = 1;
+  segSpec.entries.resize(static_cast<size_t>(numFrames));
+
+  std::vector<uint8_t> placeholderSegBytes;
+  AppendIndexTableSegment(placeholderSegBytes, segSpec);
+
+  const uint64_t bodyPartitionOffset = file.size();
+  AppendPartitionPack(file, PartitionKind::kBody, placeholderSegBytes.size(), /*indexSid=*/1);
+  const uint64_t essenceContainerBaseOffset = file.size() + placeholderSegBytes.size();
+
+  uint64_t cursor = essenceContainerBaseOffset;
+  for (int i = 0; i < numFrames; ++i) {
+    segSpec.entries[static_cast<size_t>(i)].streamOffset = cursor - essenceContainerBaseOffset;
+    cursor += 16 + BerLengthSize(videoPayloads[static_cast<size_t>(i)].size()) +
+              videoPayloads[static_cast<size_t>(i)].size();
+    cursor += 16 + BerLengthSize(audioPayloads[static_cast<size_t>(i)].size()) +
+              audioPayloads[static_cast<size_t>(i)].size();
+  }
+
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, segSpec);
+  if (segBytes.size() != placeholderSegBytes.size()) {
+    std::cerr << "BuildFileWithAudioCustomCounts: unexpected Index Table Segment size mismatch" << std::endl;
+  }
+
+  file.insert(file.end(), segBytes.begin(), segBytes.end());
+  for (int i = 0; i < numFrames; ++i) {
+    AppendEssenceElement(file, kTrackNumber, videoPayloads[static_cast<size_t>(i)]);
+    AppendEssenceElement(file, kAudioTrackNumber, audioPayloads[static_cast<size_t>(i)]);
+  }
+
   AppendRandomIndexPack(file, {{1, 0}, {1, bodyPartitionOffset}});
   return file;
 }
@@ -1451,6 +1563,84 @@ void TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference() {
   std::filesystem::remove(path);
 }
 
+// Regression test: DecodeThreadMain's NON-hinted warm-up (the "still
+// warming up" pendingAudio fallback below reorderDelay's threshold, see its
+// own doc comment) served the SAME stale block repeatedly for every one of
+// the leading reorderDelay ring indices of a from-frame-0 decode, instead of
+// each ring index's own genuinely-decoded audio -- unlike video, which truly
+// has no correct content available for these positions (nothing exists
+// before essence element 0), audio's own just-decoded block for THIS
+// iteration is always real, correct content, so repeating an older one was
+// an avoidable defect, not an inherent limit. Found via a real file
+// (D:\Vistek_DMX_-1ms.mxf, MPEG-2 long-GOP, no hint involved at all)
+// byte-compared against ffmpeg's own independent MXF demux -- confirmed
+// samples belonging to edit unit 1 came out identical to edit unit 0's real
+// content instead of their own.
+void TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup() {
+  constexpr int width = 32, height = 32, gopSize = 6, maxBFrames = 2, numFrames = 30;
+  constexpr int samplesPerEditUnit = 4, channels = 2;
+  auto encoded = EncodeMpeg2GopWithBFrames(width, height, numFrames, gopSize, maxBFrames);
+  CHECK(encoded.size() == static_cast<size_t>(numFrames));
+  if (encoded.size() != static_cast<size_t>(numFrames)) return;
+
+  const bool hasBFrames = std::any_of(encoded.begin(), encoded.end(), [](const EncodedGopEntry& e) {
+    return e.flags == 0x30;
+  });
+  CHECK(hasBFrames);
+  if (!hasBFrames) return;
+
+  constexpr uint32_t kSeqVideoTrackNumber = 0x04040600;
+  constexpr uint32_t kSeqAudioTrackNumber = 0x04040700;
+  auto bytes = BuildGopFileWithAudio(encoded, width, height, kSeqVideoTrackNumber, kSeqAudioTrackNumber,
+                                      samplesPerEditUnit, channels);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_seq_audio_no_repeat.mxf");
+
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(path.string());  // no hint at all -- exactly the reported repro's shape
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      // Deliberately NOT asserting exact expected *values* per display
+      // position here (that would require independently modeling this
+      // GOP's own decode-order-vs-display-order permutation --
+      // MakeAudioEditUnitPayload(i, ...) is keyed by decode/physical
+      // position i, not display position, see BuildGopFileWithAudio's own
+      // doc comment -- already covered for video by
+      // TestReorderDelayCompensationMatchesReferenceWithRealBFrames).
+      // This test only targets the specific repeat-during-warmup
+      // regression, which is visible directly without that model: this
+      // GOP's EstimateReorderDelay(0) is 2 (maxBFrames=2's IBB structure --
+      // entries 1 and 2 are the B-frame-flagged run right after the edit
+      // unit 0 keyframe), so ring indices 0 and 1 are exactly
+      // DecodeThreadMain's "still warming up" window (pendingAudio.size()
+      // never exceeds reorderDelay=2 until the 3rd push). Before the fix,
+      // both came out byte-identical (pendingAudio.front() pinned at
+      // decode-position 0's block for the whole window); after it, ring 1
+      // gets its own genuinely-decoded block instead, which is guaranteed
+      // to differ from ring 0's (MakeAudioEditUnitPayload embeds the edit
+      // unit index directly into the byte pattern).
+      const int64_t sampleCount = 2 * samplesPerEditUnit;
+      std::vector<uint8_t> got(static_cast<size_t>(sampleCount) * channels * 2);
+      std::string err;
+      FetchStatus st = engine.GetAudioSamples(0, sampleCount, got.data(), &err);
+      CHECK(st == FetchStatus::kOk);
+      if (st == FetchStatus::kOk) {
+        const size_t bytesPerEditUnit = static_cast<size_t>(samplesPerEditUnit) * channels * 2;
+        const uint8_t* ring0 = got.data();
+        const uint8_t* ring1 = got.data() + bytesPerEditUnit;
+        const bool duplicated = std::memcmp(ring0, ring1, bytesPerEditUnit) == 0;
+        CHECK(!duplicated);
+        if (duplicated) {
+          std::cerr << "ring indices 0 and 1 have identical audio (repeat-during-warmup regression)" << std::endl;
+        }
+      } else {
+        std::cerr << "sequential audio failed: " << err << std::endl;
+      }
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 void TestUnsupportedCodecFailsOpenCleanly() {
   SyntheticFile cfg;
   cfg.sequenceDuration = 1;
@@ -1543,6 +1733,121 @@ void TestGetAudioSamplesFreshReadAfterEviction() {
   std::filesystem::remove(path);
 }
 
+// Regression test for a real hang found on a real file (D:\MH_0021.mxf):
+// BuildAudioSampleIndexFromIndexTable derives a closed-form, uniform
+// per-edit-unit sample count from editRate/audioSampleRate (see its own doc
+// comment on the NTSC 1601/1602 cadence) -- but a real file's actual
+// per-edit-unit decoded sample count can disagree with that estimate by a
+// sample or two if the encoder's own rounding phase differs. When
+// GetAudioSamples' Locate() lands at/past the real decoded block's
+// sampleCount for that edit unit, `available` (block->sampleCount -
+// loc->sampleOffsetInEditUnit) was <= 0, making `toCopy` <= 0 too --
+// `remaining`/`hostSamplePos` never advanced, so the loop called Locate()
+// with the exact same sample position forever (confirmed via a live hang:
+// a debugger attached to the real stuck process showed GetAudioSamples
+// spinning on Locate(6405) indefinitely). This file reproduces that exact
+// edit-unit-boundary mismatch deterministically, without needing a
+// genuinely non-integer editRate/sampleRate ratio -- see
+// BuildFileWithAudioCustomCounts.
+void TestGetAudioSamplesDoesNotHangOnEditUnitSampleCountMismatch() {
+  const int width = 4, height = 2, numFrames = 5, samplesPerEditUnit = 4, channels = 1;
+  std::vector<int> counts(static_cast<size_t>(numFrames), samplesPerEditUnit);
+  counts[2] = samplesPerEditUnit - 1;  // edit unit 2's real audio is one sample short of the index's estimate
+  auto path = WriteTempFile(BuildFileWithAudioCustomCounts(width, height, numFrames, samplesPerEditUnit, channels, counts),
+                            "mxfsrc_test_engine_audio_count_mismatch.mxf");
+
+  auto engine = std::make_shared<SourceEngine>();
+  OpenResult res = engine->Open(path.string());
+  CHECK(res.status == OpenStatus::kOk);
+  if (res.status != OpenStatus::kOk) {
+    std::cerr << "Open error: " << res.error << std::endl;
+    RemoveTempFileIgnoringErrors(path);
+    return;
+  }
+  CHECK(engine->ExposesAudio());
+
+  const int64_t totalSamples = engine->TotalAudioSamples();
+  auto buf = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(totalSamples) * channels * 2);
+  auto st = std::make_shared<FetchStatus>(FetchStatus::kError);
+  auto err = std::make_shared<std::string>();
+
+  // See RunWithTimeout's doc comment: engine/buf/st/err are heap-owned so a
+  // regression here leaks a spinning thread rather than leaving it with a
+  // dangling reference once this function returns.
+  const bool finished = RunWithTimeout(
+      [engine, buf, st, err, totalSamples] { *st = engine->GetAudioSamples(0, totalSamples, buf->data(), err.get()); },
+      std::chrono::seconds(5));
+  CHECK(finished);
+  if (!finished) {
+    std::cerr << "GetAudioSamples did not return within the timeout -- likely hung" << std::endl;
+    RemoveTempFileIgnoringErrors(path);
+    return;
+  }
+  CHECK(*st == FetchStatus::kOk);
+  if (*st != FetchStatus::kOk) std::cerr << "GetAudioSamples failed: " << *err << std::endl;
+
+  // engine (and its GetAudioSamples call, now provably finished above) may
+  // still be holding the file open here -- see RemoveTempFileIgnoringErrors.
+  RemoveTempFileIgnoringErrors(path);
+}
+
+// Regression test for a second real hang found alongside the one above,
+// via a hung real-file `ffmpeg -map 0:a:0 ...` audio-only extraction:
+// DecodeThreadMain's single background thread used to gate ALL production
+// (video AND audio, since both come from one shared walker) purely on
+// videoBuffer_'s own WaitForCapacity -- correct for a caller that reads
+// video (whether or not it also reads audio), but a caller that only ever
+// reads audio and never calls GetVideoFrame leaves videoBuffer_'s
+// watermark_ parked at its initial value forever, so that gate blocked
+// permanently once video's own small eager-readahead margin filled --
+// capping audio at whatever was produced during that initial window and
+// hanging every later audio request. GetVideoFrame is deliberately never
+// called in this test.
+void TestGetAudioSamplesDoesNotStallWhenVideoNeverRequested() {
+  const int width = 4, height = 2, numFrames = 50, samplesPerEditUnit = 2, channels = 1;
+  auto path = WriteTempFile(BuildFileWithAudio(width, height, numFrames, samplesPerEditUnit, channels),
+                            "mxfsrc_test_engine_audio_only_no_video.mxf");
+
+  auto engine = std::make_shared<SourceEngine>();
+  OpenOptions opts;
+  opts.buffer_frames = 5;  // small margin so the bug (if reintroduced) triggers well within numFrames=50
+  opts.eagerdecode = 2;
+  OpenResult res = engine->Open(path.string(), opts);
+  CHECK(res.status == OpenStatus::kOk);
+  if (res.status != OpenStatus::kOk) {
+    std::cerr << "Open error: " << res.error << std::endl;
+    RemoveTempFileIgnoringErrors(path);
+    return;
+  }
+  CHECK(engine->ExposesAudio());
+
+  const int64_t totalSamples = engine->TotalAudioSamples();
+  auto buf = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(totalSamples) * channels * 2);
+  auto st = std::make_shared<FetchStatus>(FetchStatus::kError);
+  auto err = std::make_shared<std::string>();
+
+  const bool finished = RunWithTimeout(
+      [engine, buf, st, err, totalSamples] { *st = engine->GetAudioSamples(0, totalSamples, buf->data(), err.get()); },
+      std::chrono::seconds(5));
+  CHECK(finished);
+  if (!finished) {
+    std::cerr << "GetAudioSamples did not return within the timeout -- likely hung" << std::endl;
+    RemoveTempFileIgnoringErrors(path);
+    return;
+  }
+  CHECK(*st == FetchStatus::kOk);
+  if (*st != FetchStatus::kOk) std::cerr << "GetAudioSamples failed: " << *err << std::endl;
+
+  std::vector<uint8_t> expected;
+  for (int i = 0; i < numFrames; ++i) {
+    const auto p = MakeAudioEditUnitPayload(i, samplesPerEditUnit, channels);
+    expected.insert(expected.end(), p.begin(), p.end());
+  }
+  CHECK(*buf == expected);
+
+  RemoveTempFileIgnoringErrors(path);
+}
+
 // use_audio="supported" (the default): a file whose audio tracks disagree
 // on bit depth must still open successfully for video, just without audio.
 void TestUseAudioModeSupportedDegradesOnMismatch() {
@@ -1622,6 +1927,7 @@ int main() {
   TestIndexTableAssistedSeekUsesIndexAndMatchesReference();
   TestReorderDelayCompensationMatchesReferenceWithRealBFrames();
   TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference();
+  TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
   TestStartFrameHintGopServesFromBufferViaIndexAssistedJump();
   TestStartFrameHintIntraOnlyStartsProductionAtHint();
@@ -1629,6 +1935,8 @@ int main() {
   TestUnsupportedCodecFailsOpenCleanly();
   TestGetAudioSamplesSequentialMatchesExpectedBytes();
   TestGetAudioSamplesFreshReadAfterEviction();
+  TestGetAudioSamplesDoesNotHangOnEditUnitSampleCountMismatch();
+  TestGetAudioSamplesDoesNotStallWhenVideoNeverRequested();
   TestUseAudioModeSupportedDegradesOnMismatch();
   TestUseAudioModeAlwaysFailsOnMismatch();
   TestUseAudioModeNeverSuppressesSupportedAudio();

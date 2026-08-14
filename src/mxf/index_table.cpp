@@ -238,8 +238,36 @@ int EssenceIndex::EstimateReorderDelay(int64_t keyframeEditUnit) const {
                               [](const FlatIndexEntry& e, int64_t t) { return e.editUnit < t; });
   if (it == entries_.end() || it->editUnit != keyframeEditUnit) return 0;
   int run = 0;
-  for (++it; it != entries_.end() && IsBFrameFlags(it->flags); ++it) ++run;
-  return run;
+  uint64_t prevByteOffset = it->byteOffset;
+  bool monotonic = true;
+  for (++it; it != entries_.end() && IsBFrameFlags(it->flags); ++it) {
+    ++run;
+    if (it->byteOffset <= prevByteOffset) monotonic = false;
+    prevByteOffset = it->byteOffset;
+  }
+  // "Low-delay" B-pictures (bi-predictive for prediction quality, but
+  // referencing only earlier-displayed frames -- no genuine temporal
+  // reordering) have decode order already equal to display order: this
+  // run's own byteOffsets increase monotonically right along with editUnit,
+  // exactly like the keyframe's own position, confirmed against a real
+  // broadcast MXF file (D:\Vistek_DMX_-1ms.mxf) whose Index Table's
+  // StreamOffsets increase strictly with editUnit for its entire length --
+  // see this file's own handoff.md for the earlier, independent discovery
+  // of this exact distinction on a different real file. In that case, no
+  // reorder-delay compensation is needed or correct: DecodeThreadMain's
+  // `pending`/`pendingAudio` position-shifting (this function's return
+  // value, downstream) would otherwise unnecessarily shift both audio and
+  // video by `run` positions for the file's *entire* length, not just a
+  // leading warm-up window -- confirmed empirically: for the Vistek file,
+  // this repeats-forever bug looked exactly like a single ring index
+  // getting an earlier index's stale content, at every reorderDelay-many
+  // positions, not just near the start. A genuine B-pyramid (a *later*
+  // editUnit's essence physically stored *before* an earlier one --
+  // byteOffset breaks monotonicity somewhere in the run) still needs this
+  // function's original behavior; that's `TestReorderDelayCompensationMatchesReferenceWithRealBFrames`'s
+  // own already-known, already-documented harder case, unaffected by this
+  // check since monotonic is false there.
+  return monotonic ? 0 : run;
 }
 
 bool EssenceIndex::NeedsPreviousGop(int64_t keyframeEditUnit) const {
