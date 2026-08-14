@@ -8,6 +8,27 @@ namespace mxfsrc {
 
 namespace {
 
+struct EssenceResyncResult {
+  // Same semantics this whole function always had: `candidate` unchanged
+  // unless an actual essence element key is found, never inferred from
+  // merely "walked to EOF without finding one". This is what
+  // BuildEssenceIndex's bodyRanges/FlattenSegmentInto uses to resolve
+  // *other* entries' absolute byte offsets (see ResolveLogicalEssenceOffset)
+  // -- a value that's merely "proven safe to scan up to" but not "proven to
+  // be this partition's own genuine essence start" would misresolve those
+  // once more than one partition shares a BodySID (verified: loosening this
+  // field broke TestMultiSegmentStitching/TestMalformedSegmentIsSkippedNotFatal,
+  // both of which need a *tight* essenceStartOffset for a real, non-footer
+  // partition to correctly bound bodyRanges).
+  uint64_t essenceStartOffset;
+  // Furthest position reached by walking forward from `candidate` through
+  // genuinely parsed, real (non-essence) KLVs before giving up -- widen-only,
+  // safe to use *purely* as ScanPartitionForIndexSegments's own hardEnd (see
+  // scanHardEndBound's own comment in index_table.h for why it's kept
+  // separate from essenceStartOffset above).
+  uint64_t scanHardEndBound;
+};
+
 // A partition's own declared HeaderByteCount+IndexByteCount is supposed to
 // delineate exactly where its essence begins, but some real recorders don't
 // include a trailing KAG-alignment KLV Fill in that count -- the same class
@@ -22,28 +43,48 @@ namespace {
 // EssenceWalker::Next()'s own tolerant skip-and-resync) until landing on an
 // actual essence element -- of any track, video or audio, since that's
 // enough to prove "essence genuinely starts here" regardless of which
-// track this partition's essence belongs to. Returns `candidate` unchanged
-// if it already points at a real essence element (the common,
-// correctly-declared case) or if anything about the probe fails --
-// best-effort: callers already tolerate a wrong essenceStartOffset
-// producing a missed/incorrect lookup rather than a crash.
-uint64_t ResyncToActualEssenceStart(MxfReader& reader, uint64_t candidate) {
+// track this partition's essence belongs to.
+EssenceResyncResult ResyncToActualEssenceStart(MxfReader& reader, uint64_t candidate) {
   uint64_t pos = candidate;
   for (int guard = 0; guard < 8; ++guard) {  // a handful of Fill items at most, never unbounded
-    if (pos >= reader.Size() || !reader.Seek(pos)) return candidate;
+    // True EOF, reached only via real, successfully-parsed KLVs: proves
+    // there's no essence anywhere between `candidate` and end of file, which
+    // is exactly the situation a real Footer Partition is always in (SMPTE
+    // 377-1 -- footer partitions never precede essence) -- but this says
+    // nothing about whether `pos` is *this partition's own* essence start
+    // (it may have walked through Fill, other partitions' Partition Packs,
+    // the RIP, anything non-essence in between), so it's only trustworthy as
+    // `scanHardEndBound`, never as `essenceStartOffset` (see
+    // EssenceResyncResult's own comment above). Observed on a real file:
+    // the old always-`return candidate` behavior here silently kept the
+    // Footer Partition's own Index Table Segment (covering the file's true
+    // final edit units) undercounted-and-rejected by
+    // ScanPartitionForIndexSegments's hardEnd check.
+    if (pos >= reader.Size()) return {candidate, pos};
+    if (!reader.Seek(pos)) return {candidate, candidate};
     KlvHeader klv{};
-    if (!ReadKlvHeader(reader, klv)) return candidate;
-    if (!LooksLikeKlvKey(klv.key)) {
-      if (!reader.Seek(pos + 1) || !ResyncToUlDesignator(reader)) return candidate;
+    // A failed parse here isn't just "no valid key at pos" -- since
+    // `candidate` is itself only an estimate (see the undercount note
+    // above), it commonly lands *inside* a still-undiscovered segment's own
+    // raw entry array, where BER-decoding random binary content as a length
+    // field can fail outright (e.g. a length-byte count of 0 or >8) rather
+    // than merely producing a key that fails LooksLikeKlvKey. Both cases
+    // mean "not a real KLV boundary here" and get the identical resync
+    // recovery -- an outright ReadKlvHeader failure must not be treated as
+    // fatal, or a real file with this undercount can silently drop this
+    // partition's Index Table Segment for essentially arbitrary reasons
+    // (whichever way that specific binary content happens to BER-decode).
+    if (!ReadKlvHeader(reader, klv) || !LooksLikeKlvKey(klv.key)) {
+      if (!reader.Seek(pos + 1) || !ResyncToUlDesignator(reader)) return {candidate, candidate};
       pos = reader.Tell();
       continue;
     }
-    if (IsEssenceElementKey(klv.key)) return pos;
+    if (IsEssenceElementKey(klv.key)) return {pos, pos};
     const uint64_t valueEnd = klv.valueOffset + klv.length;
-    if (valueEnd > reader.Size()) return candidate;
+    if (valueEnd > reader.Size()) return {candidate, candidate};
     pos = valueEnd;
   }
-  return pos;
+  return {candidate, pos};
 }
 
 }  // namespace
@@ -121,7 +162,9 @@ std::optional<IndexScanPartition> ReadOnePartitionForIndex(MxfReader& reader, ui
   const uint64_t partitionEnd = klv.valueOffset + klv.length;
   scan.indexByteRangeStart = partitionEnd + pack->headerByteCount;
   scan.indexByteRangeEnd = scan.indexByteRangeStart + pack->indexByteCount;
-  scan.essenceStartOffset = ResyncToActualEssenceStart(reader, scan.indexByteRangeEnd);
+  const EssenceResyncResult resync = ResyncToActualEssenceStart(reader, scan.indexByteRangeEnd);
+  scan.essenceStartOffset = resync.essenceStartOffset;
+  scan.scanHardEndBound = resync.scanHardEndBound;
   scan.bodyOffset = pack->bodyOffset;
   return scan;
 }
@@ -170,11 +213,17 @@ std::vector<IndexTableSegment> ScanPartitionForIndexSegments(MxfReader& reader, 
   // scanner's very first checked entry was the ONLY thing standing between
   // an O(1) CBR-indexed seek and reading every frame's payload en route to
   // the target, the actual complaint that motivated finding this).
-  // `essenceStartOffset` (already resync-corrected, see above) is the one
-  // bound that's always safe to enforce: nothing legitimately part of the
-  // index can be at or past where essence itself is confirmed to start.
+  // `essenceStartOffset` (already resync-corrected, see above) is one bound
+  // that's always safe to enforce: nothing legitimately part of the index
+  // can be at or past where essence itself is confirmed to start.
+  // `scanHardEndBound` is the other -- a widen-only bound proven safe purely
+  // for "is there room to keep scanning/accept an already-found segment
+  // here" (never used as this partition's own essence-resolution base, see
+  // its own comment in index_table.h) -- needed for e.g. a Footer Partition,
+  // which never precedes essence at all, so essenceStartOffset alone can
+  // stay exactly at the (possibly undercounted) rangeEnd.
   const uint64_t rangeEnd = partition.indexByteRangeEnd;
-  const uint64_t hardEnd = std::max(rangeEnd, partition.essenceStartOffset);
+  const uint64_t hardEnd = std::max({rangeEnd, partition.essenceStartOffset, partition.scanHardEndBound});
   while (reader.Tell() + 16 + 1 <= hardEnd && reader.Tell() < reader.Size()) {
     if (reader.Tell() >= rangeEnd) break;  // rough guide: stop looking for a *new* segment past here
     const uint64_t klvStart = reader.Tell();

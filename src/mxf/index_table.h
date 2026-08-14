@@ -112,6 +112,19 @@ struct IndexScanPartition {
   uint64_t indexByteRangeStart = 0;  // partitionEnd + headerByteCount
   uint64_t indexByteRangeEnd = 0;    // indexByteRangeStart + indexByteCount
   uint64_t essenceStartOffset = 0;   // == indexByteRangeEnd; where this partition's own essence bytes begin
+  // A widen-only upper bound for ScanPartitionForIndexSegments's own
+  // hardEnd, separate from essenceStartOffset above: the furthest position
+  // reached by walking forward from indexByteRangeEnd through genuinely
+  // parsed, real (non-essence) KLVs before giving up -- e.g. all the way to
+  // true EOF for a Footer Partition, which never precedes essence at all
+  // (see index_table.cpp's ResyncToActualEssenceStart). Deliberately NOT
+  // folded into essenceStartOffset itself: that field also feeds
+  // BuildEssenceIndex's bodyRanges/FlattenSegmentInto for resolving other
+  // entries' absolute byte offsets, where a value that's merely "proven
+  // safe to scan up to" but not "proven to be this partition's own genuine
+  // essence start" would misresolve them once more than one partition
+  // shares a BodySID.
+  uint64_t scanHardEndBound = 0;
   // This partition's Partition Pack BodyOffset (SMPTE 377-1): this
   // partition's position within the *logical*, cross-partition essence
   // container for bodySid, i.e. the StreamOffset an Index Table Segment
