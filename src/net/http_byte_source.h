@@ -53,6 +53,7 @@ class HttpByteSource : public IByteSource {
   uint64_t Size() const override { return totalSize_; }
   bool ReadBytes(void* dst, size_t n) override;
   bool Skip(uint64_t n) override;
+  bool SupportsRandomAccess() const override { return rangeSupported_; }
   std::string LastError() const override { return lastError_; }
 
  private:

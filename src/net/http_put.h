@@ -22,4 +22,21 @@ bool HttpPutBlob(const std::string& url, const std::vector<uint8_t>& data, std::
 // `errorOut` (if non-null) on any failure.
 std::optional<std::vector<uint8_t>> HttpGetBlob(const std::string& url, std::string* errorOut);
 
+// Bounded ranged GET: fetches [offset, offset+length) via libcurl into
+// memory, in one blocking call. Unlike HttpByteSource (a persistent
+// streaming reader, one connection per instance, meant to be driven
+// sequentially by a single thread), this creates and tears down its own
+// short-lived easy handle every call -- deliberately, so index_table.h's
+// parallel HTTP index-extraction path can call this concurrently from many
+// worker threads at once (each call's easy handle is only ever touched by
+// the thread that made it, which is all libcurl requires for thread safety).
+// `httpHeaders` is the same raw "Name: value\r\n..." block HttpByteSource
+// accepts. Retries a couple of times on transient failures (connection
+// resets, 5xx) with the same backoff policy as HttpByteSource, since a
+// fan-out of many concurrent requests hitting the same endpoint is more
+// likely to see transient blips than a single sequential stream is. Returns
+// std::nullopt and fills `errorOut` (if non-null) on final failure.
+std::optional<std::vector<uint8_t>> HttpGetRange(const std::string& url, const std::string& httpHeaders,
+                                                  uint64_t offset, uint64_t length, std::string* errorOut);
+
 }  // namespace mxfsrc

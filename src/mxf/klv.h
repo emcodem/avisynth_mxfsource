@@ -40,6 +40,15 @@ class IByteSource {
   virtual bool ReadBytes(void* dst, size_t n) = 0;
   virtual bool Skip(uint64_t n) = 0;
 
+  // True if arbitrary byte ranges of this source can be fetched
+  // independently of one another (e.g. concurrent ranged GETs against the
+  // same URL) -- local files and a range-capable HTTP server are both true;
+  // an HTTP server that ignores Range requests (HttpByteSource falls back to
+  // discard/restart-based emulated seeking in that case) is false. Used by
+  // index_table.h's parallel HTTP index-extraction path to decide whether
+  // fanning out concurrent partition fetches is even possible before trying.
+  virtual bool SupportsRandomAccess() const { return true; }
+
   // Human-readable detail for the most recent failure (e.g. "HTTP 403
   // Forbidden (if this is an S3 presigned URL, it may have expired)").
   // Empty if the source doesn't have anything more specific to say than the
@@ -60,11 +69,19 @@ class IByteSource {
 class MxfReader {
  public:
   explicit MxfReader(const std::string& path, const std::string& httpHeaders = {});
+  // Wraps an already-constructed byte source directly, bypassing the
+  // path/URL dispatch above -- used internally by index_table.cpp's
+  // parallel HTTP index-extraction path to run the normal KLV-parsing
+  // functions (ReadKlvHeader, ReadPartitionPackValue, ScanPartitionForIndexSegments,
+  // ...) unmodified against an in-memory buffer (MemoryRangeByteSource)
+  // instead of a live file/HTTP stream.
+  explicit MxfReader(std::unique_ptr<IByteSource> source);
   ~MxfReader();
   MxfReader(const MxfReader&) = delete;
   MxfReader& operator=(const MxfReader&) = delete;
 
   bool IsOpen() const { return source_ && source_->IsOpen(); }
+  bool SupportsRandomAccess() const { return source_ && source_->SupportsRandomAccess(); }
   uint64_t Tell() const;
   bool Seek(uint64_t pos);
   uint64_t Size() const;

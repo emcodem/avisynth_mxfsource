@@ -468,19 +468,18 @@ SourceEngine::SeekStartPoint SourceEngine::ResolveSeekStart(int64_t essenceTarge
       searchFrom = seekPoint->editUnit - 1;
     }
 
-    // AVC open GOP: this GOP's own leading picture(s) may reference the
+    // Open GOP: this GOP's own leading picture(s) may reference the
     // *previous* GOP's anchor frame, not anything within this GOP -- a
     // decoder restarted fresh at startEditUnit alone would be missing that
     // reference (verified against a real file: every GOP's leading two B
     // pictures carry a KeyFrameOffset pointing at the previous GOP's own
     // keyframe, not this one). Extending the restart back exactly one GOP
-    // is sufficient regardless of whether *that* GOP's own leading pictures
-    // have the same issue -- its own keyframe is an intra frame, self-
-    // sufficient by definition, and everything decoded from it before
-    // reaching startEditUnit is discarded by the caller's own
-    // reorderDelay/iterations math anyway, so its correctness doesn't
-    // matter, only that decoding it populates the reference this GOP's
-    // leading pictures need.
+    // is sufficient to satisfy *this* GOP's leading pictures, regardless of
+    // whether the GOP backed up to has the identical issue itself (its own
+    // keyframe is an intra frame, self-sufficient by definition) -- but its
+    // own leading pictures' *correctness* was wrongly assumed to not matter
+    // here (see CountUndecodableLeadingPictures below for why it actually
+    // does).
     if (startEditUnit > 0 && videoIndex_->NeedsPreviousGop(startEditUnit)) {
       if (auto prevPoint = videoIndex_->FindPrecedingKeyframe(startEditUnit - 1)) {
         startOffset = prevPoint->byteOffset;
@@ -499,7 +498,35 @@ SourceEngine::SeekStartPoint SourceEngine::ResolveSeekStart(int64_t essenceTarge
   // loop above -- there's no earlier keyframe to borrow runway from when
   // startEditUnit is already 0), same as any other unreachable-near-keyframe
   // target.
-  const int reorderDelay = videoIndex_ ? videoIndex_->EstimateReorderDelay(startEditUnit) : 0;
+  //
+  // CountUndecodableLeadingPictures(startEditUnit) folded in here too: if
+  // the NeedsPreviousGop backup above just fired, startEditUnit's own
+  // leading picture(s) reference an even-earlier GOP this restart never
+  // decodes -- and, verified directly (extracted the exact raw
+  // elementary-stream bytes SendAndReceive feeds avcodec for a real file's
+  // true final GOP and fed them to a bare, independent avcodec instance),
+  // avcodec doesn't error on these, it silently produces *no output frame
+  // at all* for them, rather than emitting wrong-but-present content. The
+  // old assumption ("its own correctness doesn't matter, only that
+  // decoding it populates the reference this GOP's leading pictures need",
+  // see the backup step above) was wrong specifically because of this: a
+  // silently-dropped output permanently shifts every later output backward
+  // by one position relative to naive one-input-per-output counting, the
+  // same net effect on SeekAndDecode's `iterations` math as genuine reorder
+  // delay, hence folded into the same value here. For an interior target
+  // this just makes SeekAndDecode consume a couple of extra, otherwise-
+  // unaccounted-for essence elements past the target with no visible
+  // effect (there's always more essence past an interior target to absorb
+  // it); for a target sitting at the file's true final essence element
+  // there is no such slack, and the uncompensated version of this ran
+  // `iterations` two calls too many, hitting genuine end-of-essence instead
+  // of ever reaching the target at all -- the real, confirmed cause of the
+  // "requested frame fell outside the ring buffer window ... fallback
+  // re-decode also failed to reach it" failure on a real file's true final
+  // chunk.
+  const int reorderDelay = videoIndex_ ? (videoIndex_->EstimateReorderDelay(startEditUnit) +
+                                           videoIndex_->CountUndecodableLeadingPictures(startEditUnit))
+                                        : 0;
   return {startOffset, startEditUnit, reorderDelay};
 }
 

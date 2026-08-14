@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "mxf/klv.h"
@@ -246,6 +247,27 @@ class EssenceIndex {
   // or (CBR rows, always intra-only) keyFrameOffset is always 0.
   bool NeedsPreviousGop(int64_t keyframeEditUnit) const;
 
+  // Counts how many pictures immediately after `keyframeEditUnit` (within
+  // its own GOP) have an actual anchor (editUnit + keyFrameOffset, SMPTE
+  // 377-1) before `keyframeEditUnit` itself -- the same open-GOP condition
+  // NeedsPreviousGop detects, but counted rather than just detected. A
+  // decoder restarted fresh exactly at `keyframeEditUnit` never decodes
+  // whatever earlier GOP those pictures actually reference (SeekAndDecode
+  // only ever backs up ONE GOP via NeedsPreviousGop, not however many GOPs
+  // deep a picture's own anchor might sit -- and backing up further
+  // wouldn't help these specific pictures anyway, since it's exactly this
+  // GOP's own encoded dependency that's unsatisfiable without decoding the
+  // GOP(s) before the one being backed up to). Verified against a real
+  // broadcast MPEG-2 MXF file (D:\Vistek_DMX_-1ms.mxf) whose every GOP
+  // boundary carries this pattern: avcodec doesn't error on these
+  // pictures, it silently produces no output frame for them at all
+  // (confirmed via direct extraction + a standalone ffmpeg decode of the
+  // exact same raw elementary-stream bytes) -- permanently shifting every
+  // later output backward by this many positions relative to naive
+  // one-input-per-output counting. Returns 0 if `keyframeEditUnit` isn't
+  // covered/found, matching NeedsPreviousGop's own return-false case.
+  int CountUndecodableLeadingPictures(int64_t keyframeEditUnit) const;
+
   // Returns all index entries. Used by BuildAudioSampleIndexFromIndexTable to
   // build audio indices directly from the video index without essence walking.
   const std::vector<FlatIndexEntry>& GetEntries() const { return entries_; }
@@ -268,5 +290,31 @@ class EssenceIndex {
 // "index unavailable, use the legacy from-0 decode path", never a hard
 // failure.
 std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoBodySid);
+
+// Same end result as BuildEssenceIndex, but for an HTTP(S) source where the
+// caller has already confirmed byte-range support (MxfReader::
+// SupportsRandomAccess()) and already knows every partition's byte offset
+// (`partitionOffsets` -- typically the Header Partition plus every Random
+// Index Pack entry, in any order/with duplicates, both handled here).
+// BuildEssenceIndex's own EnumeratePartitionsForIndex reads each partition
+// fully sequentially through one persistent connection -- fine for a local
+// file (a seek is free) or a single HTTP stream reading forward, but a real
+// multi-partition file (a 45000-frame recording can have ~179 partitions,
+// see index_table.cpp's own commit history) turns that into ~179+ separate
+// round trips paid one at a time, each dominated by request latency rather
+// than the handful of bytes actually needed. This instead fans out up to
+// ~20 concurrent bounded ranged GETs (net/http_put.h's HttpGetRange, each on
+// its own short-lived connection) across those known offsets, growing each
+// partition's own download only as far as its own content actually needs
+// (see index_table.cpp's FetchAndParsePartitionForIndex) rather than
+// streaming everything in between. `httpHeaders` is the same raw
+// "Name: value\r\n..." block MxfReader/HttpByteSource accept. Returns
+// std::nullopt (not an error) under the same conditions BuildEssenceIndex
+// does -- callers should fall back to BuildEssenceIndex against the same
+// (still-open, still-valid) MxfReader on that result, exactly as they would
+// for any other "no usable index found" case.
+std::optional<EssenceIndex> BuildEssenceIndexFromHttp(const std::string& url, const std::string& httpHeaders,
+                                                       uint32_t videoBodySid, uint64_t fileSize,
+                                                       std::vector<uint64_t> partitionOffsets);
 
 }  // namespace mxfsrc

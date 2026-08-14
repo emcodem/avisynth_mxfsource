@@ -154,6 +154,31 @@ void TestEstimateReorderDelayReturnsZeroForLowDelayMonotonicByteOffsets() {
   CHECK(index.EstimateReorderDelay(200) == 0);
 }
 
+// Regression test for the real-file tail-EOF bug (2026-08-14 handoff):
+// D:\Vistek_DMX_-1ms.mxf's every GOP boundary carries this exact open-GOP
+// pattern (verified via read_test_mxf's index-scan tool against the real
+// file, absolute edit units 7380-7383) -- the keyframe's own two leading B
+// pictures reference the *previous* GOP's keyframe (13/14 edit units back,
+// this file's GOP period), not this GOP's own keyframe. NeedsPreviousGop
+// only detects this (bool); CountUndecodableLeadingPictures must count
+// exactly how many, since SeekAndDecode's restart-one-GOP-back workaround
+// still never decodes whatever those leading pictures actually reference,
+// silently costing that many missing outputs that must be added back into
+// SeekAndDecode's iteration count (see ResolveSeekStart's reorderDelay).
+void TestCountUndecodableLeadingPicturesMatchesRealFileOpenGopPattern() {
+  EssenceIndex index(std::vector<FlatIndexEntry>{
+      {7368, 100000, true, 0x40, 0},     // I (previous GOP's own keyframe)
+      {7380, 200000, true, 0x40, 0},     // I (this GOP's keyframe)
+      {7381, 200100, false, 0x33, -13},  // B, anchor=7381-13=7368 -- previous GOP
+      {7382, 200200, false, 0x33, -14},  // B, anchor=7382-14=7368 -- previous GOP
+      {7383, 200300, false, 0x22, -3},   // P, anchor=7383-3=7380 -- this GOP, fine
+      {7384, 200400, false, 0x33, -4},   // B, anchor=7384-4=7380 -- this GOP, fine
+  });
+  CHECK(index.NeedsPreviousGop(7380));
+  CHECK(index.CountUndecodableLeadingPictures(7380) == 2);
+  CHECK(index.CountUndecodableLeadingPictures(7368) == 0);  // closed GOP: nothing to count
+}
+
 void TestFindPrecedingKeyframeTargetIsAlreadyKeyframe() {
   EssenceIndex index(std::vector<FlatIndexEntry>{
       {10, 1000, true},
@@ -510,6 +535,7 @@ int main() {
   TestIsKeyframeFlagsTruthTable();
   TestEstimateReorderDelayCountsBackwardOnlyBFrames();
   TestEstimateReorderDelayReturnsZeroForLowDelayMonotonicByteOffsets();
+  TestCountUndecodableLeadingPicturesMatchesRealFileOpenGopPattern();
   TestFindPrecedingKeyframeTargetIsAlreadyKeyframe();
   TestFindPrecedingKeyframeWalksBackToEarlierKeyframe();
   TestFindPrecedingKeyframeNoKeyframeBeforeTarget();

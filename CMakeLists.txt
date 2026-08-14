@@ -62,6 +62,7 @@ add_library(mxf_core STATIC
   src/mxf/essence_walker.h
   src/mxf/index_table.cpp
   src/mxf/index_table.h
+  src/mxf/memory_byte_source.h
   src/mxf/index_serialization.cpp
   src/mxf/index_serialization.h
   src/mxf/index_transport.cpp

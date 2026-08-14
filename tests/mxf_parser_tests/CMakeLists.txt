@@ -100,6 +100,16 @@ if(WIN32)
 endif()
 add_test(NAME mxf_http_byte_source_tests COMMAND mxf_http_byte_source_tests)
 
+add_executable(mxf_index_table_http_tests
+  index_table_http_test.cpp
+)
+target_compile_features(mxf_index_table_http_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_index_table_http_tests PRIVATE mxf_core)
+if(WIN32)
+  target_link_libraries(mxf_index_table_http_tests PRIVATE ws2_32)
+endif()
+add_test(NAME mxf_index_table_http_tests COMMAND mxf_index_table_http_tests)
+
 add_executable(mxf_http_source_engine_tests
   http_source_engine_test.cpp
 )
@@ -124,6 +134,18 @@ add_executable(read_test_mxf EXCLUDE_FROM_ALL
 target_compile_features(read_test_mxf PRIVATE cxx_std_17)
 target_link_libraries(read_test_mxf PRIVATE mxf_core)
 mxfsrc_deploy_ffmpeg_runtime(read_test_mxf)
+
+add_executable(time_extract_index EXCLUDE_FROM_ALL
+  time_extract_index.cpp
+)
+target_compile_features(time_extract_index PRIVATE cxx_std_17)
+target_link_libraries(time_extract_index PRIVATE mxf_core)
+
+add_executable(bench_extract_index EXCLUDE_FROM_ALL
+  bench_extract_index.cpp
+)
+target_compile_features(bench_extract_index PRIVATE cxx_std_17)
+target_link_libraries(bench_extract_index PRIVATE mxf_core)
 
 add_executable(dump_header_info EXCLUDE_FROM_ALL
   dump_header_info.cpp

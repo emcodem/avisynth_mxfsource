@@ -1,8 +1,14 @@
 #include "mxf/index_table.h"
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <thread>
 
 #include "mxf/essence_walker.h"
+#include "mxf/memory_byte_source.h"
+#include "net/http_put.h"
 
 namespace mxfsrc {
 
@@ -329,6 +335,17 @@ bool EssenceIndex::NeedsPreviousGop(int64_t keyframeEditUnit) const {
   return false;
 }
 
+int EssenceIndex::CountUndecodableLeadingPictures(int64_t keyframeEditUnit) const {
+  auto it = std::lower_bound(entries_.begin(), entries_.end(), keyframeEditUnit,
+                              [](const FlatIndexEntry& e, int64_t t) { return e.editUnit < t; });
+  if (it == entries_.end() || it->editUnit != keyframeEditUnit) return 0;
+  int count = 0;
+  for (++it; it != entries_.end() && !it->isKeyframe; ++it) {
+    if (it->editUnit + static_cast<int64_t>(it->keyFrameOffset) < keyframeEditUnit) ++count;
+  }
+  return count;
+}
+
 namespace {
 
 struct BodyRange {
@@ -418,16 +435,19 @@ void FlattenSegmentInto(const IndexTableSegment& seg, uint64_t fileSize, const s
 
 }  // namespace
 
-std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoBodySid) {
-  std::vector<IndexScanPartition> scanPartitions = EnumeratePartitionsForIndex(reader);
+namespace {
 
-  std::vector<IndexTableSegment> segments;
-  for (const auto& partition : scanPartitions) {
-    for (auto& seg : ScanPartitionForIndexSegments(reader, partition)) {
-      if (videoBodySid != 0 && seg.bodySid != 0 && seg.bodySid != videoBodySid) continue;
-      segments.push_back(std::move(seg));
-    }
-  }
+// The reader-independent tail shared by both BuildEssenceIndex (sequential,
+// works for local files and as the network fallback) and
+// BuildEssenceIndexFromHttp (parallel, HTTP-only, see below): given every
+// scanned partition and every already-bodySid-filtered segment found across
+// them, resolves absolute byte offsets and flattens into the final,
+// queryable EssenceIndex. Pulled out verbatim from BuildEssenceIndex's own
+// former second half so both gathering strategies produce identical results
+// from identical (scanPartitions, segments) input.
+std::optional<EssenceIndex> FinishBuildingIndex(const std::vector<IndexScanPartition>& scanPartitions,
+                                                 std::vector<IndexTableSegment> segments, uint64_t fileSize,
+                                                 uint32_t videoBodySid) {
   if (segments.empty()) return std::nullopt;
 
   // Every essence-bearing partition for videoBodySid, sorted by BodyOffset
@@ -460,7 +480,6 @@ std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoB
     return a.indexStartPosition < b.indexStartPosition;
   });
 
-  const uint64_t fileSize = reader.Size();
   std::vector<FlatIndexEntry> flat;
   for (const auto& seg : segments) FlattenSegmentInto(seg, fileSize, bodyRanges, flat);
   if (flat.empty()) return std::nullopt;
@@ -473,6 +492,163 @@ std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoB
       flat.end());
 
   return EssenceIndex(std::move(flat));
+}
+
+}  // namespace
+
+std::optional<EssenceIndex> BuildEssenceIndex(MxfReader& reader, uint32_t videoBodySid) {
+  std::vector<IndexScanPartition> scanPartitions = EnumeratePartitionsForIndex(reader);
+
+  std::vector<IndexTableSegment> segments;
+  for (const auto& partition : scanPartitions) {
+    for (auto& seg : ScanPartitionForIndexSegments(reader, partition)) {
+      if (videoBodySid != 0 && seg.bodySid != 0 && seg.bodySid != videoBodySid) continue;
+      segments.push_back(std::move(seg));
+    }
+  }
+  return FinishBuildingIndex(scanPartitions, std::move(segments), reader.Size(), videoBodySid);
+}
+
+namespace {
+
+// First guess at how much of a partition's Index Table data to download in
+// one shot -- covers the common case (a handful of Index Table Segments) in
+// a single request. See FetchAndParsePartitionForIndex's growth strategy
+// below for what happens when it isn't enough.
+constexpr uint64_t kIndexFetchInitialChunk = 100 * 1024;
+// Step size for blind growth (used before the Partition Pack itself has even
+// been parsed, so IndexByteCount isn't known yet) and the minimum step once
+// it has -- paired with doubling below so a handful of retries can still
+// reach a multi-MB gap without needing dozens of round trips for it.
+constexpr uint64_t kIndexFetchGrowChunk = 100 * 1024;
+// Doubling converges to even a many-MB gap (e.g. a Footer Partition whose
+// own redundant Header Metadata copy + RIP sit between its Index Table
+// Segment and EOF) within a handful of steps; this bounds the pathological
+// case (a badly malformed partition whose own declared sizes are wildly
+// wrong) from growing forever. Growth is separately capped at `hardCap`
+// (the next partition's own offset, or file size for the last partition)
+// regardless of this limit -- a partition's content can never legitimately
+// extend past that point.
+constexpr int kIndexFetchMaxGrowSteps = 24;
+
+struct PartitionFetchResult {
+  IndexScanPartition partition;
+  std::vector<IndexTableSegment> segments;
+};
+
+// Downloads and parses one partition's worth of Index Table data, growing
+// the download as needed: first `kIndexFetchInitialChunk` bytes from
+// `offset` (per the CMC/Omneon-quirk precedent this project has already hit
+// more than once, see index_table.h's own BuildEssenceIndexFromHttp comment
+// -- a partition's own declared IndexByteCount can itself undercount reality,
+// so it's a hint to grow *toward*, never a guarantee to stop at). After each
+// attempt, MemoryRangeByteSource::HitBufferLimit() says whether the parse
+// (ReadOnePartitionForIndex + ScanPartitionForIndexSegments, run completely
+// unmodified against the in-memory buffer) ran out of downloaded bytes
+// somewhere -- if so, grow and re-parse from scratch (cheap: pure in-memory
+// CPU work) rather than trusting a result that might be silently truncated.
+// `hardCap` bounds how far this will ever grow (see kIndexFetchMaxGrowSteps).
+// Returns std::nullopt only if the very first fetch fails outright or the
+// downloaded bytes never resolve to a valid Partition Pack at `offset` --
+// mirrors ReadOnePartitionForIndex's own "simply omitted, not a hard error"
+// contract for a partition that fails to parse.
+std::optional<PartitionFetchResult> FetchAndParsePartitionForIndex(
+    const std::function<std::optional<std::vector<uint8_t>>(uint64_t, uint64_t)>& fetchRange, uint64_t offset,
+    uint64_t hardCap, uint64_t fileSize) {
+  if (offset >= fileSize || hardCap <= offset) return std::nullopt;
+  const uint64_t cap = std::min(hardCap, fileSize);
+  std::vector<uint8_t> buffer;
+
+  auto growTo = [&](uint64_t targetSize) -> bool {
+    targetSize = std::min(targetSize, cap - offset);
+    if (targetSize <= buffer.size()) return false;
+    auto more = fetchRange(offset + buffer.size(), targetSize - buffer.size());
+    if (!more || more->empty()) return false;
+    buffer.insert(buffer.end(), more->begin(), more->end());
+    return true;
+  };
+
+  if (!growTo(kIndexFetchInitialChunk)) return std::nullopt;
+
+  for (int step = 0; step <= kIndexFetchMaxGrowSteps; ++step) {
+    auto source = std::make_unique<MemoryRangeByteSource>(offset, buffer, fileSize);
+    MemoryRangeByteSource* sourcePtr = source.get();
+    MxfReader memReader(std::move(source));
+    auto scan = ReadOnePartitionForIndex(memReader, offset);
+    std::vector<IndexTableSegment> segs;
+    if (scan && !sourcePtr->HitBufferLimit()) segs = ScanPartitionForIndexSegments(memReader, *scan);
+    if (!sourcePtr->HitBufferLimit()) {
+      if (!scan) return std::nullopt;  // genuinely not a valid Partition Pack here, not a buffering issue
+      return PartitionFetchResult{*scan, std::move(segs)};
+    }
+
+    uint64_t nextTarget = std::max<uint64_t>(buffer.size() + kIndexFetchGrowChunk, buffer.size() * 2);
+    if (scan) nextTarget = std::max<uint64_t>(nextTarget, scan->indexByteRangeEnd - offset);
+    if (!growTo(nextTarget)) break;  // fetch failed, or already at `cap` -- stop, use what's parseable below
+  }
+
+  // Ran out of grow steps (or hit `cap`) still short of a complete parse --
+  // fall back to whatever's parseable from the buffer we do have, same
+  // tolerant "a malformed/truncated segment is dropped, not fatal"
+  // philosophy as the rest of this file, rather than losing the whole
+  // partition.
+  auto source = std::make_unique<MemoryRangeByteSource>(offset, buffer, fileSize);
+  MxfReader memReader(std::move(source));
+  auto scan = ReadOnePartitionForIndex(memReader, offset);
+  if (!scan) return std::nullopt;
+  return PartitionFetchResult{*scan, ScanPartitionForIndexSegments(memReader, *scan)};
+}
+
+// Concurrent partition fetches capped at this many in flight -- comfortably
+// past what one round trip's latency alone would otherwise force this whole
+// build to pay for serially (see BuildEssenceIndexFromHttp's own comment),
+// without opening an unreasonable number of simultaneous connections against
+// the source.
+constexpr size_t kMaxConcurrentPartitionFetches = 20;
+
+}  // namespace
+
+std::optional<EssenceIndex> BuildEssenceIndexFromHttp(const std::string& url, const std::string& httpHeaders,
+                                                       uint32_t videoBodySid, uint64_t fileSize,
+                                                       std::vector<uint64_t> partitionOffsets) {
+  std::sort(partitionOffsets.begin(), partitionOffsets.end());
+  partitionOffsets.erase(std::unique(partitionOffsets.begin(), partitionOffsets.end()), partitionOffsets.end());
+  if (partitionOffsets.empty() || partitionOffsets.front() != 0) partitionOffsets.insert(partitionOffsets.begin(), 0);
+
+  auto fetchRange = [&](uint64_t off, uint64_t len) -> std::optional<std::vector<uint8_t>> {
+    std::string err;
+    return HttpGetRange(url, httpHeaders, off, len, &err);
+  };
+
+  const size_t n = partitionOffsets.size();
+  std::vector<std::optional<PartitionFetchResult>> results(n);
+  std::atomic<size_t> nextIndex{0};
+  const size_t workerCount = std::min(kMaxConcurrentPartitionFetches, n);
+  std::vector<std::thread> workers;
+  workers.reserve(workerCount);
+  for (size_t w = 0; w < workerCount; ++w) {
+    workers.emplace_back([&] {
+      while (true) {
+        const size_t i = nextIndex.fetch_add(1);
+        if (i >= n) break;
+        const uint64_t hardCap = (i + 1 < n) ? partitionOffsets[i + 1] : fileSize;
+        results[i] = FetchAndParsePartitionForIndex(fetchRange, partitionOffsets[i], hardCap, fileSize);
+      }
+    });
+  }
+  for (auto& t : workers) t.join();
+
+  std::vector<IndexScanPartition> scanPartitions;
+  std::vector<IndexTableSegment> segments;
+  for (auto& r : results) {
+    if (!r) continue;
+    scanPartitions.push_back(r->partition);
+    for (auto& seg : r->segments) {
+      if (videoBodySid != 0 && seg.bodySid != 0 && seg.bodySid != videoBodySid) continue;
+      segments.push_back(std::move(seg));
+    }
+  }
+  return FinishBuildingIndex(scanPartitions, std::move(segments), fileSize, videoBodySid);
 }
 
 }  // namespace mxfsrc

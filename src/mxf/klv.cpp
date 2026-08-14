@@ -37,6 +37,8 @@ MxfReader::MxfReader(const std::string& path, const std::string& httpHeaders) {
   }
 }
 
+MxfReader::MxfReader(std::unique_ptr<IByteSource> source) : source_(std::move(source)) {}
+
 MxfReader::~MxfReader() = default;
 
 uint64_t MxfReader::Tell() const { return source_ ? source_->Tell() : 0; }

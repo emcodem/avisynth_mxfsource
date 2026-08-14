@@ -279,6 +279,42 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Diagnostic: dumps concatenated raw VIDEO essence element bytes (pure
+  // elementary stream, no KLV wrappers -- exactly the bytes SendAndReceive
+  // feeds avcodec) starting at a given byte offset, through `count` video
+  // elements. args: <file> extract-es <startOffset> <count> <outpath>.
+  if (argc >= 6 && std::string(argv[2]) == "extract-es") {
+    const uint64_t startOffset = std::stoull(argv[3]);
+    const int count = std::stoi(argv[4]);
+    const std::string outpath = argv[5];
+    MxfReader reader(argv[1]);
+    if (!reader.IsOpen()) {
+      std::cerr << "failed to open" << std::endl;
+      return 1;
+    }
+    std::string err;
+    auto info = ParseMxfHeader(reader, &err);
+    if (!info) {
+      std::cerr << "ParseMxfHeader failed: " << err << std::endl;
+      return 1;
+    }
+    EssenceWalker walker(reader, startOffset, info->videoTrackNumber, info->hasVideo, {});
+    std::ofstream out(outpath, std::ios::binary | std::ios::trunc);
+    int got = 0;
+    while (got < count) {
+      EssenceElement element;
+      if (!walker.Next(element)) {
+        std::cout << "walker.Next() FAILED after " << got << " video elements" << std::endl;
+        return 1;
+      }
+      if (!element.isVideo) continue;
+      out.write(reinterpret_cast<const char*>(element.data.data()), static_cast<std::streamsize>(element.data.size()));
+      ++got;
+    }
+    std::cout << "wrote " << got << " video elements to " << outpath << std::endl;
+    return 0;
+  }
+
   // Traces the raw sequential EssenceWalker (the exact same class
   // SourceEngine::DecodeThreadMain uses) from headerMetadataEnd forward,
   // printing every VIDEO essence element's index/file position/length --
