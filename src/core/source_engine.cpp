@@ -755,10 +755,8 @@ void SourceEngine::DecodeThreadMain() {
             // was positioned earlier in the file than this starting offset
             // and is structurally unreachable, exactly the same kind of gap
             // `pending`'s own warm-up already accepts for VIDEO at essence
-            // element 0 (see its doc comment) and Locate() already accepts
-            // for isolated missing samples elsewhere ("treat the unreachable
-            // sample(s) as silence and move on"). Previously treated as
-            // fatal for the source's entire remaining lifetime (audioFailed
+            // element 0 (see its doc comment). Previously treated as fatal
+            // for the source's entire remaining lifetime (audioFailed
             // latched permanently), which silently disabled real audio
             // production for every edit unit *after* this one too, not just
             // this genuinely-unreachable leading one -- confirmed via real
@@ -767,18 +765,27 @@ void SourceEngine::DecodeThreadMain() {
             // FreshReadAudioBlock's one-shot fresh-HTTP-connection-per-call
             // path for literally every subsequent audio block of a hinted
             // chunk, ~40s/chunk wasted over a real network for a single
-            // boundary edit unit's worth of genuinely missing audio. Skip
-            // just this one edit unit's contribution to pendingAudio instead
-            // (leaves it one entry short of `reorderDelay` at this point,
-            // handled by the main loop's own already-existing "still warming
-            // up" best-effort-repeat branch below, same as the video-side
-            // gap) -- audio production for every edit unit from here on is
-            // unaffected. Logged once (not via SignalError, which would mark
-            // the whole buffer permanently errored) so this remains visible
-            // rather than fully silent.
+            // boundary edit unit's worth of genuinely missing audio.
+            //
+            // No silence is synthesized here -- deliberately just a no-op
+            // (nothing pushed to pendingAudio at all; an earlier version of
+            // this fix's own log message wrongly said "treating as
+            // silence", which was never accurate -- fixed). This leaves
+            // pendingAudio one entry short of `reorderDelay` at this single
+            // point; that's harmless, not a gap in served audio, because the
+            // window still reaches its normal full depth well before this
+            // (much longer) warm-up loop ends regardless -- the skipped
+            // entry would have been pushed out and discarded by later real
+            // entries before any consumer ever saw it, fix or no fix.
+            // Verified directly, not just argued: decoded the same real
+            // chunk with the pre-fix (slow-but-correct-via-fallback) and
+            // fixed builds and diffed the two output audio tracks --
+            // byte-for-byte identical. Logged once (not via SignalError,
+            // which would mark the whole buffer permanently errored) so
+            // this remains visible rather than fully silent.
             AppendLogLine("[MxfSource] " + path_ + ": leading audio edit unit near the start_frame hint's own "
-                          "seek-start point is unreachable (" + audioErr + ") -- treating as silence, audio "
-                          "production continues normally from here");
+                          "seek-start point is unreachable (" + audioErr + ") -- skipping it, no effect on served "
+                          "audio (absorbed by the reorder-delay warm-up window), production continues normally");
           } else {
             pendingAudio.push_back(std::move(block));
             if (static_cast<int>(pendingAudio.size()) > reorderDelay) pendingAudio.pop_front();
