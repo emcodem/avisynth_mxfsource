@@ -745,9 +745,40 @@ void SourceEngine::DecodeThreadMain() {
           auto block = std::make_shared<AudioBlock>();
           std::string audioErr;
           if (!InterleaveAudioEditUnit(audioScratch, streamInfo_.audioTracks, *block, &audioErr)) {
-            audioBuffer_->SignalError("audio decode error near ring index " + std::to_string(firstHostFrame_) +
-                                       ": " + audioErr);
-            audioFailed = true;
+            // Only ever expected on this loop's very *first* iteration
+            // (i == hintStartEditUnit_), and only best-effort-recoverable
+            // there: walker_ starts reading at exactly the resolved
+            // seek-start video keyframe's own byte offset (ResolveSeekStart),
+            // not at that edit unit's true interleave-group boundary -- if
+            // this file's operational pattern places audio elements *before*
+            // video within an edit unit, that leading edit unit's own audio
+            // was positioned earlier in the file than this starting offset
+            // and is structurally unreachable, exactly the same kind of gap
+            // `pending`'s own warm-up already accepts for VIDEO at essence
+            // element 0 (see its doc comment) and Locate() already accepts
+            // for isolated missing samples elsewhere ("treat the unreachable
+            // sample(s) as silence and move on"). Previously treated as
+            // fatal for the source's entire remaining lifetime (audioFailed
+            // latched permanently), which silently disabled real audio
+            // production for every edit unit *after* this one too, not just
+            // this genuinely-unreachable leading one -- confirmed via real
+            // testing (HANDOFF_qtgmc_frame0_fallback_decode_2026-09-09.md's
+            // "UPDATE 2026-09-09 (later still)" section) to fall back to
+            // FreshReadAudioBlock's one-shot fresh-HTTP-connection-per-call
+            // path for literally every subsequent audio block of a hinted
+            // chunk, ~40s/chunk wasted over a real network for a single
+            // boundary edit unit's worth of genuinely missing audio. Skip
+            // just this one edit unit's contribution to pendingAudio instead
+            // (leaves it one entry short of `reorderDelay` at this point,
+            // handled by the main loop's own already-existing "still warming
+            // up" best-effort-repeat branch below, same as the video-side
+            // gap) -- audio production for every edit unit from here on is
+            // unaffected. Logged once (not via SignalError, which would mark
+            // the whole buffer permanently errored) so this remains visible
+            // rather than fully silent.
+            AppendLogLine("[MxfSource] " + path_ + ": leading audio edit unit near the start_frame hint's own "
+                          "seek-start point is unreachable (" + audioErr + ") -- treating as silence, audio "
+                          "production continues normally from here");
           } else {
             pendingAudio.push_back(std::move(block));
             if (static_cast<int>(pendingAudio.size()) > reorderDelay) pendingAudio.pop_front();
