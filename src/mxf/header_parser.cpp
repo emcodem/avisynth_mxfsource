@@ -397,14 +397,20 @@ void ValidateAndSummarizeAudio(MxfStreamInfo& info) {
   info.hasAudio = !info.audioTracks.empty();
   if (!info.hasAudio) return;
 
-  // The TrackNumber's first byte is the essence element's item type
-  // (SMPTE 379): 0x06 is an SDTI-CP sound item (D-10/IMX), whose PCM is
-  // AES3-packed (see AudioTrackInfo::aes3Packed). Only 16 and 24 bit occur
-  // there.
+  // TrackNumber = the essence element key's last 4 bytes (SMPTE 379): item
+  // type, element count, element type, element number. Item type 0x06 is
+  // an SDTI-CP sound item (D-10/IMX); its element type 0x10 is the
+  // "8-Ch AES3 Element" (see AudioTrackInfo::eightChAes3Element), the only
+  // one supported. It carries 16 or 24 bit in at most 8 channels.
   for (AudioTrackInfo& t : info.audioTracks) {
-    t.aes3Packed = t.trackNumber[0] == 0x06;
-    if (t.aes3Packed && ((t.bitsPerSample != 16 && t.bitsPerSample != 24) || t.channelCount > 8)) {
-      info.audioUnsupportedReason = "D-10/IMX AES3 audio with unexpected bit depth or more than 8 channels";
+    if (t.trackNumber[0] != 0x06) continue;
+    if (t.trackNumber[2] != 0x10) {
+      info.audioUnsupportedReason = "SDTI-CP sound element other than the 8-Ch AES3 Element not supported";
+      return;
+    }
+    t.eightChAes3Element = true;
+    if ((t.bitsPerSample != 16 && t.bitsPerSample != 24) || t.channelCount > 8) {
+      info.audioUnsupportedReason = "8-Ch AES3 Element with unexpected bit depth or more than 8 channels";
       return;
     }
   }

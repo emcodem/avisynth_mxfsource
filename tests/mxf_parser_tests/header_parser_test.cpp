@@ -400,10 +400,10 @@ void TestSingleAudioTrackResolved() {
   std::filesystem::remove(path);
 }
 
-// D-10/IMX sound (SDTI-CP sound item, TrackNumber item type 0x06) is
-// AES3-packed PCM (SMPTE 331): flagged so the audio path unpacks it.
-// Bit depths other than 16/24 don't occur there and are rejected.
-void TestD10Aes3AudioFlagged() {
+// D-10/IMX sound in the 8-Ch AES3 Element (SDTI-CP sound item 0x06,
+// element type 0x10): flagged so the audio path unpacks it. Bit depths
+// other than 16/24 don't occur there and are rejected.
+void TestEightChAes3ElementFlagged() {
   for (uint32_t bits : {24u, 20u}) {
     SyntheticFile cfg;
     SyntheticAudioTrack audio;
@@ -418,13 +418,33 @@ void TestD10Aes3AudioFlagged() {
       CHECK(info.has_value());
       if (info) {
         CHECK(info->hasAudio);
-        CHECK(info->audioTracks.size() == 1 && info->audioTracks[0].aes3Packed);
+        CHECK(info->audioTracks.size() == 1 && info->audioTracks[0].eightChAes3Element);
         CHECK(info->audioConfigSupported == (bits == 24));
-        if (bits != 24) CHECK(info->audioUnsupportedReason.find("D-10/IMX AES3") != std::string::npos);
+        if (bits != 24) CHECK(info->audioUnsupportedReason.find("8-Ch AES3 Element") != std::string::npos);
       }
     }
     std::filesystem::remove(path);
   }
+}
+
+// An SDTI-CP sound item with an element type other than the 8-Ch AES3
+// Element (0x10) has an unknown layout: unsupported, never read as PCM.
+void TestOtherSdtiCpSoundElementUnsupported() {
+  SyntheticFile cfg;
+  SyntheticAudioTrack audio;
+  audio.trackNumber = 0x06010100;
+  cfg.audioTracks = {audio};
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_sdti_cp_other_sound.mxf");
+  {
+    MxfReader reader(path.string());
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (info) {
+      CHECK(!info->audioConfigSupported);
+      CHECK(info->audioUnsupportedReason.find("other than the 8-Ch AES3 Element") != std::string::npos);
+    }
+  }
+  std::filesystem::remove(path);
 }
 
 // Two audio tracks (e.g. two mono language tracks), each carrying a
@@ -572,7 +592,8 @@ int main() {
   TestUndercountedHeaderByteCountRecoveredViaRip();
   TestEssenceInHeaderPartitionNotTreatedAsMetadata();
   TestSingleAudioTrackResolved();
-  TestD10Aes3AudioFlagged();
+  TestEightChAes3ElementFlagged();
+  TestOtherSdtiCpSoundElementUnsupported();
   TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
   TestMismatchedBitDepthMarksAudioUnsupported();
   TestNonPcmCodecMarksAudioUnsupported();

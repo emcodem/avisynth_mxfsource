@@ -6,25 +6,27 @@ namespace mxfsrc {
 
 namespace {
 
-constexpr size_t kAes3ElementHeaderBytes = 4;
-constexpr size_t kAes3SlotsPerSampleFrame = 8;
-constexpr size_t kAes3BytesPerSampleFrame = kAes3SlotsPerSampleFrame * 4;
+// 8-Ch AES3 Element (SMPTE 331) layout.
+constexpr size_t kEightChAes3HeaderBytes = 4;
+constexpr size_t kEightChAes3Slots = 8;
+constexpr size_t kEightChAes3BytesPerSampleFrame = kEightChAes3Slots * 4;
 
-// Converts one SMPTE 331 AES3 element into plain interleaved little-endian
-// PCM (channelCount channels of bitsPerSample bits). Returns false if the
+// Converts one 8-Ch AES3 Element into plain interleaved little-endian PCM
+// (channelCount channels of bitsPerSample bits). Returns false if the
 // element isn't a whole number of 8-slot sample frames.
-bool UnpackAes3Element(const std::vector<uint8_t>& element, const AudioTrackInfo& track, std::vector<uint8_t>& pcm) {
-  if (element.size() < kAes3ElementHeaderBytes) return false;
-  const size_t payload = element.size() - kAes3ElementHeaderBytes;
-  if (payload % kAes3BytesPerSampleFrame != 0) return false;
-  const size_t sampleFrames = payload / kAes3BytesPerSampleFrame;
+bool UnpackEightChAes3Element(const std::vector<uint8_t>& element, const AudioTrackInfo& track,
+                              std::vector<uint8_t>& pcm) {
+  if (element.size() < kEightChAes3HeaderBytes) return false;
+  const size_t payload = element.size() - kEightChAes3HeaderBytes;
+  if (payload % kEightChAes3BytesPerSampleFrame != 0) return false;
+  const size_t sampleFrames = payload / kEightChAes3BytesPerSampleFrame;
   const size_t bytesPerSample = track.bitsPerSample / 8;
   const int shift = track.bitsPerSample == 24 ? 4 : 12;
 
   pcm.resize(sampleFrames * track.channelCount * bytesPerSample);
   uint8_t* dst = pcm.data();
-  const uint8_t* src = element.data() + kAes3ElementHeaderBytes;
-  for (size_t s = 0; s < sampleFrames; ++s, src += kAes3BytesPerSampleFrame) {
+  const uint8_t* src = element.data() + kEightChAes3HeaderBytes;
+  for (size_t s = 0; s < sampleFrames; ++s, src += kEightChAes3BytesPerSampleFrame) {
     for (uint32_t ch = 0; ch < track.channelCount; ++ch) {
       const uint8_t* w = src + ch * 4;
       const uint32_t word = static_cast<uint32_t>(w[0]) | (static_cast<uint32_t>(w[1]) << 8) |
@@ -51,7 +53,7 @@ bool InterleaveAudioEditUnit(const std::vector<EssenceElement>& perTrackElements
   }
 
   std::vector<uint32_t> frameBytes(tracks.size());  // one track's full sample frame (all its channels)
-  // Plain PCM per track: the element's own data, or its AES3 unpacking.
+  // Plain PCM per track: the element's own data, or its 8-Ch AES3 Element unpacking.
   std::vector<const std::vector<uint8_t>*> trackPcm(tracks.size());
   std::vector<std::vector<uint8_t>> unpacked(tracks.size());
   int64_t sampleCount = -1;
@@ -62,9 +64,9 @@ bool InterleaveAudioEditUnit(const std::vector<EssenceElement>& perTrackElements
     if (frameBytes[i] == 0) return fail("audio track has zero channel count or bit depth");
 
     trackPcm[i] = &perTrackElements[i].data;
-    if (tracks[i].aes3Packed) {
-      if (!UnpackAes3Element(perTrackElements[i].data, tracks[i], unpacked[i])) {
-        return fail("D-10/IMX AES3 audio element is not a whole number of 8-channel sample frames");
+    if (tracks[i].eightChAes3Element) {
+      if (!UnpackEightChAes3Element(perTrackElements[i].data, tracks[i], unpacked[i])) {
+        return fail("8-Ch AES3 Element is not a whole number of 8-channel sample frames");
       }
       trackPcm[i] = &unpacked[i];
     }
