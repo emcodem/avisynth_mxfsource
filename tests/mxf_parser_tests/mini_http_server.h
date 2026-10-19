@@ -135,7 +135,17 @@ class MiniHttpServer {
   static void SendAll(SocketHandle client, const std::string& data) {
     size_t sent = 0;
     while (sent < data.size()) {
-      const int n = send(client, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+      // The client legitimately closes early (HttpByteSource aborts after
+      // the headers of its probe request, or stops reading a range it no
+      // longer needs). On Linux a send() to that closed socket raises
+      // SIGPIPE, which killed the whole test binary intermittently
+      // (timing-dependent); MSG_NOSIGNAL turns it into a plain error.
+#if defined(MSG_NOSIGNAL)
+      const int flags = MSG_NOSIGNAL;
+#else
+      const int flags = 0;
+#endif
+      const int n = send(client, data.data() + sent, static_cast<int>(data.size() - sent), flags);
       if (n <= 0) return;
       sent += static_cast<size_t>(n);
     }
