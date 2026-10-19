@@ -34,6 +34,12 @@ struct AudioBlock {
 // padding/truncating, consistent with this codebase's "fail loud on
 // malformed input" convention elsewhere (see e.g. SourceEngine's decode
 // error handling).
+// Tracks with AudioTrackInfo::aes3Packed (D-10/IMX) are unpacked to the
+// same plain little-endian PCM first: the 4-byte SMPTE 331 element header is
+// skipped, and of the 8 32-bit channel slots per sample frame the first
+// channelCount are kept, as (word >> 4) & 0xFFFFFF for 24 bit or
+// (word >> 12) & 0xFFFF for 16 bit -- the same conversion as FFmpeg's
+// mxf_get_d10_aes3_packet.
 bool InterleaveAudioEditUnit(const std::vector<EssenceElement>& perTrackElements,
                               const std::vector<AudioTrackInfo>& tracks, AudioBlock& out, std::string* errorOut);
 

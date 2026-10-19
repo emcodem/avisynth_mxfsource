@@ -400,28 +400,31 @@ void TestSingleAudioTrackResolved() {
   std::filesystem::remove(path);
 }
 
-// D-10/IMX sound (SDTI-CP sound item, TrackNumber item type 0x06) is AES3
-// (SMPTE 331), not plain PCM, even though its descriptor says PCM. Reading
-// it as PCM failed on the first audio request on real files, so it must be
-// reported unsupported instead of exposed.
-void TestD10Aes3AudioMarkedUnsupported() {
-  SyntheticFile cfg;
-  SyntheticAudioTrack audio;
-  audio.trackNumber = 0x06010110;  // CP sound item, element type AES3 8-channel
-  audio.channelCount = 8;
-  cfg.audioTracks = {audio};
-  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_d10_audio.mxf");
-  {
-    MxfReader reader(path.string());
-    auto info = ParseMxfHeader(reader);
-    CHECK(info.has_value());
-    if (info) {
-      CHECK(info->hasAudio);
-      CHECK(!info->audioConfigSupported);
-      CHECK(info->audioUnsupportedReason.find("D-10/IMX AES3") != std::string::npos);
+// D-10/IMX sound (SDTI-CP sound item, TrackNumber item type 0x06) is
+// AES3-packed PCM (SMPTE 331): flagged so the audio path unpacks it.
+// Bit depths other than 16/24 don't occur there and are rejected.
+void TestD10Aes3AudioFlagged() {
+  for (uint32_t bits : {24u, 20u}) {
+    SyntheticFile cfg;
+    SyntheticAudioTrack audio;
+    audio.trackNumber = 0x06010110;  // CP sound item, element type AES3 8-channel
+    audio.channelCount = 8;
+    audio.bitsPerSample = bits;
+    cfg.audioTracks = {audio};
+    auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_d10_audio.mxf");
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      CHECK(info.has_value());
+      if (info) {
+        CHECK(info->hasAudio);
+        CHECK(info->audioTracks.size() == 1 && info->audioTracks[0].aes3Packed);
+        CHECK(info->audioConfigSupported == (bits == 24));
+        if (bits != 24) CHECK(info->audioUnsupportedReason.find("D-10/IMX AES3") != std::string::npos);
+      }
     }
+    std::filesystem::remove(path);
   }
-  std::filesystem::remove(path);
 }
 
 // Two audio tracks (e.g. two mono language tracks), each carrying a
@@ -569,7 +572,7 @@ int main() {
   TestUndercountedHeaderByteCountRecoveredViaRip();
   TestEssenceInHeaderPartitionNotTreatedAsMetadata();
   TestSingleAudioTrackResolved();
-  TestD10Aes3AudioMarkedUnsupported();
+  TestD10Aes3AudioFlagged();
   TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
   TestMismatchedBitDepthMarksAudioUnsupported();
   TestNonPcmCodecMarksAudioUnsupported();

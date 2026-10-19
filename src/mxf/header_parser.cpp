@@ -397,20 +397,24 @@ void ValidateAndSummarizeAudio(MxfStreamInfo& info) {
   info.hasAudio = !info.audioTracks.empty();
   if (!info.hasAudio) return;
 
+  // The TrackNumber's first byte is the essence element's item type
+  // (SMPTE 379): 0x06 is an SDTI-CP sound item (D-10/IMX), whose PCM is
+  // AES3-packed (see AudioTrackInfo::aes3Packed). Only 16 and 24 bit occur
+  // there.
+  for (AudioTrackInfo& t : info.audioTracks) {
+    t.aes3Packed = t.trackNumber[0] == 0x06;
+    if (t.aes3Packed && ((t.bitsPerSample != 16 && t.bitsPerSample != 24) || t.channelCount > 8)) {
+      info.audioUnsupportedReason = "D-10/IMX AES3 audio with unexpected bit depth or more than 8 channels";
+      return;
+    }
+  }
+
   const AudioTrackInfo& first = info.audioTracks.front();
   uint32_t totalChannels = 0;
   for (const AudioTrackInfo& t : info.audioTracks) {
     totalChannels += t.channelCount;
     if (t.codec != CodecFamily::kPcm) {
       info.audioUnsupportedReason = "non-PCM audio codec not supported yet";
-      return;
-    }
-    // The TrackNumber's first byte is the essence element's item type
-    // (SMPTE 379). 0x06 is an SDTI-CP sound item (D-10/IMX, SMPTE 386): an
-    // AES3 element (SMPTE 331) with its own header and per-sample channel
-    // bits, not plain PCM. Reading it as PCM fails at the first audio read.
-    if (t.trackNumber[0] == 0x06) {
-      info.audioUnsupportedReason = "D-10/IMX AES3 audio (SDTI-CP sound element) not supported yet";
       return;
     }
     if (t.bitsPerSample != first.bitsPerSample) {

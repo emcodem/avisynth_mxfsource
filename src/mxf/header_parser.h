@@ -28,6 +28,12 @@ struct AudioTrackInfo {
   uint32_t sampleRate = 0;
   uint32_t bitsPerSample = 0;
   CodecFamily codec = CodecFamily::kUnknown;
+  // D-10/IMX SDTI-CP sound element (TrackNumber item type 0x06, SMPTE 386):
+  // the PCM samples are packed as SMPTE 331 AES3 data -- a 4-byte element
+  // header, then per sample frame 8 channel slots of one 32-bit
+  // little-endian word each, with the audio in bits 4-27 (channel number
+  // below, V/U/C/P bits above). See codec/pcm_interleave.h.
+  bool aes3Packed = false;
 };
 
 struct MxfStreamInfo {
