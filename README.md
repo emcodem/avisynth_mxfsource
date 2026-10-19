@@ -193,7 +193,10 @@ hard failure, and only under `"always"`.
 
 ### Strict mode
 
-`strict` (on by default) is meant for automated pipelines, where a file that
+**Strict mode is the default (`strict=true`).** Pass `strict=false` to open
+incomplete or damaged files on a best-effort basis.
+
+`strict` is meant for automated pipelines, where a file that
 is silently shorter than declared, or that takes minutes to open, is worse
 than an explicit error. With `strict=true`, `MxfSource()` fails at open time
 for files that are incomplete or damaged, and it never builds an index by
