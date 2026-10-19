@@ -169,6 +169,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
 | `use_audio` | string | `"supported"` | Audio fallback policy -- see below. |
+| `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
 
 ### Audio
 
@@ -189,6 +190,145 @@ depth or sample rate are treated as "unsupported audio", governed by
 A file with no audio at all never fails under any `use_audio` setting --
 only "audio present but not in a state this plugin can output" is ever a
 hard failure, and only under `"always"`.
+
+### Strict mode
+
+`strict` (on by default) is meant for automated pipelines, where a file that
+is silently shorter than declared, or that takes minutes to open, is worse
+than an explicit error. With `strict=true`, `MxfSource()` fails at open time
+for files that are incomplete or damaged, and it never builds an index by
+walking the whole file. With `strict=false` the plugin behaves as it did
+before strict mode existed (see [Without strict](#without-strict)).
+
+Strict mode only adds checks. It never changes how an intact file is
+parsed, indexed or decoded: a file that passes opens exactly as it would
+with `strict=false`.
+
+#### Terms
+
+- **Closed / Open partition:** byte 14 of a Partition Pack key (SMPTE
+  377-1). `0x03` Closed Incomplete and `0x04` Closed Complete count as
+  Closed; `0x01` Open Incomplete, `0x02` Open Complete and anything else
+  (e.g. `0x00` in pre-2004 files) count as not Closed.
+- **Valid partition:** a Partition Pack whose own `ThisPartition` field
+  equals the byte offset it was found at. A pointer into essence, garbage or
+  zero fill practically never passes this.
+- **Valid RIP:** a Random Index Pack parses at the end of the file, its
+  first entry is offset 0 and its last entry is a valid partition.
+- **Closed Footer:** a valid Footer Partition Pack with Closed status,
+  found through the Header Partition Pack's `FooterPartition` field or the
+  last entry of the RIP.
+- **Finished file:** a Closed Footer exists, *or else* the Header Partition
+  is Closed. The footer wins: a recorder that leaves the header Open but
+  writes a Closed Footer has finished the file, and the plugin already takes
+  Duration and the other metadata from the footer's copy in that case.
+- **Growing file:** not finished, i.e. Open header and no Closed Footer --
+  a recording still being written, or one that was aborted. Its Duration is
+  not final.
+- **Reachable index:** Index Table Segments in the Header Partition (e.g. a
+  CBR/CBG segment with `EditUnitByteCount`, which indexes every frame by
+  arithmetic) or in any partition listed in the RIP. Body Partitions that
+  are not in a RIP are never searched for.
+
+#### Checks, in order
+
+The first failing check ends the open with the message shown. Checks 1-3
+run right after the Header Metadata is parsed, before any index work, so a
+damaged file fails within a few small reads (well under a second over SMB,
+also for 100+ GB files).
+
+| # | Fails when | Applies to | Error starts with |
+|---|---|---|---|
+| 1 | The last 64 KiB of the file are all zero bytes. | every file | `strict: the file ends with N zero bytes (data ends at byte D of S)` |
+| 2 | The Header Partition is Closed, its `FooterPartition` field is nonzero, there is no valid Footer Partition Pack at that offset, no valid RIP and no Closed Footer. | Closed header | `strict: Header Partition is Closed and declares the Footer Partition at byte F, but the file is only S bytes; the file is truncated` (offset beyond EOF) or `... but there is no valid Footer Partition Pack there and no Random Index Pack` |
+| 3 | No Index Table Segment is reachable. | every file | `strict: no Index Table Segment found in the Header Partition or any partition listed in a Random Index Pack` |
+| 4 | The index covers fewer edit units than the file's Duration (SourcePackage Duration, including Origin pre-roll). | finished file | `strict: the file is finalized (Closed Partition) and declares N edit units, but the Index Table covers only M` |
+
+Every message ends with `(disable strict to open it anyway)`.
+
+Notes on the individual checks:
+
+1. **Zero tail.** A valid MXF file ends with a RIP or a Footer Partition,
+   never with zeros. Raw-zero KAG padding seen on real recorders stays
+   below 1 KiB, so 64 KiB (`kMaxExpectedTrailingZeroBytes`) leaves a wide
+   margin. This also fails growing files: a recorder that preallocated the
+   file with zeros is still incomplete. The decision costs one 64 KiB read;
+   only when it fails is the length of the zero run measured, by binary
+   search over 64 KiB blocks (about 21 reads for 100 GB), for the message.
+2. **Missing footer.** A Closed header promises a footer. A `FooterPartition`
+   of 0 (unknown) is not an error by itself, since the Footer Partition is
+   optional; such a file is still covered by checks 3 and 4. A valid RIP or a
+   Closed Footer found through the RIP overrides a wrong `FooterPartition`
+   field (seen on Omneon recordings).
+3. **No reachable index.** Without strict, the plugin then builds an index
+   by walking every KLV of the file (`BuildEssenceIndexFromBitstream`),
+   which takes minutes on large files over SMB. Strict never does that, for
+   any file, finished or growing. A growing file therefore opens in strict
+   mode only if it has a RIP or a CBR/CBG index in its Header Partition.
+4. **Short index.** Only for finished files. A growing file has no final
+   Duration and opens with the frames its Duration declares, as without
+   strict. Coverage is measured as the highest indexed edit unit + 1; gaps
+   inside the index are not checked.
+
+#### Decision overview
+
+| File | strict=true | strict=false |
+|---|---|---|
+| Finished, intact, index covers Duration | opens | opens |
+| Any file ending in > 64 KiB of zeros | fails (1) | opens; without a reachable index via the full-file scan |
+| Closed header, footer missing/beyond EOF, no RIP | fails (2) | opens via the full-file scan |
+| Finished, no reachable index | fails (3) | opens via the full-file scan |
+| Finished, index shorter than Duration | fails (4) | opens |
+| Growing, index reachable (RIP or CBR/CBG in Header Partition) | opens | opens |
+| Growing, no reachable index | fails (3) | opens via the full-file scan |
+
+#### What strict mode does not do
+
+- It does not repair or partially open damaged files. There is no recovery
+  of partitions that the RIP doesn't list, and no indexing of a last
+  partition whose index would have been in the missing footer.
+- It does not verify essence content (codec bitstream errors, frames cut
+  off in the middle are only found when decoding).
+- It does not affect the essence walk during playback. Skipping and
+  resyncing over KLV Fill and raw-zero padding between elements still
+  happens there as usual.
+- With `indexurl`, the fetched index replaces the local index build, so
+  check 3 does not apply; checks 1, 2 and 4 do.
+- `MxfExtractIndex` has no `strict` parameter. It still falls back to the
+  full-file scan when the file has no reachable index.
+
+#### Without strict
+
+`strict=false` keeps the previous best-effort behaviour: no integrity checks,
+the full-file bitstream scan when no index is reachable, and the frame count
+from the header Duration even when the index or the file is shorter.
+Opening such a file can take minutes on large files over SMB, and the clip
+can report more frames than the file really contains.
+
+#### Real-world examples
+
+From the 2026-10-16 scan of 1479 files on `SERVER/SHARE/...`, opened
+with `strict=true`:
+
+| File | Result |
+|---|---|
+| XDCAM HD422 / D10 recordings of 0.42, 2.06 and 126.6 GB with a zero-filled tail where the footer should be (> 60 s to open without strict) | fail with check 1 in < 0.5 s |
+| First 0.70 GB of a finished 1.75 GB file, cut off mid-frame (header says the footer is at byte 1748772352) | fails with check 2 in 0.2 s |
+| `klvfill_reprod - Kopie.mxf`: footer declared 590 KB beyond EOF | fails with check 2 in 0.2 s |
+| Intact 9.5 GB AVC-Intra file | opens, unchanged |
+| Header Open Incomplete, index reachable | opens |
+
+#### Implementation
+
+- `src/mxf/integrity.{h,cpp}`: `ProbeFileIntegrity()` (read-only probe:
+  partition statuses, Footer/RIP validity, zero tail) and
+  `CheckStrictIntegrity()` (checks 1 and 2).
+- `src/core/source_engine.cpp`, `SourceEngine::Open()`: runs the probe and
+  checks 3 and 4.
+- `src/core/options.h`: `OpenOptions::strict`.
+- Tests: `TestStrict*` in `tests/mxf_parser_tests/source_engine_test.cpp`.
+
+Changes to strict mode must update this section.
 
 ## Build
 
