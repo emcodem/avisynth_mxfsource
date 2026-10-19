@@ -18,7 +18,9 @@ namespace mxfsrc {
 // (avs_adapter.cpp, vs_adapter.cpp, core/) don't need FFmpeg's include path.
 class AvcodecDecoder final : public Decoder {
  public:
-  AvcodecDecoder(CodecFamily family, int width, int height);
+  // `codecTag`: AVCodecContext::codec_tag, 0 = none (see
+  // codec/decoder_factory.h's ProresCodecTag).
+  AvcodecDecoder(CodecFamily family, int width, int height, uint32_t codecTag = 0);
   ~AvcodecDecoder() override;
 
   bool SendAndReceive(const std::vector<uint8_t>& essenceData, NormalizedFrame& out) override;

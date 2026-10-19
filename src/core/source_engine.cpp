@@ -266,7 +266,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   }
 
   videoDecoder_ = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
-                                      static_cast<int>(streamInfo_.height));
+                                      static_cast<int>(streamInfo_.height), streamInfo_.pictureEssenceCoding);
   if (!videoDecoder_) return {OpenStatus::kUnsupportedCodec, "unsupported or unavailable video codec"};
 
   // Decide whether this file's audio is actually exposed. Never an error
@@ -571,7 +571,7 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   if (!freshReader.IsOpen()) return nullptr;
 
   auto freshDecoder = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
-                                          static_cast<int>(streamInfo_.height));
+                                          static_cast<int>(streamInfo_.height), streamInfo_.pictureEssenceCoding);
   if (!freshDecoder) return nullptr;
 
   auto frame = std::make_shared<NormalizedFrame>();

@@ -37,6 +37,9 @@ PixelFormat FromAvPixFmt(int fmt) {
     case AV_PIX_FMT_YUV422P: return PixelFormat::kYuv422p8;
     case AV_PIX_FMT_YUV420P10LE: return PixelFormat::kYuv420p10;
     case AV_PIX_FMT_YUV422P10LE: return PixelFormat::kYuv422p10;
+    case AV_PIX_FMT_YUV422P12LE: return PixelFormat::kYuv422p12;
+    case AV_PIX_FMT_YUV444P10LE: return PixelFormat::kYuv444p10;
+    case AV_PIX_FMT_YUV444P12LE: return PixelFormat::kYuv444p12;
     default: return PixelFormat::kUnknown;
   }
 }
@@ -97,7 +100,8 @@ bool AvcodecDecoder::ReceiveOneFrame(NormalizedFrame& out) {
   return true;
 }
 
-AvcodecDecoder::AvcodecDecoder(CodecFamily family, int width, int height) : impl_(std::make_unique<Impl>()) {
+AvcodecDecoder::AvcodecDecoder(CodecFamily family, int width, int height, uint32_t codecTag)
+    : impl_(std::make_unique<Impl>()) {
   const AVCodecID id = ToAvCodecId(family);
   if (id == AV_CODEC_ID_NONE) return;
   const AVCodec* codec = avcodec_find_decoder(id);
@@ -107,6 +111,7 @@ AvcodecDecoder::AvcodecDecoder(CodecFamily family, int width, int height) : impl
   if (!impl_->ctx) return;
   impl_->ctx->width = width;
   impl_->ctx->height = height;
+  impl_->ctx->codec_tag = codecTag;
   // Without this, AVCodecContext defaults to single-threaded decode --
   // ffmpeg's own CLI opens codecs with auto-detected frame+slice threading
   // (its default "-threads 0"), and skipping that here cost roughly an

@@ -50,6 +50,15 @@ bool MapPixelFormat(PixelFormat fmt, int& pixelType, bool& isPackedUyvy) {
     case PixelFormat::kYuv422p10:
       pixelType = VideoInfo::CS_YUV422P10;
       return true;
+    case PixelFormat::kYuv422p12:
+      pixelType = VideoInfo::CS_YUV422P12;
+      return true;
+    case PixelFormat::kYuv444p10:
+      pixelType = VideoInfo::CS_YUV444P10;
+      return true;
+    case PixelFormat::kYuv444p12:
+      pixelType = VideoInfo::CS_YUV444P12;
+      return true;
     default:
       return false;
   }

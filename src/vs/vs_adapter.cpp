@@ -69,6 +69,20 @@ bool MapPixelFormat(PixelFormat fmt, VSCore* core, const VSAPI* vsapi, FormatInf
       subH = 0;
       out.bytesPerSample = 2;
       break;
+    case PixelFormat::kYuv422p12:
+      bitsPerSample = 12;
+      subW = 1;
+      subH = 0;
+      out.bytesPerSample = 2;
+      break;
+    case PixelFormat::kYuv444p10:
+      bitsPerSample = 10;
+      out.bytesPerSample = 2;
+      break;
+    case PixelFormat::kYuv444p12:
+      bitsPerSample = 12;
+      out.bytesPerSample = 2;
+      break;
     default:
       return false;
   }

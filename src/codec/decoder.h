@@ -11,6 +11,9 @@ enum class PixelFormat {
   kYuv422p8,
   kYuv420p10,
   kYuv422p10,
+  kYuv422p12,  // DNxHR HQX 12-bit
+  kYuv444p10,  // DNxHR 444 10-bit
+  kYuv444p12,  // DNxHR 444 12-bit, ProRes 4444 (XQ) without alpha
   kUyvy422,  // packed, single plane -- e.g. raw uncompressed essence
 };
 

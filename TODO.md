@@ -23,7 +23,9 @@ engineering task:
   every frame decodes correctly. Found (but did not fix) a real gap: we
   never set `codec_tag`/extradata, so avcodec logs `Unknown prores profile
   0` on every decoder init. Decode output looks correct regardless (ProRes
-  self-describes enough per-frame), but item 3's "verify" task remains open
+  self-describes enough per-frame) -- **fixed 2026-10-19**: the codec tag
+  now comes from the PictureEssenceCoding UL (`ProresCodecTag`), which also
+  made 4444 profiles decode at 12 instead of 10 bit -- but item 3's "verify" task remains open
   for anything beyond this one real sample, and there's still no committed
   regression test for ProRes decode (see item 3 below).
 - **D-10/IMX**: verified against a real 234MB Bremer-Test D-10 IMX50 file --
