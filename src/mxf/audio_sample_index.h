@@ -97,10 +97,12 @@ class AudioSampleIndex {
 // like any other unsupported-audio condition) unless ALL of the following
 // hold:
 //   - videoIndex is non-empty
-//   - videoIndex.GetEntries().size() == rawFrameCount, with the first
-//     entry's editUnit == 0 and the last's == rawFrameCount-1 (entries are
-//     sorted-ascending-and-unique-by-editUnit, so this alone proves full
-//     contiguous coverage of [0, rawFrameCount) with no gaps)
+//   - videoIndex.GetEntries().size() >= rawFrameCount, with entry 0's
+//     editUnit == 0 and entry rawFrameCount-1's == rawFrameCount-1 (entries
+//     are sorted-ascending-and-unique-by-editUnit, so this alone proves full
+//     contiguous coverage of [0, rawFrameCount) with no gaps). Entries past
+//     rawFrameCount (essence longer than the SourcePackage Duration) are
+//     ignored.
 //   - streamInfo.editRate.num > 0 and streamInfo.audioSampleRate > 0
 std::optional<AudioSampleIndex> BuildAudioSampleIndexFromIndexTable(const EssenceIndex& videoIndex,
                                                                      const MxfStreamInfo& streamInfo,

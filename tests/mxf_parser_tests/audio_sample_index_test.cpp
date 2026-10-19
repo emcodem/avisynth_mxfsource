@@ -117,6 +117,39 @@ void TestTooFewEntriesReturnsNullopt() {
   CHECK(!index.has_value());
 }
 
+// The index covers more edit units than rawFrameCount: real files carry
+// essence past their SourcePackage Duration (observed: 628 indexed frames,
+// Duration 615 with Origin 12, audio was dropped). Builds over
+// [0, rawFrameCount) only.
+void TestMoreEntriesThanRawFrameCountBuilds() {
+  EssenceIndex videoIndex(MakeContiguousEntries(13));
+
+  MxfStreamInfo info;
+  info.editRate = Rational{25, 1};
+  info.audioSampleRate = 48000;
+
+  auto index = BuildAudioSampleIndexFromIndexTable(videoIndex, info, /*rawFrameCount=*/10);
+  CHECK(index.has_value());
+  if (index) {
+    CHECK(index->NumEditUnits() == 10);
+    CHECK(index->TotalSamples() == 10 * 1920);
+  }
+}
+
+// More entries than rawFrameCount, but with a gap inside [0, rawFrameCount)
+// (edit unit 5 missing): still nullopt.
+void TestMoreEntriesWithGapInsideRangeReturnsNullopt() {
+  std::vector<FlatIndexEntry> entries = MakeContiguousEntries(13);
+  entries.erase(entries.begin() + 5);
+  EssenceIndex videoIndex(entries);
+
+  MxfStreamInfo info;
+  info.editRate = Rational{25, 1};
+  info.audioSampleRate = 48000;
+
+  CHECK(!BuildAudioSampleIndexFromIndexTable(videoIndex, info, /*rawFrameCount=*/10).has_value());
+}
+
 // Same entry count as rawFrameCount, but the covered range doesn't start at
 // editUnit 0 -- e.g. an Index Table Segment for a later BodySID range or a
 // dropped leading segment. Must not be mistaken for full coverage just
@@ -169,6 +202,8 @@ int main() {
   TestIntegerCadenceBuildsCorrectly();
   TestNtscCadenceReproducesExpectedPattern();
   TestTooFewEntriesReturnsNullopt();
+  TestMoreEntriesThanRawFrameCountBuilds();
+  TestMoreEntriesWithGapInsideRangeReturnsNullopt();
   TestEntriesNotStartingAtZeroReturnsNullopt();
   TestEmptyIndexReturnsNullopt();
   TestInvalidRateMetadataReturnsNullopt();

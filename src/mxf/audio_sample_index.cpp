@@ -45,11 +45,16 @@ std::optional<AudioSampleIndex> BuildAudioSampleIndexFromIndexTable(const Essenc
 
   const std::vector<FlatIndexEntry>& entries = videoIndex.GetEntries();
   // Entries are sorted ascending & unique by editUnit (EssenceIndex's own
-  // invariant) -- so matching both the count and the first/last editUnit
-  // against [0, rawFrameCount) alone proves full contiguous coverage, no
-  // gaps, with no per-element loop needed.
-  if (static_cast<int64_t>(entries.size()) != rawFrameCount) return std::nullopt;
-  if (entries.front().editUnit != 0 || entries.back().editUnit != rawFrameCount - 1) return std::nullopt;
+  // invariant) -- so entry 0 being edit unit 0 and entry rawFrameCount-1
+  // being edit unit rawFrameCount-1 alone proves full contiguous coverage
+  // of [0, rawFrameCount), no gaps, with no per-element loop needed. The
+  // index may cover more: real files carry essence past their
+  // SourcePackage Duration (observed: 628 indexed frames, Duration 615 with
+  // Origin 12); those edit units are never exposed, so they don't matter.
+  if (static_cast<int64_t>(entries.size()) < rawFrameCount) return std::nullopt;
+  if (entries.front().editUnit != 0 || entries[static_cast<size_t>(rawFrameCount) - 1].editUnit != rawFrameCount - 1) {
+    return std::nullopt;
+  }
 
   AudioSampleIndex index;
   index.editUnitByteOffset_.resize(static_cast<size_t>(rawFrameCount));
