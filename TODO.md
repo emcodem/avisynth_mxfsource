@@ -445,3 +445,15 @@ covers a forward jump but apparently not this access pattern).
 
 Not investigated yet: whether the cause is the jump distance, the
 end-of-stream position, or the access pattern of AviSynth's `Trim`.
+
+### D-10/IMX AES3 audio (SDTI-CP sound element)
+
+D-10/IMX files carry their sound as SDTI-CP sound items (TrackNumber item
+type 0x06, SMPTE 386): AES3 elements (SMPTE 331) with an element header and
+per-sample channel/validity bits, not plain PCM. Since 2026-10-19 they are
+reported as unsupported audio (`use_audio` decides: video-only or fail).
+Supporting them needs an AES3 unpacker in the audio path, like ffmpeg's
+`mxf_get_d10_aes3_packet`. 4 files of the 2026-10-16 scan, e.g.
+`SERVER/SHARE/...`
+(8 channels, 24-bit; ffmpeg decodes it as pcm_s24le). Related: item 1 of
+Phase 7 (IMX/D-10 padding stripping).
