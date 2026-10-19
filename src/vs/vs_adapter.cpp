@@ -414,7 +414,11 @@ void VS_CC CreateMxfExtractIndex(const VSMap* in, VSMap* out, void* /*userData*/
   int httpHeadersErr = 0;
   const char* httpHeaders = vsapi->mapGetData(in, "httpheaders", 0, &httpHeadersErr);
 
-  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders);
+  int strictErr = 0;
+  const int64_t strictArg = vsapi->mapGetInt(in, "strict", 0, &strictErr);
+  const bool strict = strictErr ? true : (strictArg != 0);
+  const ExtractIndexResult result =
+      ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders, strict);
   if (!result.ok) {
     vsapi->mapSetError(out, ("MxfExtractIndex: " + result.error).c_str());
     return;
@@ -437,6 +441,6 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
       // return type spec is fixed for the plugin's whole lifetime, not
       // per-invocation.
       "clip:vnode;audio:anode;", CreateMxfSource, nullptr, plugin);
-  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;", "result:int;",
+  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;strict:int:opt;", "result:int;",
                             CreateMxfExtractIndex, nullptr, plugin);
 }

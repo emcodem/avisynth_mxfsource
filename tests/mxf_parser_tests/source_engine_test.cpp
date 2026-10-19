@@ -16,9 +16,11 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
+#include "core/index_extract.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
 #include "mxf/index_table.h"
+#include "mxf/index_transport.h"
 #include "mxf/integrity.h"
 #include "synthetic_mxf.h"
 
@@ -2210,6 +2212,91 @@ void TestStrictTreatsClosedFooterAsFinished() {
   CHECK(res.status == OpenStatus::kOk);
 }
 
+// MxfExtractIndex must accept and refuse exactly the files MxfSource does,
+// with the same message, for strict on and off -- otherwise a distributed
+// setup (extract once, indexurl everywhere) would bypass strict. When both
+// accept, the published index must cover what the opened source's index
+// covers. Every strict scenario of the tests above.
+void TestExtractIndexAgreesWithOpenForEveryStrictCase() {
+  std::vector<std::pair<const char*, StrictTestFileSpec>> cases;
+  auto add = [&](const char* name, auto&& tweak) {
+    StrictTestFileSpec spec;
+    tweak(spec);
+    cases.push_back({name, spec});
+  };
+  add("intact", [](StrictTestFileSpec&) {});
+  add("zero tail", [](StrictTestFileSpec& s) {
+    s.footer = false;
+    s.rip = false;
+    s.zeroTailBytes = 200000;
+  });
+  add("footer beyond EOF", [](StrictTestFileSpec& s) {
+    s.footer = false;
+    s.rip = false;
+    s.footerPointerOverride = 1u << 30;
+  });
+  add("footer pointer into metadata", [](StrictTestFileSpec& s) {
+    s.footer = false;
+    s.rip = false;
+    s.footerPointerOverride = 200;
+  });
+  add("bad footer pointer, valid RIP", [](StrictTestFileSpec& s) { s.footerPointerOverride = 200; });
+  add("no index", [](StrictTestFileSpec& s) { s.indexedFrames = 0; });
+  add("short index", [](StrictTestFileSpec& s) { s.indexedFrames = 2; });
+  add("growing, RIP index", [](StrictTestFileSpec& s) {
+    s.headerClosed = false;
+    s.footer = false;
+    s.indexedFrames = 2;
+  });
+  add("growing, CBR index in header", [](StrictTestFileSpec& s) {
+    s.headerClosed = false;
+    s.footer = false;
+    s.rip = false;
+    s.cbrIndexInHeader = true;
+  });
+  add("growing, no reachable index", [](StrictTestFileSpec& s) {
+    s.headerClosed = false;
+    s.footer = false;
+    s.rip = false;
+  });
+  add("open header, Closed Footer, short index", [](StrictTestFileSpec& s) {
+    s.headerClosed = false;
+    s.indexedFrames = 2;
+  });
+
+  for (const auto& [name, spec] : cases) {
+    for (bool strict : {true, false}) {
+      auto path = WriteTempFile(BuildStrictTestFile(spec), "mxfsrc_test_extract_parity.mxf");
+      const std::string target = path.string() + ".index.json";
+      OpenResult opened;
+      int64_t openedHighest = -1;
+      {
+        SourceEngine engine;
+        OpenOptions opts;
+        opts.strict = strict;
+        opened = engine.Open(path.string(), opts);
+        openedHighest = engine.EssenceIndexHighestEditUnit();
+      }
+      const ExtractIndexResult extracted = ExtractAndPublishIndex(path.string(), target, "", strict);
+      const bool same = extracted.ok == (opened.status == OpenStatus::kOk) &&
+                        (extracted.ok || extracted.error == opened.error);
+      if (!same) {
+        std::cerr << "extract/open disagree for '" << name << "' strict=" << strict << ": open='" << opened.error
+                  << "' extract='" << extracted.error << "'" << std::endl;
+      }
+      CHECK(same);
+      if (extracted.ok) {
+        auto fetched = FetchEssenceIndex(target, /*expectedBodySid=*/1, std::filesystem::file_size(path), nullptr);
+        CHECK(fetched.has_value());
+        if (fetched) CHECK(fetched->HighestCoveredEditUnit() == openedHighest);
+      }
+      std::error_code ec;
+      std::filesystem::remove(target, ec);
+      std::filesystem::remove(path);
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -2253,6 +2340,7 @@ int main() {
   TestStrictFailsGrowingFileWithoutReachableIndex();
   TestStrictFailsZeroTailWithOpenHeader();
   TestStrictTreatsClosedFooterAsFinished();
+  TestExtractIndexAgreesWithOpenForEveryStrictCase();
 
   if (g_failures == 0) {
     std::cout << "all source_engine tests passed" << std::endl;

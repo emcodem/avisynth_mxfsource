@@ -92,6 +92,8 @@ add_library(mxf_core STATIC
   src/core/options.h
   src/core/use_audio_mode.h
   src/core/index_extract.cpp
+  src/core/index_policy.cpp
+  src/core/index_policy.h
   src/core/index_extract.h
   src/core/source_engine.cpp
   src/core/source_engine.h

@@ -10,10 +10,9 @@
 #include <vector>
 
 #include "codec/decoder_factory.h"
-#include "mxf/bitstream_index.h"
+#include "core/index_policy.h"
 #include "mxf/file_open.h"
 #include "mxf/index_transport.h"
-#include "mxf/integrity.h"
 #include "mxf/ul_tables.h"
 
 namespace mxfsrc {
@@ -154,19 +153,11 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
 
   // OpenOptions::strict: read-only checks, run before the index build so a
   // damaged file fails in a few reads instead of first paying for a
-  // full-file bitstream scan.
-  // strictFinished: the writer declared the file finished (Closed Footer,
-  // or else Closed header), so its Duration is final and the index must
-  // cover it.
-  bool strictFinished = false;
-  if (options.strict) {
-    if (std::optional<FileIntegrity> integrity = ProbeFileIntegrity(*reader_)) {
-      if (std::optional<std::string> error = CheckStrictIntegrity(*integrity)) {
-        return {OpenStatus::kDamagedFile, *error};
-      }
-      strictFinished = integrity->Finished();
-    }
-  }
+  // full-file bitstream scan. Same functions, same order as MxfExtractIndex
+  // (core/index_policy.h), so both accept and refuse the same files.
+  const IntegrityCheckResult integrity = CheckIntegrityBeforeIndex(*reader_, options.strict);
+  if (integrity.error) return {OpenStatus::kDamagedFile, *integrity.error};
+  if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
 
   // Override whatever ResolvePackage's generic first-package-wins loop
   // produced for numFrames with the SourcePackage-authoritative formula
@@ -193,39 +184,22 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
       return {OpenStatus::kParseError, "failed to fetch shared index from '" + options.index_url + "': " + indexError};
     }
   } else {
-    // Best-effort, and never written to disk (see MxfExtractIndex for the
-    // separate host function that does that): absent/failed index building
-    // degrades silently to videoIndex_ staying nullopt, which SeekAndDecode
-    // already treats as "no index available, use the
-    // from-essence-element-0 fallback" -- never a hard Open() failure.
-    videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
-    if ((!videoIndex_ || videoIndex_->Empty()) && options.strict) {
-      // Strict never builds an index by walking the whole file, finished or
-      // not: a growing file opens only if its index is reachable directly
-      // (Header Partition, e.g. a CBR/CBG segment, or partitions listed in
-      // the RIP).
-      return {OpenStatus::kDamagedFile,
-              "strict: no Index Table Segment found in the Header Partition or any partition listed in a Random "
-              "Index Pack; opening the file would need a full-file bitstream scan (disable strict to open it "
-              "anyway)"};
-    }
-    if ((!videoIndex_ || videoIndex_->Empty())) {
-      // No real SMPTE Index Table Segment at all (e.g. a truncated file
-      // with no RIP/footer) -- try recovering a fallback index straight
-      // from the essence's own bitstream headers (mxf/bitstream_index.h),
-      // still best-effort: an unsupported codec or no video elements at
-      // all just leaves videoIndex_ unset, same as today.
-      if (auto fallback = BuildEssenceIndexFromBitstream(*reader_, streamInfo_)) {
-        if (!fallback->Empty()) {
-          AppendLogLine("[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
-                        "bitstream headers (" + std::to_string(fallback->GetEntries().size()) + " edit units)");
-          videoIndex_ = std::move(fallback);
-        }
+    // Never written to disk (see MxfExtractIndex for the separate host
+    // function that does that, through the same BuildVideoIndex). Without
+    // strict, a file with no index at all leaves videoIndex_ unset, which
+    // SeekAndDecode treats as "no index available, use the
+    // from-essence-element-0 fallback".
+    VideoIndexResult built = BuildVideoIndex(*reader_, path_, httpHeaders_, streamInfo_, options.strict);
+    if (built.error) return {OpenStatus::kDamagedFile, *built.error};
+    if (built.index && !built.index->Empty()) {
+      if (built.fromBitstreamScan) {
+        AppendLogLine("[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
+                      "bitstream headers (" + std::to_string(built.index->GetEntries().size()) + " edit units)");
       }
+      videoIndex_ = std::move(built.index);
     }
   }
 
-  if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
   if (streamInfo_.numFrames < 0) {
     if (videoIndex_ && !videoIndex_->Empty()) {
       // Natural fallback win: an Index Table Segment's own covered range
@@ -245,12 +219,10 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   // override, or the Index Table fallback above), so this is safe to derive.
   const int64_t rawFrameCount = originSkip_ + streamInfo_.numFrames;
 
-  if (strictFinished && videoIndex_ && videoIndex_->HighestCoveredEditUnit() + 1 < rawFrameCount) {
-    return {OpenStatus::kDamagedFile,
-            "strict: the file is finalized (Closed Partition) and declares " + std::to_string(rawFrameCount) +
-                " edit units, but the Index Table covers only " +
-                std::to_string(videoIndex_->HighestCoveredEditUnit() + 1) +
-                "; the file is incomplete or damaged (disable strict to open it anyway)"};
+  if (videoIndex_) {
+    if (std::optional<std::string> error = CheckIndexCoverage(*videoIndex_, streamInfo_, integrity.finished)) {
+      return {OpenStatus::kDamagedFile, *error};
+    }
   }
 
   // OpenOptions::start_frame_hint: see its own doc comment. Clamp/ignore

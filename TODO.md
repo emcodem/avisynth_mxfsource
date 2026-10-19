@@ -494,8 +494,6 @@ only runs with `strict=false`.
 
 - ProRes 4444 with alpha (`yuva444p10/12`) has no output mapping; no file in
   the corpus uses it.
-- `MxfExtractIndex` has no `strict` parameter and still falls back to the
-  full-file bitstream scan.
 - `EnumeratePartitionsForIndex` finds partitions only via offset 0 and the
   RIP, not via the header's `FooterPartition` pointer. A file without a RIP
   whose index is only in the Footer would get no index. No such file in the

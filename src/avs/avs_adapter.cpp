@@ -253,8 +253,9 @@ AVSValue __cdecl CreateMxfExtractIndex(AVSValue args, void* /*user_data*/, IScri
   const char* targetUrl = args[1].AsString(nullptr);
   if (!targetUrl || !*targetUrl) env->ThrowError("MxfExtractIndex: a target URL/path is required");
   const char* httpHeaders = args[2].AsString("");
+  const bool strict = args[3].AsBool(true);
 
-  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders);
+  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders, strict);
   if (!result.ok) env->ThrowError("MxfExtractIndex: %s", result.error.c_str());
 
   return AVSValue(true);
@@ -278,6 +279,6 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
       "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
       "[indexurl]s[start_frame]i[strict]b",
       CreateMxfSource, nullptr);
-  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s", CreateMxfExtractIndex, nullptr);
+  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b", CreateMxfExtractIndex, nullptr);
   return "MXF forward-only source plugin";
 }

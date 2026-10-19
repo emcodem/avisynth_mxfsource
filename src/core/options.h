@@ -125,6 +125,9 @@ struct OpenOptions {
   //     An unfinished (growing/aborted) recording has no final Duration, so
   //     it opens with whatever its index covers.
   // On by default. Exposed to scripts as MxfSource(..., strict=true/false).
+  // MxfExtractIndex takes the same parameter with the same meaning; both go
+  // through core/index_policy.h, which is where every one of these
+  // decisions lives.
   // Full user-facing description: README.md, "Strict mode" -- keep it in
   // sync with any change here or in mxf/integrity.h.
   bool strict = true;

@@ -193,12 +193,18 @@ r = core.mxfsource.MxfSource("file.mxf")
 clip = r if isinstance(r, vs.VideoNode) else r["clip"]
 ```
 
-`MxfExtractIndex(file, targeturl, httpheaders="")` (both hosts) builds the
-essence index of `file` and publishes it as JSON to `targeturl` (local path
-or `http(s)://` URL, written with PUT), for `MxfSource(..., indexurl=...)`
-on other machines that read a byte-identical copy of the same file. It has
-no `strict` parameter and still falls back to the full-file bitstream scan
-when the file has no reachable index.
+`MxfExtractIndex(file, targeturl, httpheaders="", strict=true)` (both hosts;
+`strict` is an int in VapourSynth) builds the essence index of `file` and
+publishes it as JSON to `targeturl` (local path or `http(s)://` URL, written
+with PUT), for `MxfSource(..., indexurl=...)` on other machines that read a
+byte-identical copy of the same file. It checks the file and builds the
+index with exactly the same code as `MxfSource` (`src/core/index_policy.h`),
+so with the same `strict` setting it refuses exactly the files `MxfSource`
+refuses, with the same message, and never publishes an index for a file
+`MxfSource` wouldn't open. The one inherent difference: without strict,
+`MxfSource` can still open a file for which no index can be built at all
+(it then decodes from the start), while `MxfExtractIndex` has nothing to
+publish and fails.
 
 ### File paths and URLs
 
@@ -273,7 +279,9 @@ hard failure, and only under `"always"`.
 ### Strict mode
 
 **Strict mode is the default (`strict=true`).** Pass `strict=false` to open
-incomplete or damaged files on a best-effort basis.
+incomplete or damaged files on a best-effort basis. Everything below applies
+identically to `MxfSource` and `MxfExtractIndex`: both run the same checks
+in the same order and fail with the same messages.
 
 `strict` is meant for automated pipelines, where a file that
 is silently shorter than declared, or that takes minutes to open, is worse
@@ -376,8 +384,6 @@ Notes on the individual checks:
   happens there as usual.
 - With `indexurl`, the fetched index replaces the local index build, so
   check 3 does not apply; checks 1, 2 and 4 do.
-- `MxfExtractIndex` has no `strict` parameter. It still falls back to the
-  full-file scan when the file has no reachable index.
 
 #### Without strict
 
@@ -406,10 +412,18 @@ with `strict=true`:
 - `src/mxf/integrity.{h,cpp}`: `ProbeFileIntegrity()` (read-only probe:
   partition statuses, Footer/RIP validity, zero tail) and
   `CheckStrictIntegrity()` (checks 1 and 2).
-- `src/core/source_engine.cpp`, `SourceEngine::Open()`: runs the probe and
-  checks 3 and 4.
-- `src/core/options.h`: `OpenOptions::strict`.
-- Tests: `TestStrict*` in `tests/mxf_parser_tests/source_engine_test.cpp`.
+- `src/core/index_policy.{h,cpp}`: the shared sequence both `MxfSource`
+  (`SourceEngine::Open()`) and `MxfExtractIndex` (`ExtractAndPublishIndex()`)
+  run, in this order: `CheckIntegrityBeforeIndex()` (checks 1 and 2),
+  `BuildVideoIndex()` (check 3, no bitstream scan under strict),
+  `CheckIndexCoverage()` (check 4). Neither caller may implement any of
+  these decisions on its own.
+- `src/core/options.h`: `OpenOptions::strict`; `ExtractAndPublishIndex`'s
+  `strict` parameter.
+- Tests: `TestStrict*` and `TestExtractIndexAgreesWithOpenForEveryStrictCase`
+  (same verdict and message from both entry points for every strict
+  scenario, strict on and off) in
+  `tests/mxf_parser_tests/source_engine_test.cpp`.
 
 Changes to strict mode must update this section.
 
