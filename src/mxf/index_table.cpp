@@ -247,7 +247,7 @@ std::vector<IndexTableSegment> ScanPartitionForIndexSegments(MxfReader& reader, 
       // file content (e.g. essence bytes, which also start with the same
       // UL designator).
       if (!reader.Seek(klvStart + 1)) break;
-      if (!ResyncToUlDesignator(reader) || reader.Tell() >= rangeEnd) break;
+      if (!ResyncToUlDesignator(reader, rangeEnd)) break;
       continue;
     }
 

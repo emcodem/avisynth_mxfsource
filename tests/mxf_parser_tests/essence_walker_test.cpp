@@ -3,6 +3,7 @@
 // appends a Body Partition containing video essence elements interspersed
 // with KLV Fill and an essence element from an untracked track, to verify
 // EssenceWalker's forward-only skip logic.
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 
@@ -330,7 +331,102 @@ void TestBoundedPrefixReadSkipsRemainder() {
 
 }  // namespace
 
+// In-memory IByteSource that counts ReadBytes calls, to check that
+// ResyncToUlDesignator reads in blocks instead of byte by byte.
+class CountingByteSource : public IByteSource {
+ public:
+  explicit CountingByteSource(std::vector<uint8_t> data) : data_(std::move(data)) {}
+  bool IsOpen() const override { return true; }
+  uint64_t Tell() const override { return pos_; }
+  bool Seek(uint64_t pos) override {
+    if (pos > data_.size()) return false;
+    pos_ = pos;
+    return true;
+  }
+  uint64_t Size() const override { return data_.size(); }
+  bool ReadBytes(void* dst, size_t n) override {
+    ++reads_;
+    if (pos_ + n > data_.size()) return false;
+    std::memcpy(dst, data_.data() + pos_, n);
+    pos_ += n;
+    return true;
+  }
+  bool Skip(uint64_t n) override { return Seek(pos_ + n); }
+  std::string LastError() const override { return {}; }
+  int reads_ = 0;
+
+ private:
+  std::vector<uint8_t> data_;
+  uint64_t pos_ = 0;
+};
+
+std::vector<uint8_t> ZerosWithDesignatorAt(size_t size, size_t at) {
+  std::vector<uint8_t> data(size, 0);
+  const uint8_t designator[4] = {0x06, 0x0e, 0x2b, 0x34};
+  std::memcpy(data.data() + at, designator, 4);
+  return data;
+}
+
+// Returns where ResyncToUlDesignator left the reader, or -1 if it failed.
+int64_t ResyncFrom(std::vector<uint8_t> data, uint64_t start, uint64_t limit = UINT64_MAX, int* readsOut = nullptr) {
+  auto source = std::make_unique<CountingByteSource>(std::move(data));
+  CountingByteSource* counter = source.get();
+  MxfReader reader(std::move(source));
+  if (!reader.Seek(start)) return -2;
+  const bool found = ResyncToUlDesignator(reader, limit);
+  if (readsOut) *readsOut = counter->reads_;
+  return found ? static_cast<int64_t>(reader.Tell()) : -1;
+}
+
+// A designator split across the first two read blocks (4 KiB, overlapping
+// by 3 bytes) is found at every split point, as is one just before.
+void TestResyncFindsDesignatorAcrossBlockBoundary() {
+  for (size_t at : {size_t{4092}, size_t{4093}, size_t{4094}, size_t{4095}, size_t{4096}}) {
+    CHECK(ResyncFrom(ZerosWithDesignatorAt(16384, at), 0) == static_cast<int64_t>(at));
+  }
+}
+
+// The search starts at the current position, ignores earlier hits, and
+// fails cleanly when nothing follows.
+void TestResyncStartsAtCurrentPositionAndFailsAtEof() {
+  std::vector<uint8_t> data = ZerosWithDesignatorAt(200, 5);
+  const uint8_t designator[4] = {0x06, 0x0e, 0x2b, 0x34};
+  std::memcpy(data.data() + 50, designator, 4);
+  CHECK(ResyncFrom(data, 0) == 5);
+  CHECK(ResyncFrom(data, 6) == 50);
+  CHECK(ResyncFrom(data, 51) == -1);
+  CHECK(ResyncFrom(std::vector<uint8_t>(3, 0x06), 0) == -1);  // shorter than a designator
+  // A lone 0x06 0x0e 0x2b without the 0x34 is no match.
+  std::vector<uint8_t> partial(100, 0);
+  partial[40] = 0x06;
+  partial[41] = 0x0e;
+  partial[42] = 0x2b;
+  CHECK(ResyncFrom(partial, 0) == -1);
+}
+
+// `limit`: a hit must start before it; one starting at limit-1 counts even
+// though it extends past.
+void TestResyncHonoursLimit() {
+  std::vector<uint8_t> data = ZerosWithDesignatorAt(10000, 100);
+  CHECK(ResyncFrom(data, 0, /*limit=*/100) == -1);
+  CHECK(ResyncFrom(data, 0, /*limit=*/101) == 100);
+  CHECK(ResyncFrom(data, 0, /*limit=*/9000) == 100);
+}
+
+// 3 MiB of zeros before the next key (real case: zero-filled tails and
+// preallocated regions) costs a handful of block reads, not one per byte.
+void TestResyncOverLongZeroRunUsesFewReads() {
+  const size_t at = 3 * 1024 * 1024 + 7;
+  int reads = 0;
+  CHECK(ResyncFrom(ZerosWithDesignatorAt(at + 100, at), 0, UINT64_MAX, &reads) == static_cast<int64_t>(at));
+  CHECK(reads <= 16);
+}
+
 int main() {
+  TestResyncFindsDesignatorAcrossBlockBoundary();
+  TestResyncStartsAtCurrentPositionAndFailsAtEof();
+  TestResyncHonoursLimit();
+  TestResyncOverLongZeroRunUsesFewReads();
   TestWalksVideoElementsInOrderSkippingOthers();
   TestNoBodyPartitionEssenceFollowsHeaderDirectly();
   TestSkipsNonCompliantZeroBytePadding();

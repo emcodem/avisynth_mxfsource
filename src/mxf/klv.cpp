@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <vector>
 
 #include "mxf/file_byte_source.h"
 #include "net/http_byte_source.h"
@@ -115,21 +116,39 @@ constexpr uint8_t kUlDesignator[4] = {0x06, 0x0e, 0x2b, 0x34};
 
 bool LooksLikeKlvKey(const Ul& key) { return std::memcmp(key.data(), kUlDesignator, sizeof(kUlDesignator)) == 0; }
 
-bool ResyncToUlDesignator(MxfReader& reader) {
-  uint8_t window[4] = {};
-  size_t have = 0;
-  while (reader.Tell() < reader.Size()) {
-    uint8_t b = 0;
-    if (!reader.ReadU8(b)) return false;
-    if (have < 4) {
-      window[have++] = b;
-    } else {
-      window[0] = window[1];
-      window[1] = window[2];
-      window[2] = window[3];
-      window[3] = b;
+bool ResyncToUlDesignator(MxfReader& reader, uint64_t limit) {
+  // Raw padding is usually well under 1 KiB, so the first small block
+  // normally finds the next key; long garbage or zero runs quickly reach
+  // the large block size. Consecutive blocks overlap by 3 bytes so a
+  // designator split across two blocks is still found.
+  constexpr size_t kFirstBlock = 4 * 1024;
+  constexpr size_t kMaxBlock = 1024 * 1024;
+  constexpr size_t kOverlap = sizeof(kUlDesignator) - 1;
+
+  const uint64_t size = reader.Size();
+  // A designator starting at limit-1 may extend up to 3 bytes past it.
+  const uint64_t scanEnd = limit >= size ? size : std::min(size, limit + kOverlap);
+  uint64_t pos = reader.Tell();
+  size_t blockSize = kFirstBlock;
+  std::vector<uint8_t> buf;
+  while (pos + sizeof(kUlDesignator) <= scanEnd) {
+    const size_t n = static_cast<size_t>(std::min<uint64_t>(blockSize, scanEnd - pos));
+    buf.resize(n);
+    if (!reader.Seek(pos) || !reader.ReadBytes(buf.data(), n)) return false;
+
+    const uint8_t* const begin = buf.data();
+    const uint8_t* const last = begin + n - sizeof(kUlDesignator);  // last possible match start
+    for (const uint8_t* p = begin; p <= last; ++p) {
+      p = static_cast<const uint8_t*>(std::memchr(p, kUlDesignator[0], static_cast<size_t>(last - p) + 1));
+      if (!p) break;
+      if (std::memcmp(p, kUlDesignator, sizeof(kUlDesignator)) == 0) {
+        const uint64_t hit = pos + static_cast<uint64_t>(p - begin);
+        return hit < limit && reader.Seek(hit);
+      }
     }
-    if (have == 4 && std::memcmp(window, kUlDesignator, 4) == 0) return reader.Seek(reader.Tell() - 4);
+    if (pos + n >= scanEnd) break;
+    pos += n - kOverlap;
+    blockSize = std::min(blockSize * 2, kMaxBlock);
   }
   return false;
 }

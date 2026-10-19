@@ -138,10 +138,12 @@ bool ReadKlvHeader(MxfReader& reader, KlvHeader& out);
 // forward through a byte range that can contain this kind of padding.
 bool LooksLikeKlvKey(const Ul& key);
 
-// Scans forward byte-by-byte from the reader's current position for the
-// next occurrence of the UL designator, leaving the reader positioned
-// exactly at its first byte so the caller can retry ReadKlvHeader there.
-// Returns false if the designator never occurs before EOF.
-bool ResyncToUlDesignator(MxfReader& reader);
+// Scans forward from the reader's current position for the next occurrence
+// of the UL designator, leaving the reader positioned exactly at its first
+// byte so the caller can retry ReadKlvHeader there. Returns false if no
+// designator starts before `limit` (or EOF). Reads in growing blocks
+// (4 KiB up to 1 MiB) searched with memchr, so a long run of zeros or
+// garbage costs a few large reads, not one read per byte.
+bool ResyncToUlDesignator(MxfReader& reader, uint64_t limit = UINT64_MAX);
 
 }  // namespace mxfsrc
