@@ -17,6 +17,7 @@ extern "C" {
 }
 
 #include "core/index_extract.h"
+#include "core/index_policy.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
 #include "mxf/index_table.h"
@@ -1928,7 +1929,8 @@ void TestUseAudioModeAlwaysSucceedsOnVideoOnlySource() {
 // Table Segment, then a Footer Partition and a RIP. Each field breaks one
 // thing.
 struct StrictTestFileSpec {
-  int numFrames = 4;                 // essence elements written and header Duration
+  int numFrames = 4;                 // essence elements written (and header Duration unless declaredFrames)
+  int declaredFrames = -1;           // >= 0: header Duration differs from the essence actually written
   int indexedFrames = 4;             // edit units the Index Table covers; 0 = no Index Table Segment at all
   bool headerClosed = true;          // Header Partition status ClosedComplete vs OpenIncomplete
   bool footer = true;                // write a Footer Partition Pack
@@ -1944,7 +1946,7 @@ struct StrictTestFileSpec {
 std::vector<uint8_t> BuildStrictTestFile(const StrictTestFileSpec& spec) {
   const int width = 4, height = 2;
   SyntheticFile cfg;
-  cfg.sequenceDuration = spec.numFrames;
+  cfg.sequenceDuration = spec.declaredFrames >= 0 ? spec.declaredFrames : spec.numFrames;
   cfg.width = width;
   cfg.height = height;
   cfg.videoTrackNumber = kTrackNumber;
@@ -2150,6 +2152,93 @@ void TestStrictFailsWhenIndexShorterThanDuration() {
   CHECK(res.status == OpenStatus::kOk);
 }
 
+// Header Duration larger than the essence (real case: Schuhegestohlen, 714
+// declared, 706 frames, then the Footer): without strict, only the frames
+// that exist are exposed -- before, the clip claimed 714 and ended in decode
+// errors, and its audio was dropped. Strict still refuses the finished file.
+void TestEssenceEndingBeforeDurationIsClamped() {
+  StrictTestFileSpec spec;
+  spec.numFrames = 4;
+  spec.indexedFrames = 4;
+  spec.declaredFrames = 6;
+  int64_t numFrames = -1;
+  OpenResult res = OpenStrictTestFile(spec, false, "mxfsrc_test_clamp_footer.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == 4);
+
+  res = OpenStrictTestFile(spec, true, "mxfsrc_test_clamp_footer_strict.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "declares 6 edit units, but the Index Table covers only 4"));
+
+  // No Footer, essence followed directly by the RIP: same.
+  spec.footer = false;
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_clamp_rip.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == 4);
+
+  // Growing file in strict mode (no Duration check): clamped too.
+  spec.headerClosed = false;
+  res = OpenStrictTestFile(spec, true, "mxfsrc_test_clamp_growing.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == 4);
+}
+
+// EssenceEndsAfter on the content package after the last index entry:
+// complete, cut off in zero fill after 2 of 3 sound elements (real case:
+// Sobotka, picture + 5 of 8 sound elements, then zeros -- the last frame's
+// audio could not be read), and followed by another frame.
+void TestEssenceEndsAfterChecksLastContentPackage() {
+  const std::array<uint8_t, 4> video = {0x15, 0x01, 0x05, 0x00};
+  const std::vector<std::array<uint8_t, 4>> audio = {
+      {0x16, 0x08, 0x03, 0x00}, {0x16, 0x08, 0x03, 0x01}, {0x16, 0x08, 0x03, 0x02}};
+  auto element = [](std::vector<uint8_t>& buf, const std::array<uint8_t, 4>& tn) {
+    AppendEssenceElement(buf, (uint32_t{tn[0]} << 24) | (uint32_t{tn[1]} << 16) | (uint32_t{tn[2]} << 8) | tn[3],
+                         std::vector<uint8_t>(32, 0x11));
+  };
+  struct Case {
+    const char* name;
+    int soundElements;
+    bool anotherFrame;
+    bool ends;
+    bool complete;
+  };
+  const Case cases[] = {
+      {"complete, then zeros", 3, false, true, true},
+      {"2 of 3 sound elements, then zeros", 2, false, true, false},
+      {"another frame follows", 3, true, false, false},
+  };
+  for (const Case& c : cases) {
+    std::vector<uint8_t> bytes(100, 0x55);  // stand-in for earlier essence
+    const uint64_t lastOffset = bytes.size();
+    element(bytes, video);
+    for (int i = 0; i < c.soundElements; ++i) element(bytes, audio[static_cast<size_t>(i)]);
+    if (c.anotherFrame) element(bytes, video);
+    bytes.insert(bytes.end(), 4096, 0);
+    auto path = WriteTempFile(bytes, "mxfsrc_test_essence_end.bin");
+    {
+      MxfReader reader(path.string());
+      const EssenceEnd end = EssenceEndsAfter(reader, lastOffset, video, audio);
+      if (end.ends != c.ends || end.lastPackageComplete != c.complete) std::cerr << c.name << std::endl;
+      CHECK(end.ends == c.ends);
+      CHECK(end.lastPackageComplete == c.complete);
+    }
+    std::filesystem::remove(path);
+  }
+}
+
+// Index stops early but the essence goes on (e.g. the last partition's index
+// would have been in a missing Footer): the declared frame count stays, the
+// unindexed frames are still reached by the sequential walk.
+void TestIndexEndingBeforeEssenceIsNotClamped() {
+  StrictTestFileSpec spec;
+  spec.numFrames = 4;
+  spec.indexedFrames = 2;
+  int64_t numFrames = -1;
+  OpenResult res = OpenStrictTestFile(spec, false, "mxfsrc_test_no_clamp.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == 4);
+}
+
 // Open header, no Footer (growing/aborted recording) with an index reached
 // via the RIP: opens with what the index covers, even though the header's
 // not-yet-final Duration claims more.
@@ -2343,6 +2432,9 @@ int main() {
   TestStrictFailsWithoutIndex();
   TestStrictFailsWhenIndexShorterThanDuration();
   TestStrictOpensGrowingFileWithRipIndex();
+  TestEssenceEndingBeforeDurationIsClamped();
+  TestIndexEndingBeforeEssenceIsNotClamped();
+  TestEssenceEndsAfterChecksLastContentPackage();
   TestStrictOpensGrowingFileWithCbrIndexInHeader();
   TestStrictFailsGrowingFileWithoutReachableIndex();
   TestStrictFailsZeroTailWithOpenHeader();

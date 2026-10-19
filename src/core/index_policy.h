@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "mxf/header_parser.h"
 #include "mxf/index_table.h"
@@ -53,5 +55,24 @@ int64_t DeclaredEditUnits(const MxfStreamInfo& info);
 // edit unit. Does nothing unless `finished` (see IntegrityCheckResult) and
 // the Duration is known.
 std::optional<std::string> CheckIndexCoverage(const EssenceIndex& index, const MxfStreamInfo& info, bool finished);
+
+// Whether the essence demonstrably ends with the edit unit whose content
+// package starts at `lastEditUnitOffset` (the last index entry): walking on
+// from there, the Footer Partition, the RIP, the end of the file or zero fill
+// comes before any further picture element of `videoTrackNumber` or any
+// Body/Header Partition. Then frames the Header Metadata declares beyond it
+// don't exist (real case: Duration 714, 706 frames of essence, Footer) --
+// unlike a file whose index merely stops early while its essence goes on.
+// `lastPackageComplete`: that last content package also holds a complete
+// element of every one of `audioTrackNumbers` (real case: a recording cut
+// off in zero fill after its last picture and 5 of 8 sound elements).
+// Costs the KLV header reads of about one content package.
+struct EssenceEnd {
+  bool ends = false;
+  bool lastPackageComplete = false;
+};
+EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
+                            const std::array<uint8_t, 4>& videoTrackNumber,
+                            const std::vector<std::array<uint8_t, 4>>& audioTrackNumbers);
 
 }  // namespace mxfsrc

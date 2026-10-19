@@ -287,8 +287,8 @@ in the same order and fail with the same messages.
 is silently shorter than declared, or that takes minutes to open, is worse
 than an explicit error. With `strict=true`, `MxfSource()` fails at open time
 for files that are incomplete or damaged, and it never builds an index by
-walking the whole file. With `strict=false` the plugin behaves as it did
-before strict mode existed (see [Without strict](#without-strict)).
+walking the whole file. With `strict=false` the plugin opens such files on a
+best-effort basis (see [Without strict](#without-strict)).
 
 Strict mode only adds checks. It never changes how an intact file is
 parsed, indexed or decoded: a file that passes opens exactly as it would
@@ -358,9 +358,12 @@ Notes on the individual checks:
    any file, finished or growing. A growing file therefore opens in strict
    mode only if it has a RIP or a CBR/CBG index in its Header Partition.
 4. **Short index.** Only for finished files. A growing file has no final
-   Duration and opens with the frames its Duration declares, as without
-   strict. Coverage is measured as the highest indexed edit unit + 1; gaps
-   inside the index are not checked.
+   Duration; it opens, with the frame count rule of
+   [Frame count when the essence ends early](#frame-count-when-the-essence-ends-early).
+   Coverage is measured as the highest indexed edit unit + 1; gaps inside
+   the index are not checked. Only the top-level file package's Duration
+   counts: lower-level source packages (tape, import) may legitimately be
+   much longer (an Avid import package declares 21600000 edit units).
 
 #### Decision overview
 
@@ -370,8 +373,8 @@ Notes on the individual checks:
 | Any file ending in > 64 KiB of zeros | fails (1) | opens; without a reachable index via the full-file scan |
 | Closed header, footer missing/beyond EOF, no RIP | fails (2) | opens via the full-file scan |
 | Finished, no reachable index | fails (3) | opens via the full-file scan |
-| Finished, index shorter than Duration | fails (4) | opens |
-| Growing, index reachable (RIP or CBR/CBG in Header Partition) | opens | opens |
+| Finished, index shorter than Duration | fails (4) | opens; frame count clamped if the essence ends early (below) |
+| Growing, index reachable (RIP or CBR/CBG in Header Partition) | opens; frame count clamped if the essence ends early | opens; same |
 | Growing, no reachable index | fails (3) | opens via the full-file scan |
 
 #### What strict mode does not do
@@ -389,11 +392,37 @@ Notes on the individual checks:
 
 #### Without strict
 
-`strict=false` keeps the previous best-effort behaviour: no integrity checks,
-the full-file bitstream scan when no index is reachable, and the frame count
-from the header Duration even when the index or the file is shorter.
-Opening such a file can take minutes on large files over SMB, and the clip
-can report more frames than the file really contains.
+`strict=false` is best effort: no integrity checks, the full-file bitstream
+scan when no index is reachable (minutes on large files over SMB), and the
+frame count rule below.
+
+#### Frame count when the essence ends early
+
+Applies to every file that opens with an index shorter than its Duration,
+i.e. with `strict=false`, and to growing files in strict mode. Many real
+files declare more frames than they contain: truncated copies, recordings
+cut off in zero fill, and writers that record the planned length
+(Schuhegestohlen: Duration 714, 706 frames of essence, then a proper Footer).
+
+After the last index entry the plugin reads about one content package of
+KLV headers:
+
+- If the **end of the essence** follows (Footer Partition, RIP, end of file
+  or zero fill), only the frames that exist are exposed, and the log says
+  `Header Metadata declares N frames, but the essence ends after M; exposing
+  M frames`. Their audio is exposed too. Without this, the clip claimed N
+  frames, ended in decode errors at frame M, and lost all its audio (the
+  audio index must cover every exposed frame).
+- If that last content package lacks some of its sound elements (cut off in
+  the middle), that frame is dropped too, so video and audio end together
+  (`..., the last one with sound elements missing; exposing M-1 frames`).
+- If **more essence** follows (another picture element or a Body
+  Partition), the index merely stops early; the declared frame count stays
+  and the unindexed frames are reached by the sequential walk.
+
+Real files, `strict=false`: Schuhegestohlen 714 -> 706 frames, Wienheute
+2260 -> 1535, Sobotka 1401 -> 1348 (last of 1349 frames incomplete); all
+decode without errors, audio bit-identical to ffmpeg.
 
 #### Real-world examples
 
@@ -419,7 +448,8 @@ with `strict=true`:
   run, in this order: `CheckIntegrityBeforeIndex()` (checks 1 and 2),
   `BuildVideoIndex()` (check 3, no bitstream scan under strict),
   `CheckIndexCoverage()` (check 4). Neither caller may implement any of
-  these decisions on its own.
+  these decisions on its own. `EssenceEndsAfter()` (same file) decides the
+  frame count clamp; `SourceEngine::Open()` applies it.
 - `src/core/options.h`: `OpenOptions::strict`; `ExtractAndPublishIndex`'s
   `strict` parameter.
 - Tests: `TestStrict*` and `TestExtractIndexAgreesWithOpenForEveryStrictCase`

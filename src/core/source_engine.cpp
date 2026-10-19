@@ -212,18 +212,43 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
               "essence-count fallback not yet implemented, see plan Phase 1 Duration fallback chain step 5)"};
     }
   }
+  if (videoIndex_ && !videoIndex_->Empty()) {
+    if (std::optional<std::string> error = CheckIndexCoverage(*videoIndex_, streamInfo_, integrity.finished)) {
+      return {OpenStatus::kDamagedFile, *error};
+    }
+    // A file that got this far (strict=false, or a growing file in strict
+    // mode) may declare more frames than its essence holds. Expose only the
+    // indexed frames when the essence demonstrably ends after the last of
+    // them -- otherwise the clip ends in decode errors and the audio, which
+    // needs index coverage of every exposed frame, is dropped entirely. A file
+    // whose index merely stops early while the essence goes on keeps its
+    // declared frame count, as before.
+    // If the last content package lacks some of its sound elements (cut off
+    // mid-package), that frame goes too, so video and audio end together.
+    const int64_t indexedFrames = videoIndex_->HighestCoveredEditUnit() + 1 - originSkip_;
+    if (indexedFrames > 0 && indexedFrames < streamInfo_.numFrames) {
+      std::vector<std::array<uint8_t, 4>> audioTrackNumbers;
+      for (const AudioTrackInfo& t : streamInfo_.audioTracks) audioTrackNumbers.push_back(t.trackNumber);
+      const EssenceEnd end = EssenceEndsAfter(*reader_, videoIndex_->GetEntries().back().byteOffset,
+                                              streamInfo_.videoTrackNumber, audioTrackNumbers);
+      const int64_t exposed = end.lastPackageComplete ? indexedFrames : indexedFrames - 1;
+      if (end.ends && exposed > 0) {
+        std::string why = " frames, but the essence ends after " + std::to_string(indexedFrames);
+        if (!end.lastPackageComplete) why += ", the last one with sound elements missing";
+        AppendLogLine("[MxfSource] " + path_ + ": Header Metadata declares " + std::to_string(streamInfo_.numFrames) +
+                      why + "; exposing " + std::to_string(exposed) + " frames");
+        streamInfo_.numFrames = exposed;
+        streamInfo_.durationReliable = false;
+      }
+    }
+  }
   // Raw, untrimmed essence-edit-unit-space frame count -- the coordinate
   // space videoIndex_'s own entries live in (see
   // BuildAudioSampleIndexFromIndexTable's doc comment). streamInfo_.numFrames
   // is now fully finalized (Header Metadata Duration, SourcePackage-Origin
-  // override, or the Index Table fallback above), so this is safe to derive.
+  // override, the Index Table fallback above, or the clamp to the essence
+  // end), so this is safe to derive.
   const int64_t rawFrameCount = originSkip_ + streamInfo_.numFrames;
-
-  if (videoIndex_) {
-    if (std::optional<std::string> error = CheckIndexCoverage(*videoIndex_, streamInfo_, integrity.finished)) {
-      return {OpenStatus::kDamagedFile, *error};
-    }
-  }
 
   // OpenOptions::start_frame_hint: see its own doc comment. Clamp/ignore
   // (never a hard Open() failure) anything non-positive or at/past the

@@ -1,8 +1,11 @@
 #include "core/index_policy.h"
 
+#include <algorithm>
+#include <cstring>
 #include <vector>
 
 #include "mxf/bitstream_index.h"
+#include "mxf/essence_walker.h"
 #include "mxf/integrity.h"
 #include "mxf/partition.h"
 
@@ -76,6 +79,57 @@ std::optional<std::string> CheckIndexCoverage(const EssenceIndex& index, const M
   return "strict: the file is finalized (Closed Partition) and declares " + std::to_string(declared) +
          " edit units, but the Index Table covers only " + std::to_string(covered) +
          "; the file is incomplete or damaged (disable strict to open it anyway)";
+}
+
+EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
+                            const std::array<uint8_t, 4>& videoTrackNumber,
+                            const std::vector<std::array<uint8_t, 4>>& audioTrackNumbers) {
+  // One content package has a handful of elements (system item, picture,
+  // up to 16 sound, data, fill); anything longer is not "right after".
+  constexpr int kMaxKlvs = 64;
+  const uint64_t size = reader.Size();
+  uint64_t pos = lastEditUnitOffset;
+  bool seenLastPicture = false;
+  std::vector<bool> seenAudio(audioTrackNumbers.size(), false);
+  auto ended = [&]() {
+    EssenceEnd result;
+    result.ends = true;
+    result.lastPackageComplete =
+        seenLastPicture && std::all_of(seenAudio.begin(), seenAudio.end(), [](bool seen) { return seen; });
+    return result;
+  };
+  for (int i = 0; i < kMaxKlvs; ++i) {
+    if (pos >= size) return ended();  // EOF
+    if (!reader.Seek(pos)) return {};
+    KlvHeader klv{};
+    if (!ReadKlvHeader(reader, klv)) return pos + 17 > size ? ended() : EssenceEnd{};  // only a cut-off tail left
+    if (!LooksLikeKlvKey(klv.key)) {
+      // Raw zero fill instead of a Footer counts as the end; anything else
+      // is unknown territory, so don't conclude anything.
+      uint8_t probe[16] = {};
+      const size_t probeLen = static_cast<size_t>(std::min<uint64_t>(sizeof(probe), size - pos));
+      if (!reader.Seek(pos) || !reader.ReadBytes(probe, probeLen)) return {};
+      const bool zeros = std::all_of(std::begin(probe), std::end(probe), [](uint8_t b) { return b == 0; });
+      return zeros ? ended() : EssenceEnd{};
+    }
+    PartitionKind kind{};
+    if (IsPartitionPackKey(klv.key, &kind)) return kind == PartitionKind::kFooter ? ended() : EssenceEnd{};
+    if (UlEquals(klv.key, kRandomIndexPackKey)) return ended();
+    const uint64_t valueEnd = klv.valueOffset + klv.length;
+    if (IsEssenceElementKey(klv.key)) {
+      if (std::memcmp(klv.key.data() + 12, videoTrackNumber.data(), 4) == 0) {
+        if (seenLastPicture) return {};  // a further frame follows
+        seenLastPicture = true;
+      } else if (valueEnd <= size) {  // a sound element cut off at EOF doesn't count
+        for (size_t t = 0; t < audioTrackNumbers.size(); ++t) {
+          if (std::memcmp(klv.key.data() + 12, audioTrackNumbers[t].data(), 4) == 0) seenAudio[t] = true;
+        }
+      }
+    }
+    if (valueEnd >= size) return ended();  // the last element reaches (or is cut off at) EOF
+    pos = valueEnd;
+  }
+  return {};
 }
 
 }  // namespace mxfsrc
