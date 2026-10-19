@@ -18,6 +18,13 @@ target_compile_features(mxf_header_parser_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_header_parser_tests PRIVATE mxf_core)
 add_test(NAME mxf_header_parser_tests COMMAND mxf_header_parser_tests)
 
+add_executable(mxf_file_open_tests
+  file_open_test.cpp
+)
+target_compile_features(mxf_file_open_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_file_open_tests PRIVATE mxf_core)
+add_test(NAME mxf_file_open_tests COMMAND mxf_file_open_tests)
+
 add_executable(mxf_essence_walker_tests
   essence_walker_test.cpp
 )

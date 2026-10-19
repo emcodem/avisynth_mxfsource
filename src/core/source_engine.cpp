@@ -11,6 +11,7 @@
 
 #include "codec/decoder_factory.h"
 #include "mxf/bitstream_index.h"
+#include "mxf/file_open.h"
 #include "mxf/index_transport.h"
 #include "mxf/ul_tables.h"
 
@@ -90,7 +91,7 @@ void SourceEngine::AppendLogLine(const std::string& line) const {
   // overwritten so the file accumulates a history across repeated runs;
   // silently skipped (not fatal) if the path can't be opened.
   if (logFile_.empty()) return;
-  if (FILE* f = fopen(logFile_.c_str(), "a")) {
+  if (FILE* f = OpenFile(logFile_, "a")) {
     const time_t now = time(nullptr);
     struct tm tmBuf{};
 #if defined(_WIN32)

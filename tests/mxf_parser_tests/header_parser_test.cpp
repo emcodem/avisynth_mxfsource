@@ -258,6 +258,30 @@ void TestXavcLongGopUlClassification() {
   CHECK(IsIntraOnlyCodec(CodecFamily::kH264));
 }
 
+// Regression test for the UL Version Number byte (ST 336 byte 8, index 7)
+// being part of the comparison: real files on the sample share carry
+// DNxHR coding ULs at version 0x0a and KLV Fill at 0x01, where our tables
+// hold 0x01/0x02, so every DNxHR file failed as an unknown codec. Version
+// must be ignored. Also covers SMPTE382MDefaultUncompressedSoundCoding,
+// the PCM label 640 real files use, which was missing from the table and
+// made their audio drop as "non-PCM".
+void TestUlVersionByteIgnored() {
+  // DNxHR HQX, verbatim from "TALK-UHD HDR DNxHR HQX.mxf".
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a,
+                         0x04, 0x01, 0x02, 0x02, 0x71, 0x25, 0x00, 0x00}) == CodecFamily::kDnxhd);
+  // Uncompressed PCM, verbatim from "DJ OETZI UHD HDR XAVC CBG300.mxf".
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a,
+                         0x04, 0x02, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00}) == CodecFamily::kPcm);
+  // KLV Fill at version 0x01 (table key is 0x02).
+  CHECK(UlEquals({0x06, 0x0e, 0x2b, 0x34, 0x01, 0x01, 0x01, 0x01,
+                  0x03, 0x01, 0x02, 0x10, 0x01, 0x00, 0x00, 0x00}, kKlvFillKey));
+  // Any other byte still distinguishes.
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a,
+                         0x04, 0x01, 0x02, 0x02, 0x72, 0x25, 0x00, 0x00}) == CodecFamily::kUnknown);
+  CHECK(!UlEquals({0x06, 0x0e, 0x2b, 0x34, 0x01, 0x01, 0x01, 0x01,
+                   0x03, 0x01, 0x02, 0x10, 0x02, 0x00, 0x00, 0x00}, kKlvFillKey));
+}
+
 // Single audio track, via a MultipleDescriptor wrapping the CDCI Descriptor
 // + one Sound Descriptor -- the common real-world case. Binds directly
 // (sole-candidate fallback) even though LinkedTrackID/TrackID default to 0
@@ -437,6 +461,7 @@ int main() {
   TestRipFallbackLocatesFooterWhenHeaderFieldIsZero();
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
   TestXavcLongGopUlClassification();
+  TestUlVersionByteIgnored();
   TestSingleAudioTrackResolved();
   TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
   TestMismatchedBitDepthMarksAudioUnsupported();

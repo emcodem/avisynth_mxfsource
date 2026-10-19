@@ -1,7 +1,8 @@
 #include "mxf/index_transport.h"
 
-#include <fstream>
+#include <cstdio>
 
+#include "mxf/file_open.h"
 #include "mxf/index_serialization.h"
 #include "mxf/klv.h"
 #include "net/http_put.h"
@@ -17,13 +18,13 @@ namespace {
 constexpr uint64_t kMaxTrailingBytesTolerance = 50ull * 1024 * 1024;
 
 bool WriteLocalText(const std::string& path, const std::string& text, std::string* errorOut) {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  FILE* out = OpenFile(path, "wb");
   if (!out) {
     if (errorOut) *errorOut = "failed to open '" + path + "' for writing";
     return false;
   }
-  out.write(text.data(), static_cast<std::streamsize>(text.size()));
-  if (!out) {
+  const bool ok = std::fwrite(text.data(), 1, text.size(), out) == text.size();
+  if (std::fclose(out) != 0 || !ok) {
     if (errorOut) *errorOut = "failed writing index JSON to '" + path + "'";
     return false;
   }
@@ -31,15 +32,18 @@ bool WriteLocalText(const std::string& path, const std::string& text, std::strin
 }
 
 std::optional<std::string> ReadLocalText(const std::string& path, std::string* errorOut) {
-  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  FILE* in = OpenFile(path, "rb");
   if (!in) {
     if (errorOut) *errorOut = "failed to open '" + path + "' for reading";
     return std::nullopt;
   }
-  const std::streamsize size = in.tellg();
-  in.seekg(0);
-  std::string text(static_cast<size_t>(size), '\0');
-  if (size > 0 && !in.read(text.data(), size)) {
+  std::string text;
+  char buf[64 * 1024];
+  size_t n = 0;
+  while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) text.append(buf, n);
+  const bool failed = std::ferror(in) != 0;
+  std::fclose(in);
+  if (failed) {
     if (errorOut) *errorOut = "failed reading index JSON from '" + path + "'";
     return std::nullopt;
   }

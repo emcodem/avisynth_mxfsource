@@ -13,9 +13,18 @@ namespace mxfsrc {
 // the value of many Header Metadata properties (e.g. PictureEssenceCoding).
 using Ul = std::array<uint8_t, 16>;
 
+// Index of the UL's Version Number byte (ST 336 byte 8). It records which
+// registry revision a label was published in, not what the label means, so
+// it is never part of a UL's identity and both helpers below skip it --
+// real files carry e.g. PCM/DNxHR coding ULs and KLV Fill keys at versions
+// other than our tables' (observed: 0x0a PCM/DNxHR, 0x01 KLV Fill).
+inline constexpr size_t kUlVersionByteIndex = 7;
+
 // Compares the first prefixLen bytes only -- several UL families (see
 // ul_tables.h) are only specified/matched up to a variable-length prefix.
+// Ignores the Version Number byte.
 bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen);
+// Ignores the Version Number byte.
 bool UlEquals(const Ul& a, const Ul& b);
 
 // True if `path` has an http:// or https:// scheme prefix (case-insensitive).

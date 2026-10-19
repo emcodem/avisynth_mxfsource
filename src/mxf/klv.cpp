@@ -24,10 +24,13 @@ bool IsHttpUrl(const std::string& path) { return HasSchemePrefix(path, "http://"
 
 bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen) {
   if (prefixLen > key.size()) return false;
-  return std::memcmp(key.data(), prefix, prefixLen) == 0;
+  for (size_t i = 0; i < prefixLen; ++i) {
+    if (i != kUlVersionByteIndex && key[i] != prefix[i]) return false;
+  }
+  return true;
 }
 
-bool UlEquals(const Ul& a, const Ul& b) { return a == b; }
+bool UlEquals(const Ul& a, const Ul& b) { return UlPrefixEquals(a, b.data(), b.size()); }
 
 MxfReader::MxfReader(const std::string& path, const std::string& httpHeaders) {
   if (IsHttpUrl(path)) {

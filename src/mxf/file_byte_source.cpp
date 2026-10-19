@@ -1,5 +1,7 @@
 #include "mxf/file_byte_source.h"
 
+#include "mxf/file_open.h"
+
 #if defined(_WIN32)
 #define MXFSRC_FSEEK _fseeki64
 #define MXFSRC_FTELL _ftelli64
@@ -13,7 +15,7 @@ using mxfsrc_off_t = off_t;
 namespace mxfsrc {
 
 FileByteSource::FileByteSource(const std::string& path) {
-  file_ = fopen(path.c_str(), "rb");
+  file_ = OpenFile(path, "rb");
   if (file_) {
     MXFSRC_FSEEK(file_, 0, SEEK_END);
     mxfsrc_off_t end = MXFSRC_FTELL(file_);

@@ -34,7 +34,7 @@ enum class SetType {
 };
 
 SetType ClassifySetType(const Ul& key) {
-  if (std::memcmp(key.data(), kSetTypePrefix, sizeof(kSetTypePrefix)) != 0) return SetType::kOther;
+  if (!UlPrefixEquals(key, kSetTypePrefix, sizeof(kSetTypePrefix))) return SetType::kOther;
   const uint16_t code = (static_cast<uint16_t>(key[14]) << 8) | key[15];
   switch (code) {
     case 0x2F00: return SetType::kPreface;

@@ -47,6 +47,7 @@ add_library(mxf_core STATIC
   src/mxf/klv.cpp
   src/mxf/klv.h
   src/mxf/file_byte_source.cpp
+  src/mxf/file_open.cpp
   src/mxf/file_byte_source.h
   src/net/http_byte_source.cpp
   src/net/http_byte_source.h
