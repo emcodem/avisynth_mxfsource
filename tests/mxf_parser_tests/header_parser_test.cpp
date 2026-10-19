@@ -407,7 +407,7 @@ void TestD10Aes3AudioFlagged() {
   for (uint32_t bits : {24u, 20u}) {
     SyntheticFile cfg;
     SyntheticAudioTrack audio;
-    audio.trackNumber = 0x06010110;  // CP sound item, element type AES3 8-channel
+    audio.trackNumber = 0x06011000;  // as in the real SDPLAYERAPISUB.mxf: CP sound item, 1 element, type 0x10, number 0
     audio.channelCount = 8;
     audio.bitsPerSample = bits;
     cfg.audioTracks = {audio};
