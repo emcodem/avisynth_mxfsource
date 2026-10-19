@@ -405,6 +405,14 @@ void ValidateAndSummarizeAudio(MxfStreamInfo& info) {
       info.audioUnsupportedReason = "non-PCM audio codec not supported yet";
       return;
     }
+    // The TrackNumber's first byte is the essence element's item type
+    // (SMPTE 379). 0x06 is an SDTI-CP sound item (D-10/IMX, SMPTE 386): an
+    // AES3 element (SMPTE 331) with its own header and per-sample channel
+    // bits, not plain PCM. Reading it as PCM fails at the first audio read.
+    if (t.trackNumber[0] == 0x06) {
+      info.audioUnsupportedReason = "D-10/IMX AES3 audio (SDTI-CP sound element) not supported yet";
+      return;
+    }
     if (t.bitsPerSample != first.bitsPerSample) {
       info.audioUnsupportedReason = "audio tracks have mismatched bit depth";
       return;
