@@ -447,3 +447,57 @@ covers a forward jump but apparently not this access pattern).
 
 Not investigated yet: whether the cause is the jump distance, the
 end-of-stream position, or the access pattern of AviSynth's `Trim`.
+
+### Corpus re-run against the 2026-10-16 baseline
+
+Not run yet (on request only). Compare against
+`tools/corpus_scan/results_2026-10-16/`: every file that was SUPPORTED must
+stay SUPPORTED, except the expected strict-mode failures below; re-time any
+decode timeouts serially (10 parallel UHD decodes caused false timeouts).
+Expected changes:
+
+- SUPPORTED -> FAILED by strict (default on), all damaged or without any
+  index: of the 57 baseline-OK files without a RIP, 50 now fail (19 footer
+  beyond EOF, 10 zero tail, 21 no reachable index), plus files with a zero
+  tail or a short index that do have a RIP. Each must fail with a `strict:`
+  message and open with `strict=false`.
+- Open timeouts -> SUPPORTED: the 67 Fixup 1 files (essence in the Header
+  Partition).
+- Open timeouts -> FAILED (strict) in < 1 s: zero-tail / missing-footer
+  recordings.
+- Audio dropped -> exposed: about 250 files (CBR index past the essence,
+  index longer than Duration, D-10 8-Ch AES3 Element).
+- Pixel format not mapped -> SUPPORTED: 15 DNxHR / ProRes 4444 files.
+
+The scan logs keep only the last 600 characters of the plugin log; keep the
+full log (or at least the first lines) in the re-run, they were needed to
+classify the audio failures.
+
+### Open-header file whose declared index isn't found
+
+`SERVER/SHARE/...`
+(0.29 GB, Header Open Incomplete, `IndexByteCount=512`, `IndexSID=1`,
+`BodySID=2`, no Duration). Strict mode reports "no Index Table Segment";
+it opened in the baseline only via the full-file scan. Probably a lookup
+bug (BodySID/IndexSID matching or the segment's position), not damage.
+Not investigated.
+
+### Best-effort recovery of damaged files (postponed)
+
+`handoff_partition_recovery_2026-10-16.md` sections C/D (partition discovery
+from the data end via `PreviousPartition`, tail walk of the last partition)
+are postponed by decision of 2026-10-19: damaged files are only detected and
+fail in strict mode. If picked up again, it goes into a separate module that
+only runs with `strict=false`.
+
+### Smaller gaps
+
+- ProRes 4444 with alpha (`yuva444p10/12`) has no output mapping; no file in
+  the corpus uses it.
+- `MxfExtractIndex` has no `strict` parameter and still falls back to the
+  full-file bitstream scan.
+- `EnumeratePartitionsForIndex` finds partitions only via offset 0 and the
+  RIP, not via the header's `FooterPartition` pointer. A file without a RIP
+  whose index is only in the Footer would get no index. No such file in the
+  corpus (checked 2026-10-19: none of the 105 RIP-less files has a valid
+  Footer carrying an index).

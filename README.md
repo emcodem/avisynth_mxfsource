@@ -153,6 +153,18 @@ Current status:
   `source_engine_test.cpp` additions using a real encoded MPEG-2 I/P-frame
   sequence (avcodec's own encoder) to prove byte-identical output both with
   and without an index present.
+- **Corpus hardening (2026-10-16 scan of 1479 real files, fixes 2026-10-19)
+  -- done, corpus re-run pending.** UL matching ignores the version byte
+  (DNxHR, KLV Fill); SMPTE 382 default PCM label; long and Unicode paths;
+  [strict mode](#strict-mode) (default on) that fails damaged files in under
+  a second instead of scanning them; essence carried in the Header Partition
+  (Fixup 1 no longer treats it as metadata: 39-978 GB UHD H.264 files open in
+  1-2 s); CBR index entries no longer run past the essence, and audio is
+  built when the index covers more than the Duration (audio back on about
+  250 files); D-10/IMX 8-Ch AES3 Element audio; yuv422p12/yuv444p10/
+  yuv444p12 output and 12-bit ProRes 4444 (codec tag from the coding UL);
+  block-read resync over raw padding and garbage. Each fix was checked
+  bit-exactly against ffmpeg on real files from the scan.
 
 ## Parameters
 
@@ -169,17 +181,84 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
 | `use_audio` | string | `"supported"` | Audio fallback policy -- see below. |
+| `indexurl` | string | *(none)* | Fetch a previously published essence index (JSON, see `MxfExtractIndex` below) from this URL or local path instead of building it locally. Any problem (network error, BodySID/version mismatch, byte offsets implausible for this file) fails the open; there is no silent fallback to a local build. |
+| `start_frame` | int | `0` | Performance hint: the first frame the caller will request. The decode thread starts at the nearest keyframe before it (via the Index Table) instead of at frame 0, so a pipeline that processes a chunk far into the file is served from the ring buffer. Earlier frames still work, just without this optimization. Values `<= 0` or past the end are ignored. |
 | `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
+
+In VapourSynth, `MxfSource` returns a single video clip for files without
+exposed audio, and `clip` plus `audio` otherwise:
+
+```python
+r = core.mxfsource.MxfSource("file.mxf")
+clip = r if isinstance(r, vs.VideoNode) else r["clip"]
+```
+
+`MxfExtractIndex(file, targeturl, httpheaders="")` (both hosts) builds the
+essence index of `file` and publishes it as JSON to `targeturl` (local path
+or `http(s)://` URL, written with PUT), for `MxfSource(..., indexurl=...)`
+on other machines that read a byte-identical copy of the same file. It has
+no `strict` parameter and still falls back to the full-file bitstream scan
+when the file has no reachable index.
+
+### File paths and URLs
+
+`file`, `logfile` and local `indexurl`/`targeturl` paths accept:
+
+- **Long paths**: on Windows, paths of 260 characters or more are opened as
+  extended-length paths (`\\?\` for local paths, `\\?\UNC\` for network
+  shares), with no `longPathAware` manifest or registry setting needed.
+- **Non-ASCII paths**: on Windows the path is decoded as UTF-8 if it is
+  valid UTF-8 (what VapourSynth passes), otherwise in the ANSI codepage
+  (what AviSynth+ scripts normally carry), and opened through the
+  wide-character API. On Linux paths are byte strings and opened as they
+  are.
+- **`http://` / `https://` URLs** for `file`, with `httpheaders` for
+  authentication (S3 presigned URLs need none).
+
+### Video output formats
+
+| Decoded format | AviSynth+ | VapourSynth | Typical source |
+|---|---|---|---|
+| UYVY 4:2:2 8-bit (uncompressed) | `YUY2` (byte-reordered) | `YUV422P8` (unpacked) | uncompressed MXF |
+| yuv420p | `YV12` | `YUV420P8` | MPEG-2 4:2:0, H.264 |
+| yuv422p | `YV16` | `YUV422P8` | MPEG-2 422P (XDCAM HD422, D-10) |
+| yuv420p10 | `YUV420P10` | `YUV420P10` | H.264 10-bit |
+| yuv422p10 | `YUV422P10` | `YUV422P10` | AVC-Intra, XAVC, DNxHR HQX 10-bit, ProRes 422 |
+| yuv422p12 | `YUV422P12` | `YUV422P12` | DNxHR HQX 12-bit |
+| yuv444p10 | `YUV444P10` | `YUV444P10` | DNxHR 444 10-bit |
+| yuv444p12 | `YUV444P12` | `YUV444P12` | DNxHR 444 12-bit, ProRes 4444 / 4444 XQ |
+
+Anything else (e.g. ProRes 4444 with alpha, `yuva444p`) fails at open with
+"decoded pixel format has no ... mapping yet". For ProRes, the decoder gets
+FFmpeg's codec tag (`apco` ... `ap4x`) from the PictureEssenceCoding UL, as
+FFmpeg's own MXF demuxer does; without it, 4444 profiles would decode at 10
+instead of 12 bit.
 
 ### Audio
 
 Every audio track found in the file is summed into one interleaved output
 stream at the file's native bit depth (`SAMPLE_INT16`/`SAMPLE_INT24`/
 `SAMPLE_INT32` in AviSynth+, the equivalent integer format in VapourSynth) --
-no format conversion, no resampling. Only uncompressed PCM is supported today;
-compressed codecs (AC-3/MP2/AAC) and files whose audio tracks disagree on bit
-depth or sample rate are treated as "unsupported audio", governed by
-`use_audio`:
+no format conversion, no resampling. With `handle_origin=true` the Origin
+pre-roll is trimmed from the audio exactly like from the video.
+
+Supported (all uncompressed linear PCM; the UL version byte is ignored):
+
+| Sound essence | How it is recognized | Payload |
+|---|---|---|
+| Generic Container sound element (SMPTE 382), WAVE or AES3 descriptor | SoundEssenceCompression `06 0E 2B 34 04 01 01 xx 04 02 02 01 00`, `... 01 01` (SMPTE382MDefaultUncompressedSoundCoding, the most common label on real files), `... 01 7F`, or no SoundEssenceCompression at all (AES3 descriptors often omit it) | plain packed little-endian PCM, used as is |
+| D-10/IMX **8-Ch AES3 Element** (SMPTE 386 / 331) | element key `06 0E 2B 34 01 02 01 01 0D 01 03 01 06 01 10 00` (TrackNumber item type 0x06, element type 0x10) | 4-byte element header, then per sample 8 slots of a 32-bit word with the PCM sample in bits 4-27; unpacked to plain PCM (`(word >> 4) & 0xFFFFFF` for 24 bit, `>> 12` for 16 bit) |
+
+Not supported, treated as "unsupported audio": compressed codecs
+(AC-3/MP2/AAC), AIFF coding (`... 04 02 02 01 7E`, big-endian), any other
+SDTI-CP sound element type, and tracks that disagree on bit depth or sample
+rate.
+
+Audio is located through the video Index Table, without scanning the
+essence: the index must cover every edit unit from 0 up to the
+SourcePackage Duration (it may cover more; edit units past the Duration are
+ignored). A file without such an index, e.g. a truncated one, gets no
+audio. All of this is governed by `use_audio`:
 
 | `use_audio` | Audio present & supported | Audio present & unsupported | No audio at all |
 |---|---|---|---|
