@@ -329,7 +329,7 @@ also for 100+ GB files).
 
 | # | Fails when | Applies to | Error starts with |
 |---|---|---|---|
-| 1 | The last 64 KiB of the file are all zero bytes. | every file | `strict: the file ends with N zero bytes (data ends at byte D of S)` |
+| 1 | The last 64 KiB of the file are all zero bytes. | every file | `strict: unexpected zero bytes at offset O (verified from there to the end of the file at S)` |
 | 2 | The Header Partition is Closed, its `FooterPartition` field is nonzero, there is no valid Footer Partition Pack at that offset, no valid RIP and no Closed Footer. | Closed header | `strict: Header Partition is Closed and declares the Footer Partition at byte F, but the file is only S bytes; the file is truncated` (offset beyond EOF) or `... but there is no valid Footer Partition Pack there and no Random Index Pack` |
 | 3 | No Index Table Segment is reachable. | every file | `strict: no Index Table Segment found in the Header Partition or any partition listed in a Random Index Pack` |
 | 4 | The index covers fewer edit units than the file's Duration (SourcePackage Duration, including Origin pre-roll). | finished file | `strict: the file is finalized (Closed Partition) and declares N edit units, but the Index Table covers only M` |
@@ -342,9 +342,11 @@ Notes on the individual checks:
    never with zeros. Raw-zero KAG padding seen on real recorders stays
    below 1 KiB, so 64 KiB (`kMaxExpectedTrailingZeroBytes`) leaves a wide
    margin. This also fails growing files: a recorder that preallocated the
-   file with zeros is still incomplete. The decision costs one 64 KiB read;
-   only when it fails is the length of the zero run measured, by binary
-   search over 64 KiB blocks (about 21 reads for 100 GB), for the message.
+   file with zeros is still incomplete. The check is one 64 KiB read at the
+   end of the file. The message reports only what was read: the offset where
+   that block starts (file size - 64 KiB) and that it is zero up to the end.
+   The zero run may well start earlier, but the plugin does not read further
+   to find out.
 2. **Missing footer.** A Closed header promises a footer. A `FooterPartition`
    of 0 (unknown) is not an error by itself, since the Footer Partition is
    optional; such a file is still covered by checks 3 and 4. A valid RIP or a

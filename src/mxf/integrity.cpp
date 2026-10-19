@@ -39,53 +39,11 @@ bool RangeIsAllZero(MxfReader& reader, uint64_t offset, size_t len, std::vector<
   return std::all_of(buf.begin(), buf.end(), [](uint8_t b) { return b == 0; });
 }
 
-// Measures the zero run at the end of the file in kMaxExpectedTrailingZeroBytes
-// blocks, counted back from EOF: block i covers
-// [size - (i+1)*B, size - i*B). Block 0 is already known to be zero. Binary
-// search for the first non-zero block assumes the zeros are one contiguous
-// run, which a zero-filled tail is; a zero block inside real data (e.g.
-// silent clip-wrapped PCM) can only make the reported dataEnd too low,
-// never turn a non-zero tail into a zero one -- the strict decision itself
-// depends on block 0 alone.
-void MeasureTrailingZeros(MxfReader& reader, FileIntegrity& out) {
-  const uint64_t size = out.fileSize;
-  const uint64_t block = kMaxExpectedTrailingZeroBytes;
-  const uint64_t numBlocks = (size + block - 1) / block;
-  std::vector<uint8_t> buf;
-  auto blockStart = [&](uint64_t i) { return size > (i + 1) * block ? size - (i + 1) * block : 0; };
-  auto blockIsZero = [&](uint64_t i) {
-    const uint64_t start = blockStart(i);
-    return RangeIsAllZero(reader, start, static_cast<size_t>(size - i * block - start), buf);
-  };
-
-  uint64_t lo = 0;          // known all-zero
-  uint64_t hi = numBlocks;  // first non-zero block, or numBlocks if the whole file is zero
-  while (hi - lo > 1) {
-    const uint64_t mid = lo + (hi - lo) / 2;
-    if (blockIsZero(mid)) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-
-  uint64_t dataEnd = 0;
-  if (hi < numBlocks) {
-    const uint64_t start = blockStart(hi);
-    blockIsZero(hi);  // reload the non-zero block into buf
-    auto lastNonZero = std::find_if(buf.rbegin(), buf.rend(), [](uint8_t b) { return b != 0; });
-    dataEnd = start + static_cast<uint64_t>(buf.rend() - lastNonZero);
-  }
-  out.dataEnd = dataEnd;
-  out.trailingZeroBytes = size - dataEnd;
-}
-
 }  // namespace
 
 std::optional<FileIntegrity> ProbeFileIntegrity(MxfReader& reader) {
   FileIntegrity out;
   out.fileSize = reader.Size();
-  out.dataEnd = out.fileSize;
 
   if (!reader.Seek(0)) return std::nullopt;
   KlvHeader headerKlv{};
@@ -117,7 +75,7 @@ std::optional<FileIntegrity> ProbeFileIntegrity(MxfReader& reader) {
   std::vector<uint8_t> buf;
   if (tailLen > 0 && RangeIsAllZero(reader, out.fileSize - tailLen, static_cast<size_t>(tailLen), buf)) {
     out.trailingZerosUnexpected = true;
-    MeasureTrailingZeros(reader, out);
+    out.zeroTailOffset = out.fileSize - tailLen;
   }
   return out;
 }
@@ -126,9 +84,8 @@ std::optional<std::string> CheckStrictIntegrity(const FileIntegrity& integrity) 
   // Whatever the partition statuses say: a growing file preallocated with
   // zeros is as unusable for an automated pipeline as a broken one.
   if (integrity.trailingZerosUnexpected) {
-    return "strict: the file ends with " + std::to_string(integrity.trailingZeroBytes) +
-           " zero bytes (data ends at byte " + std::to_string(integrity.dataEnd) + " of " +
-           std::to_string(integrity.fileSize) +
+    return "strict: unexpected zero bytes at offset " + std::to_string(integrity.zeroTailOffset) +
+           " (verified from there to the end of the file at " + std::to_string(integrity.fileSize) +
            "); the file is incomplete or damaged (disable strict to open it anyway)";
   }
 

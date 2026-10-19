@@ -19,8 +19,8 @@ inline constexpr uint64_t kMaxExpectedTrailingZeroBytes = 64 * 1024;
 
 // Read-only structural checks on an opened file, used by
 // OpenOptions::strict. Costs a handful of small reads (Header Partition
-// Pack, RIP, Footer Partition Pack, and ~log2(size/64 KiB) 64 KiB reads only
-// when the tail is zero) and never changes how the file is parsed.
+// Pack, RIP, Footer Partition Pack, the last 64 KiB) and never changes how
+// the file is parsed.
 struct FileIntegrity {
   uint64_t fileSize = 0;
 
@@ -43,11 +43,11 @@ struct FileIntegrity {
   // ParseMxfHeader already reads Duration from.
   bool closedFooterFound = false;
 
-  // Number of zero bytes at the end of the file, and where the non-zero data
-  // ends (fileSize - trailingZeroBytes). Only measured when the last
-  // kMaxExpectedTrailingZeroBytes are all zero; 0 / fileSize otherwise.
-  uint64_t trailingZeroBytes = 0;
-  uint64_t dataEnd = 0;
+  // The last kMaxExpectedTrailingZeroBytes of the file (all of it if
+  // smaller) were read and are all zero. zeroTailOffset is where that
+  // verified block starts; nothing before it is claimed, the zero run may
+  // or may not begin earlier.
+  uint64_t zeroTailOffset = 0;
   bool trailingZerosUnexpected = false;
 
   // The writer declared the file finished: a Closed Footer exists, or else

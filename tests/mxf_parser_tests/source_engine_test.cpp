@@ -2029,7 +2029,15 @@ OpenResult OpenStrictTestFile(const StrictTestFileSpec& spec, bool strict, const
   return res;
 }
 
-bool ErrorContains(const OpenResult& res, const char* text) { return res.error.find(text) != std::string::npos; }
+bool ErrorContains(const OpenResult& res, const std::string& text) { return res.error.find(text) != std::string::npos; }
+
+// The zero-tail message names only what was read: the start of the last
+// kMaxExpectedTrailingZeroBytes block and the file size.
+std::string ZeroTailMessage(const StrictTestFileSpec& spec) {
+  const uint64_t size = BuildStrictTestFile(spec).size();
+  return "strict: unexpected zero bytes at offset " + std::to_string(size - kMaxExpectedTrailingZeroBytes) +
+         " (verified from there to the end of the file at " + std::to_string(size) + ")";
+}
 
 // A finished, intact file opens in strict mode (the default).
 void TestStrictOpensIntactClosedFile() {
@@ -2052,13 +2060,13 @@ void TestStrictFailsOnZeroTail() {
   spec.zeroTailBytes = 200000;
   OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_zero_tail.mxf");
   CHECK(res.status == OpenStatus::kDamagedFile);
-  CHECK(ErrorContains(res, "ends with 200000 zero bytes"));
+  CHECK(ErrorContains(res, ZeroTailMessage(spec)));
 
   res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_zero_tail_off.mxf");
   CHECK(res.status == OpenStatus::kOk);
 
-  // Exact measurement for the error message, and a zero run below the
-  // threshold isn't flagged.
+  // The verified block is reported; a zero run below the threshold isn't
+  // flagged.
   for (size_t zeros : {size_t{200000}, size_t{1000}}) {
     spec.zeroTailBytes = zeros;
     const std::vector<uint8_t> bytes = BuildStrictTestFile(spec);
@@ -2071,8 +2079,7 @@ void TestStrictFailsOnZeroTail() {
         CHECK(integrity->headerClosed);
         CHECK(integrity->trailingZerosUnexpected == (zeros > kMaxExpectedTrailingZeroBytes));
         if (integrity->trailingZerosUnexpected) {
-          CHECK(integrity->trailingZeroBytes == zeros);
-          CHECK(integrity->dataEnd == bytes.size() - zeros);
+          CHECK(integrity->zeroTailOffset == bytes.size() - kMaxExpectedTrailingZeroBytes);
         }
       }
     }
@@ -2194,7 +2201,7 @@ void TestStrictFailsZeroTailWithOpenHeader() {
   spec.zeroTailBytes = 200000;
   OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_open_zero_tail.mxf");
   CHECK(res.status == OpenStatus::kDamagedFile);
-  CHECK(ErrorContains(res, "ends with 200000 zero bytes"));
+  CHECK(ErrorContains(res, ZeroTailMessage(spec)));
 }
 
 // Open header but a Closed Footer: the file is finished, so the index must
