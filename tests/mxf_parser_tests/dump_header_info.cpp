@@ -10,6 +10,7 @@
 #include <iostream>
 
 #include "mxf/header_parser.h"
+#include "mxf/index_table.h"
 #include "mxf/klv.h"
 
 using namespace mxfsrc;
@@ -66,6 +67,33 @@ int main(int argc, char** argv) {
   std::printf("origin=%lld sourcePackageDuration=%lld\n", static_cast<long long>(info->origin),
               static_cast<long long>(info->sourcePackageDuration));
   std::printf("durationReliable=%d\n", info->durationReliable);
+
+  // Index Table coverage vs. the frame count SourceEngine derives (SP
+  // Duration incl. Origin when a SourcePackage exists, else numFrames) --
+  // BuildAudioSampleIndexFromIndexTable needs an exact match.
+  const int64_t rawFrameCount = info->sourcePackageDuration >= 0 ? info->sourcePackageDuration : info->numFrames;
+  if (auto index = BuildEssenceIndex(reader, info->bodySid)) {
+    const auto& entries = index->GetEntries();
+    std::printf("index: entries=%zu firstEditUnit=%lld lastEditUnit=%lld rawFrameCount=%lld\n", entries.size(),
+                entries.empty() ? -1LL : static_cast<long long>(entries.front().editUnit),
+                entries.empty() ? -1LL : static_cast<long long>(entries.back().editUnit),
+                static_cast<long long>(rawFrameCount));
+    // What the last entries point at: real essence, or e.g. an end-of-
+    // essence marker at the Footer Partition.
+    for (size_t i = entries.size() >= 3 ? entries.size() - 3 : 0; i < entries.size(); ++i) {
+      std::printf("  entry editUnit=%lld byteOffset=%llu", static_cast<long long>(entries[i].editUnit),
+                  static_cast<unsigned long long>(entries[i].byteOffset));
+      KlvHeader klv{};
+      if (reader.Seek(entries[i].byteOffset) && ReadKlvHeader(reader, klv)) {
+        std::printf(" key=");
+        for (uint8_t b : klv.key) std::printf("%02x", b);
+        std::printf(" len=%llu", static_cast<unsigned long long>(klv.length));
+      }
+      std::printf("\n");
+    }
+  } else {
+    std::printf("index: none rawFrameCount=%lld\n", static_cast<long long>(rawFrameCount));
+  }
 
   // Scan forward from headerMetadataEnd printing the first few top-level
   // KLV keys (Partition Packs, essence elements, KLVFill) to see what's
