@@ -387,6 +387,19 @@ uint64_t ResolveLogicalEssenceOffset(uint64_t logicalOffset, const std::vector<B
   return it->essenceStartOffset + (logicalOffset - it->bodyOffset);
 }
 
+// True if `offset` can be the start of an edit unit: the closest known
+// partition at or before it carries essence (BodySID != 0, so never a
+// Footer or an index-only partition) and its essence has started there.
+// With no partition at or before it, there's nothing to check against.
+// `partitionsByOffset` is sorted ascending by partitionOffset.
+bool LiesInPartitionEssence(uint64_t offset, const std::vector<IndexScanPartition>& partitionsByOffset) {
+  auto it = std::upper_bound(partitionsByOffset.begin(), partitionsByOffset.end(), offset,
+                              [](uint64_t off, const IndexScanPartition& p) { return off < p.partitionOffset; });
+  if (it == partitionsByOffset.begin()) return true;
+  --it;
+  return it->bodySid != 0 && offset >= it->essenceStartOffset;
+}
+
 // Appends one segment's edit units as absolute {editUnit, byteOffset,
 // isKeyframe} rows. CBR iteration count is derived from how many edit
 // units could possibly fit within the file's actual size (rather than
@@ -397,9 +410,12 @@ uint64_t ResolveLogicalEssenceOffset(uint64_t logicalOffset, const std::vector<B
 // Segment left IndexDuration unspecified/0, which used to make this whole
 // segment -- despite its otherwise-usable EditUnitByteCount -- get
 // silently discarded rather than falling back to this same file-size-based
-// cap).
+// cap). That cap counts to the end of the file, so the edit units it
+// adds past the essence -- e.g. one landing on the Footer Partition Pack
+// or the RIP, observed on 238 real files with IndexDuration 0 -- are
+// dropped via LiesInPartitionEssence.
 void FlattenSegmentInto(const IndexTableSegment& seg, uint64_t fileSize, const std::vector<BodyRange>& ranges,
-                        std::vector<FlatIndexEntry>& out) {
+                        const std::vector<IndexScanPartition>& partitionsByOffset, std::vector<FlatIndexEntry>& out) {
   if (seg.editUnitByteCount != 0) {
     if (seg.essenceContainerBaseOffset >= fileSize) return;
     const uint64_t maxIterationsThatFit =
@@ -415,7 +431,7 @@ void FlattenSegmentInto(const IndexTableSegment& seg, uint64_t fileSize, const s
       // essence container.
       const uint64_t logicalOffset = static_cast<uint64_t>(editUnit) * static_cast<uint64_t>(seg.editUnitByteCount);
       const uint64_t offset = ResolveLogicalEssenceOffset(logicalOffset, ranges, seg.essenceContainerBaseOffset);
-      if (offset >= fileSize) continue;
+      if (offset >= fileSize || !LiesInPartitionEssence(offset, partitionsByOffset)) continue;
       out.push_back({editUnit, offset, true, 0});
     }
     return;
@@ -480,8 +496,12 @@ std::optional<EssenceIndex> FinishBuildingIndex(const std::vector<IndexScanParti
     return a.indexStartPosition < b.indexStartPosition;
   });
 
+  std::vector<IndexScanPartition> partitionsByOffset = scanPartitions;
+  std::sort(partitionsByOffset.begin(), partitionsByOffset.end(),
+            [](const IndexScanPartition& a, const IndexScanPartition& b) { return a.partitionOffset < b.partitionOffset; });
+
   std::vector<FlatIndexEntry> flat;
-  for (const auto& seg : segments) FlattenSegmentInto(seg, fileSize, bodyRanges, flat);
+  for (const auto& seg : segments) FlattenSegmentInto(seg, fileSize, bodyRanges, partitionsByOffset, flat);
   if (flat.empty()) return std::nullopt;
 
   std::stable_sort(flat.begin(), flat.end(),

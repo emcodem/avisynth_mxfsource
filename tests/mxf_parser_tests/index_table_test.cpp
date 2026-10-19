@@ -281,6 +281,37 @@ void TestCbrSegmentFlattenFormula() {
   std::filesystem::remove(path);
 }
 
+// CBR segment with IndexDuration 0 (unspecified): the edit-unit count comes
+// from the file size, which used to add edit units on top of the Footer
+// Partition and RIP behind the essence (238 real files; their audio was
+// dropped because the index then had one entry more than the Duration).
+void TestCbrWithoutDurationStopsAtFooterPartition() {
+  IndexTableSegmentSpec spec;
+  spec.indexDuration = 0;
+  spec.editUnitByteCount = 100;
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, spec);
+  std::vector<uint8_t> file = BuildSingleIndexPartitionFile(segBytes, /*headerByteCount=*/64, /*indexSid=*/1,
+                                                             /*essenceTrailerSize=*/5 * 100);
+  const uint64_t footerOffset = file.size();
+  AppendPartitionPackWithFields(file, PartitionKind::kFooter, TestPartitionStatus::kClosedComplete, footerOffset,
+                                footerOffset, 0, 0, 0, 0, /*bodySid=*/0);
+  AppendRandomIndexPack(file, {{1, 0}, {0, footerOffset}});
+  CHECK(file.size() - footerOffset > 100);  // room for at least one bogus edit unit behind the essence
+  auto path = WriteTempFile(file, "mxfsrc_test_its_cbr_footer.mxf");
+
+  {
+    MxfReader reader(path.string());
+    auto index = BuildEssenceIndex(reader, /*videoBodySid=*/1);
+    CHECK(index.has_value());
+    if (index) {
+      CHECK(index->HighestCoveredEditUnit() == 4);
+      CHECK(index->GetEntries().size() == 5);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 void TestNoIndexTableAnywhereReturnsNullopt() {
   std::vector<uint8_t> file;
   AppendPartitionPackWithFields(file, PartitionKind::kHeader, TestPartitionStatus::kClosedComplete, 0, 0,
@@ -541,6 +572,7 @@ int main() {
   TestFindPrecedingKeyframeNoKeyframeBeforeTarget();
   TestFindPrecedingKeyframeOutsideCoveredRange();
   TestCbrSegmentFlattenFormula();
+  TestCbrWithoutDurationStopsAtFooterPartition();
   TestNoIndexTableAnywhereReturnsNullopt();
   TestMalformedSegmentIsSkippedNotFatal();
   TestOutOfBoundsOffsetIsDropped();
