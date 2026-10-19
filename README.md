@@ -402,7 +402,7 @@ with `strict=true`:
 
 | File | Result |
 |---|---|
-| XDCAM HD422 / D10 recordings of 0.42, 2.06 and 126.6 GB with a zero-filled tail where the footer should be (> 60 s to open without strict) | fail with check 1 in < 0.5 s |
+| XDCAM HD422 / D10 recordings of 0.42, 2.06 and 126.6 GB with a zero-filled tail where the footer should be | fail with check 1 in < 0.5 s (without strict they open only via the full-file scan) |
 | First 0.70 GB of a finished 1.75 GB file, cut off mid-frame (header says the footer is at byte 1748772352) | fails with check 2 in 0.2 s |
 | `klvfill_reprod - Kopie.mxf`: footer declared 590 KB beyond EOF | fails with check 2 in 0.2 s |
 | XDCAM HD422 files without any index, Footer or RIP (Header Closed Complete, `FooterPartition=0`; 20 files of 0.02-2.4 GB). Some are complete, many are cut off at a KLV boundary (e.g. 22.7 MB holding 75 of 670 declared frames); without an index only a full scan could tell which | fail with check 3 by design; open with `strict=false` |
