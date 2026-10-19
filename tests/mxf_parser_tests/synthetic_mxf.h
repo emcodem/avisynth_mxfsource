@@ -159,6 +159,21 @@ struct SyntheticFile {
   int64_t sourcePackageDuration = 10;  // SP's raw/untrimmed Sequence.Duration
   int64_t sourcePackageOrigin = 0;     // SP's Track.Origin (0x4B02)
 
+  // Adds a second, lower-level SourcePackage after the one above -- like the
+  // import source (ImportDescriptor) of a real Avid file: its own video track
+  // with a different edit rate (50/1), Duration and Origin, no picture
+  // descriptor. Only the SourcePackage above (the file package) describes the
+  // essence; see header_parser.cpp's FindFilePackage. Requires
+  // includeSourcePackage.
+  bool includeLowerLevelSourcePackage = false;
+  int64_t lowerLevelSourceDuration = 21600000;
+  int64_t lowerLevelSourceOrigin = 0;
+  // How the file package is identified (SMPTE 377-1): an EssenceContainerData
+  // whose LinkedPackageUID is its PackageUID, and/or the MaterialPackage's
+  // video SourceClip referencing it.
+  bool essenceContainerDataLinksSourcePackage = false;
+  bool materialSourceClipRefsSourcePackage = false;
+
   // Empty (the default) => no audio at all, exactly today's single-video
   // file shape (Package.Descriptor points directly at the CDCI Descriptor,
   // no MultipleDescriptor) -- zero behavior change for every existing test.
@@ -174,6 +189,20 @@ struct SyntheticFile {
 // Pack. Factored out of BuildSyntheticHeader so the same metadata-building
 // logic can be reused for a Footer Partition's redundant copy (see
 // BuildFooterPrecedenceTestFile) with a different SyntheticFile config.
+// 32-byte UMID (PackageUID), distinct per marker.
+inline std::vector<uint8_t> MakeUmid(uint8_t marker) {
+  std::vector<uint8_t> umid = {0x06, 0x0A, 0x2B, 0x34, 0x01, 0x01, 0x01, 0x05,
+                               0x01, 0x01, 0x0D, 0x12, 0x13, 0x00, 0x00, 0x00};
+  for (int i = 0; i < 16; ++i) umid.push_back(static_cast<uint8_t>(marker + i));
+  return umid;
+}
+
+inline void AppendTagBytes(std::vector<uint8_t>& entries, uint16_t tag, const std::vector<uint8_t>& value) {
+  AppendU16BE(entries, tag);
+  AppendU16BE(entries, static_cast<uint16_t>(value.size()));
+  entries.insert(entries.end(), value.begin(), value.end());
+}
+
 inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
   const Ul uidContentStorage = MakeUid(1);
   const Ul uidPackage = MakeUid(2);
@@ -184,6 +213,15 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
   const Ul uidSourceTrack = MakeUid(7);
   const Ul uidSourceSequence = MakeUid(8);
   const Ul uidMultipleDescriptor = MakeUid(9);
+  const Ul uidLowerPackage = MakeUid(10);
+  const Ul uidLowerTrack = MakeUid(11);
+  const Ul uidLowerSequence = MakeUid(12);
+  const Ul uidEssenceContainerData = MakeUid(13);
+  const Ul uidMaterialSourceClip = MakeUid(14);
+  const std::vector<uint8_t> sourcePackageUmid = MakeUmid(0x40);
+  const std::vector<uint8_t> lowerPackageUmid = MakeUmid(0x80);
+  const bool withPackageUids = cfg.includeLowerLevelSourcePackage || cfg.essenceContainerDataLinksSourcePackage ||
+                               cfg.materialSourceClipRefsSourcePackage;
 
   std::vector<uint8_t> metadata;  // everything from right after the Partition Pack KLV onward
 
@@ -198,7 +236,9 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagUl(entries, 0x3C0A, uidContentStorage);
     std::vector<Ul> packageUids = {uidPackage};
     if (cfg.includeSourcePackage) packageUids.push_back(uidSourcePackage);
+    if (cfg.includeLowerLevelSourcePackage) packageUids.push_back(uidLowerPackage);
     AppendTagUlArray(entries, 0x1901, packageUids);
+    if (cfg.essenceContainerDataLinksSourcePackage) AppendTagUlArray(entries, 0x1902, {uidEssenceContainerData});
     AppendLocalSet(metadata, 0x18, 0x00, entries);
   }
 
@@ -242,7 +282,17 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagUl(entries, 0x3C0A, uidSequence);
     AppendTagUl(entries, 0x0201, kPictureDataDefinition);
     AppendTagI64(entries, 0x0202, cfg.sequenceDuration);
+    if (cfg.materialSourceClipRefsSourcePackage) AppendTagUlArray(entries, 0x1001, {uidMaterialSourceClip});
     AppendLocalSet(metadata, 0x0F, 0x00, entries);
+  }
+  if (cfg.materialSourceClipRefsSourcePackage) {
+    std::vector<uint8_t> entries;
+    AppendTagUl(entries, 0x3C0A, uidMaterialSourceClip);
+    AppendTagUl(entries, 0x0201, kPictureDataDefinition);
+    AppendTagI64(entries, 0x0202, cfg.sequenceDuration);
+    AppendTagBytes(entries, 0x1101, sourcePackageUmid);  // SourcePackageID
+    AppendTagU32(entries, 0x1102, 1);                     // SourceTrackID
+    AppendLocalSet(metadata, 0x11, 0x00, entries);        // SourceClip
   }
   // CDCI Descriptor
   {
@@ -302,6 +352,7 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     {
       std::vector<uint8_t> entries;
       AppendTagUl(entries, 0x3C0A, uidSourcePackage);
+      if (withPackageUids) AppendTagBytes(entries, 0x4401, sourcePackageUmid);
       AppendTagUlArray(entries, 0x4403, {uidSourceTrack});
       AppendTagUl(entries, 0x4701, uidDescriptor);
       AppendLocalSet(metadata, 0x37, 0x00, entries);
@@ -324,6 +375,40 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
       AppendTagI64(entries, 0x0202, cfg.sourcePackageDuration);
       AppendLocalSet(metadata, 0x0F, 0x00, entries);
     }
+  }
+
+  if (cfg.includeLowerLevelSourcePackage) {
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidLowerPackage);
+      AppendTagBytes(entries, 0x4401, lowerPackageUmid);
+      AppendTagUlArray(entries, 0x4403, {uidLowerTrack});
+      AppendLocalSet(metadata, 0x37, 0x00, entries);
+    }
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidLowerTrack);
+      AppendTagRational(entries, 0x4B01, 50, 1);
+      AppendTagI64(entries, 0x4B02, cfg.lowerLevelSourceOrigin);
+      AppendTagUl(entries, 0x4803, uidLowerSequence);
+      AppendTagU32(entries, 0x4804, 1);
+      AppendLocalSet(metadata, 0x3B, 0x00, entries);
+    }
+    {
+      std::vector<uint8_t> entries;
+      AppendTagUl(entries, 0x3C0A, uidLowerSequence);
+      AppendTagUl(entries, 0x0201, kPictureDataDefinition);
+      AppendTagI64(entries, 0x0202, cfg.lowerLevelSourceDuration);
+      AppendLocalSet(metadata, 0x0F, 0x00, entries);
+    }
+  }
+
+  if (cfg.essenceContainerDataLinksSourcePackage) {
+    std::vector<uint8_t> entries;
+    AppendTagUl(entries, 0x3C0A, uidEssenceContainerData);
+    AppendTagBytes(entries, 0x2701, sourcePackageUmid);  // LinkedPackageUID
+    AppendTagU32(entries, 0x3F07, 1);                     // BodySID
+    AppendLocalSet(metadata, 0x23, 0x00, entries);        // EssenceContainerData
   }
 
   return metadata;

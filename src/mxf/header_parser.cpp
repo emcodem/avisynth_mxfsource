@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <vector>
 
 #include "mxf/index_table.h"
@@ -64,6 +65,11 @@ namespace tag {
 constexpr uint16_t kPackageTracks = 0x4403;
 constexpr uint16_t kPackageDescriptor = 0x4701;
 constexpr uint16_t kContentStoragePackages = 0x1901;
+constexpr uint16_t kContentStorageEssenceContainerData = 0x1902;
+constexpr uint16_t kEssenceContainerDataLinkedPackageUid = 0x2701;
+constexpr uint16_t kPackageUid = 0x4401;
+constexpr uint16_t kSequenceStructuralComponents = 0x1001;
+constexpr uint16_t kSourceClipSourcePackageId = 0x1101;
 constexpr uint16_t kTrackEditRate = 0x4B01;
 constexpr uint16_t kTrackOrigin = 0x4B02;
 constexpr uint16_t kTrackSequenceRef = 0x4803;
@@ -219,7 +225,11 @@ void ResolveDescriptor(const Ul& descriptorRef, const RawSets& sets, EssenceKind
   }
 }
 
-void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePackage, MxfStreamInfo& info) {
+// `isFilePackage`: this is the SourcePackage that describes the essence in
+// this file (see FindFilePackage) -- the only one whose video Track.Origin
+// and Sequence.Duration count. Other SourcePackages are lower-level sources
+// (tape, import) whose length and edit rate describe the original material.
+void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isFilePackage, MxfStreamInfo& info) {
   auto pit = sets.byInstanceUid.find(packageUid);
   if (pit == sets.byInstanceUid.end()) return;
   const LocalTagMap& pkg = pit->second;
@@ -248,7 +258,7 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePack
     // SourcePackage's video track regardless of whether some other
     // package's video track was resolved for editRate/trackNumber first --
     // see MxfStreamInfo::origin's comment.
-    if (kind == EssenceKind::kVideo && isSourcePackage) {
+    if (kind == EssenceKind::kVideo && isFilePackage) {
       int64_t origin = 0;
       GetI64(track, tag::kTrackOrigin, origin);  // absent => 0, i.e. no trim
       info.origin = origin;
@@ -362,6 +372,73 @@ bool ReadMetadataSets(MxfReader& reader, uint64_t partitionEnd, uint64_t byteCou
 // Resolves a full RawSets (as produced by ReadMetadataSets) into a fresh
 // MxfStreamInfo -- shared between the Header Partition's pass and a Closed
 // Footer Partition's override pass.
+const std::vector<uint8_t>* FindTag(const LocalTagMap& set, uint16_t tag) {
+  auto it = set.find(tag);
+  return it == set.end() ? nullptr : &it->second;
+}
+
+const LocalTagMap* FindSet(const RawSets& sets, const Ul& instanceUid) {
+  auto it = sets.byInstanceUid.find(instanceUid);
+  return it == sets.byInstanceUid.end() ? nullptr : &it->second;
+}
+
+// The SourcePackage that describes the essence in this file -- SMPTE 377-1's
+// top-level file package -- as opposed to lower-level source packages (tape,
+// import) a file may also carry: the one an EssenceContainerData links to
+// (LinkedPackageUID == its PackageUID), or else the one the MaterialPackage's
+// video SourceClip references. nullopt if neither identifies one; callers
+// then treat every SourcePackage as before. Real case: an Avid file whose
+// import package (ImportDescriptor, 50/1, Duration 21600000) came after the
+// file package (25/1, Duration 5575) and overrode its Duration.
+std::optional<Ul> FindFilePackage(const RawSets& sets, const std::vector<Ul>& packageUids) {
+  auto packageWithUid = [&](const std::vector<uint8_t>& umid) -> std::optional<Ul> {
+    for (const Ul& uid : packageUids) {
+      auto isSource = sets.packageIsSource.find(uid);
+      if (isSource == sets.packageIsSource.end() || !isSource->second) continue;
+      const LocalTagMap* pkg = FindSet(sets, uid);
+      const std::vector<uint8_t>* packageUid = pkg ? FindTag(*pkg, tag::kPackageUid) : nullptr;
+      if (packageUid && *packageUid == umid) return uid;
+    }
+    return std::nullopt;
+  };
+
+  if (!sets.contentStorages.empty()) {
+    if (const LocalTagMap* storage = FindSet(sets, sets.contentStorages.front())) {
+      for (const Ul& ecdUid : GetUlArray(*storage, tag::kContentStorageEssenceContainerData)) {
+        const LocalTagMap* ecd = FindSet(sets, ecdUid);
+        const std::vector<uint8_t>* linked = ecd ? FindTag(*ecd, tag::kEssenceContainerDataLinkedPackageUid) : nullptr;
+        if (!linked) continue;
+        if (std::optional<Ul> found = packageWithUid(*linked)) return found;
+      }
+    }
+  }
+
+  for (const Ul& uid : packageUids) {
+    auto isSource = sets.packageIsSource.find(uid);
+    if (isSource == sets.packageIsSource.end() || isSource->second) continue;  // MaterialPackages only
+    const LocalTagMap* pkg = FindSet(sets, uid);
+    if (!pkg) continue;
+    for (const Ul& trackUid : GetUlArray(*pkg, tag::kPackageTracks)) {
+      const LocalTagMap* track = FindSet(sets, trackUid);
+      Ul sequenceRef{};
+      if (!track || !GetUl(*track, tag::kTrackSequenceRef, sequenceRef)) continue;
+      const LocalTagMap* sequence = FindSet(sets, sequenceRef);
+      Ul dataDefinition{};
+      if (!sequence || !GetUl(*sequence, tag::kSequenceDataDefinition, dataDefinition) ||
+          ClassifyDataDefinition(dataDefinition) != EssenceKind::kVideo) {
+        continue;
+      }
+      for (const Ul& componentUid : GetUlArray(*sequence, tag::kSequenceStructuralComponents)) {
+        const LocalTagMap* clip = FindSet(sets, componentUid);
+        const std::vector<uint8_t>* referenced = clip ? FindTag(*clip, tag::kSourceClipSourcePackageId) : nullptr;
+        if (!referenced) continue;
+        if (std::optional<Ul> found = packageWithUid(*referenced)) return found;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 MxfStreamInfo ResolveStreamInfo(const RawSets& sets) {
   MxfStreamInfo info;
 
@@ -370,11 +447,12 @@ MxfStreamInfo ResolveStreamInfo(const RawSets& sets) {
     packageUids = GetUlArray(sets.byInstanceUid.at(sets.contentStorages.front()), tag::kContentStoragePackages);
   }
   if (packageUids.empty()) packageUids = sets.packages;  // fallback for malformed/unusual files
+  const std::optional<Ul> filePackage = FindFilePackage(sets, packageUids);
 
   for (const Ul& packageUid : packageUids) {
     auto isSourceIt = sets.packageIsSource.find(packageUid);
     const bool isSourcePackage = isSourceIt != sets.packageIsSource.end() && isSourceIt->second;
-    ResolvePackage(packageUid, sets, isSourcePackage, info);
+    ResolvePackage(packageUid, sets, isSourcePackage && (!filePackage || *filePackage == packageUid), info);
     // No early-exit here (unlike the old single-video/single-audio version):
     // audio tracks can be spread across multiple Tracks within a package (or
     // even across packages), so every package must be scanned to collect

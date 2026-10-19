@@ -362,6 +362,56 @@ void TestEssenceInHeaderPartitionNotTreatedAsMetadata() {
   }
 }
 
+// A lower-level SourcePackage (real case: the import source of an Avid file,
+// ImportDescriptor, 50/1, Duration 21600000) listed after the file package
+// must not override the file package's Duration and Origin -- strict refused
+// the file because the index "covered only 5575 of 21600000" edit units.
+// The file package is found via EssenceContainerData, or via the
+// MaterialPackage's SourceClip; without either, the old behaviour stays.
+void TestLowerLevelSourcePackageDoesNotOverrideFilePackage() {
+  struct Case {
+    const char* name;
+    bool viaEssenceContainerData;
+    bool viaMaterialSourceClip;
+    int64_t expectedDuration;
+    int64_t expectedOrigin;
+  };
+  const Case cases[] = {
+      {"EssenceContainerData", true, false, 1505, 5},
+      {"MaterialPackage SourceClip", false, true, 1505, 5},
+      {"both", true, true, 1505, 5},
+      {"neither (unchanged: last SourcePackage wins)", false, false, 21600000, 3},
+  };
+  for (const Case& c : cases) {
+    SyntheticFile cfg;
+    cfg.sequenceDuration = 1500;
+    cfg.includeSourcePackage = true;
+    cfg.sourcePackageDuration = 1505;
+    cfg.sourcePackageOrigin = 5;
+    cfg.includeLowerLevelSourcePackage = true;
+    cfg.lowerLevelSourceDuration = 21600000;
+    cfg.lowerLevelSourceOrigin = 3;
+    cfg.essenceContainerDataLinksSourcePackage = c.viaEssenceContainerData;
+    cfg.materialSourceClipRefsSourcePackage = c.viaMaterialSourceClip;
+    auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_lower_level_sp.mxf");
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      CHECK(info.has_value());
+      if (info) {
+        if (info->sourcePackageDuration != c.expectedDuration || info->origin != c.expectedOrigin) {
+          std::cerr << c.name << ": duration " << info->sourcePackageDuration << " origin " << info->origin
+                    << std::endl;
+        }
+        CHECK(info->sourcePackageDuration == c.expectedDuration);
+        CHECK(info->origin == c.expectedOrigin);
+        CHECK(info->width == cfg.width && info->height == cfg.height);
+      }
+    }
+    std::filesystem::remove(path);
+  }
+}
+
 // Single audio track, via a MultipleDescriptor wrapping the CDCI Descriptor
 // + one Sound Descriptor -- the common real-world case. Binds directly
 // (sole-candidate fallback) even though LinkedTrackID/TrackID default to 0
@@ -591,6 +641,7 @@ int main() {
   TestUlVersionByteIgnored();
   TestUndercountedHeaderByteCountRecoveredViaRip();
   TestEssenceInHeaderPartitionNotTreatedAsMetadata();
+  TestLowerLevelSourcePackageDoesNotOverrideFilePackage();
   TestSingleAudioTrackResolved();
   TestEightChAes3ElementFlagged();
   TestOtherSdtiCpSoundElementUnsupported();
