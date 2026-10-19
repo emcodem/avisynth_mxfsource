@@ -408,7 +408,7 @@ inline void AppendPartitionPackWithFields(std::vector<uint8_t>& buf, mxfsrc::Par
                                             TestPartitionStatus status, uint64_t thisPartition,
                                             uint64_t footerPartitionOffset, uint64_t headerByteCount,
                                             uint64_t indexByteCount = 0, uint32_t indexSid = 0,
-                                            uint64_t bodyOffset = 0) {
+                                            uint64_t bodyOffset = 0, uint32_t bodySid = 1) {
   uint8_t kindByte = 0x02;
   if (kind == mxfsrc::PartitionKind::kBody) kindByte = 0x03;
   if (kind == mxfsrc::PartitionKind::kFooter) kindByte = 0x04;
@@ -425,7 +425,7 @@ inline void AppendPartitionPackWithFields(std::vector<uint8_t>& buf, mxfsrc::Par
   AppendU64BE(buf, indexByteCount);
   AppendU32BE(buf, indexSid);
   AppendU64BE(buf, bodyOffset);
-  AppendU32BE(buf, 1);  // BodySID
+  AppendU32BE(buf, bodySid);
   Ul zeroUl{};
   AppendUl(buf, zeroUl);
   AppendU32BE(buf, 0);

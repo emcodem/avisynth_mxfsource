@@ -50,7 +50,7 @@ struct ServeStats {
   }
 };
 
-enum class OpenStatus { kOk, kFileError, kParseError, kUnsupportedCodec, kDecodeError };
+enum class OpenStatus { kOk, kFileError, kParseError, kUnsupportedCodec, kDecodeError, kDamagedFile };
 
 struct OpenResult {
   OpenStatus status = OpenStatus::kFileError;

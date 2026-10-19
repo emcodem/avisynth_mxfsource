@@ -107,6 +107,22 @@ struct OpenOptions {
   // SeekAndDecode fallback, just without this optimization). Exposed to
   // scripts as MxfSource(..., start_frame=N).
   int64_t start_frame_hint = 0;
+
+  // Refuse damaged files instead of opening whatever can be salvaged --
+  // for automated pipelines, where a silently short or slow-to-open file is
+  // worse than an explicit error. Applies only when the Header Partition is
+  // Closed (the writer declared the file finished); an Open header is a
+  // growing or aborted recording, expected to be incomplete, and opens as
+  // usual. With a Closed header, Open() fails when:
+  //   - the file ends with an unexpected run of zero bytes
+  //     (see mxf/integrity.h's kMaxExpectedTrailingZeroBytes),
+  //   - the header declares a Footer Partition that isn't there (e.g.
+  //     beyond EOF) and there is no Random Index Pack,
+  //   - there is no Index Table Segment at all (no full-file bitstream
+  //     scan, see mxf/bitstream_index.h), or
+  //   - the index covers fewer edit units than the header's Duration.
+  // On by default. Exposed to scripts as MxfSource(..., strict=true/false).
+  bool strict = true;
 };
 
 } // namespace mxfsrc

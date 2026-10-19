@@ -19,6 +19,7 @@ extern "C" {
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
 #include "mxf/index_table.h"
+#include "mxf/integrity.h"
 #include "synthetic_mxf.h"
 
 using namespace mxfsrc;
@@ -1910,6 +1911,220 @@ void TestUseAudioModeAlwaysSucceedsOnVideoOnlySource() {
   std::filesystem::remove(path);
 }
 
+// Shape of a finished (or damaged) recording for the OpenOptions::strict
+// tests: video-only UYVY essence in one Body Partition carrying a VBR Index
+// Table Segment, then a Footer Partition and a RIP. Each field breaks one
+// thing.
+struct StrictTestFileSpec {
+  int numFrames = 4;                 // essence elements written and header Duration
+  int indexedFrames = 4;             // edit units the Index Table covers; 0 = no Index Table Segment at all
+  bool headerClosed = true;          // Header Partition status ClosedComplete vs OpenIncomplete
+  bool footer = true;                // write a Footer Partition Pack
+  bool rip = true;                   // write a RIP after it
+  uint64_t footerPointerOverride = 0;  // nonzero: Header's FooterPartition field instead of the real offset
+  size_t zeroTailBytes = 0;          // zero bytes appended at the very end
+};
+
+std::vector<uint8_t> BuildStrictTestFile(const StrictTestFileSpec& spec) {
+  const int width = 4, height = 2;
+  SyntheticFile cfg;
+  cfg.sequenceDuration = spec.numFrames;
+  cfg.width = width;
+  cfg.height = height;
+  cfg.videoTrackNumber = kTrackNumber;
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+  file[14] = static_cast<uint8_t>(spec.headerClosed ? TestPartitionStatus::kClosedComplete
+                                                    : TestPartitionStatus::kOpenIncomplete);
+
+  std::vector<std::vector<uint8_t>> payloads;
+  for (int i = 0; i < spec.numFrames; ++i) payloads.push_back(MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+
+  IndexTableSegmentSpec segSpec;
+  segSpec.indexDuration = spec.indexedFrames;
+  segSpec.entries.resize(static_cast<size_t>(spec.indexedFrames));
+  std::vector<uint8_t> segBytes;
+  if (spec.indexedFrames > 0) AppendIndexTableSegment(segBytes, segSpec);  // placeholder: size only
+
+  const uint64_t bodyOffset = file.size();
+  AppendPartitionPack(file, PartitionKind::kBody, segBytes.size(), spec.indexedFrames > 0 ? 1 : 0);
+  const uint64_t essenceStart = file.size() + segBytes.size();
+  uint64_t cursor = essenceStart;
+  for (int i = 0; i < spec.numFrames; ++i) {
+    if (i < spec.indexedFrames) segSpec.entries[static_cast<size_t>(i)].streamOffset = cursor - essenceStart;
+    cursor += 16 + BerLengthSize(payloads[static_cast<size_t>(i)].size()) + payloads[static_cast<size_t>(i)].size();
+  }
+  if (spec.indexedFrames > 0) {
+    segBytes.clear();
+    AppendIndexTableSegment(segBytes, segSpec);
+  }
+  file.insert(file.end(), segBytes.begin(), segBytes.end());
+  for (const auto& payload : payloads) AppendEssenceElement(file, kTrackNumber, payload);
+
+  const uint64_t footerOffset = file.size();
+  if (spec.footer) {
+    AppendPartitionPackWithFields(file, PartitionKind::kFooter, TestPartitionStatus::kClosedComplete, footerOffset,
+                                  footerOffset, 0, 0, 0, 0, /*bodySid=*/0);
+  }
+  if (spec.rip) {
+    std::vector<std::pair<uint32_t, uint64_t>> entries = {{0, 0}, {1, bodyOffset}};
+    if (spec.footer) entries.push_back({0, footerOffset});
+    AppendRandomIndexPack(file, entries);
+  }
+  file.insert(file.end(), spec.zeroTailBytes, 0);
+
+  // Header Partition Pack's FooterPartition field: 16-byte key + 1-byte BER
+  // length, then MajorVersion(2) MinorVersion(2) KAGSize(4) ThisPartition(8)
+  // PreviousPartition(8).
+  const uint64_t footerPointer = spec.footerPointerOverride != 0 ? spec.footerPointerOverride
+                                 : spec.footer                   ? footerOffset
+                                                                 : 0;
+  for (int i = 0; i < 8; ++i) file[41 + i] = static_cast<uint8_t>(footerPointer >> (56 - 8 * i));
+  return file;
+}
+
+OpenResult OpenStrictTestFile(const StrictTestFileSpec& spec, bool strict, const char* name,
+                              int64_t* numFramesOut = nullptr) {
+  auto path = WriteTempFile(BuildStrictTestFile(spec), name);
+  OpenResult res;
+  {
+    SourceEngine engine;
+    OpenOptions opts;
+    opts.strict = strict;
+    res = engine.Open(path.string(), opts);
+    if (numFramesOut) *numFramesOut = engine.StreamInfo().numFrames;
+  }
+  std::filesystem::remove(path);
+  return res;
+}
+
+bool ErrorContains(const OpenResult& res, const char* text) { return res.error.find(text) != std::string::npos; }
+
+// A finished, intact file opens in strict mode (the default).
+void TestStrictOpensIntactClosedFile() {
+  StrictTestFileSpec spec;
+  int64_t numFrames = -1;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_intact.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == spec.numFrames);
+  CHECK(OpenOptions{}.strict);
+}
+
+// Zero-filled tail where the Footer/RIP should be (real case: XDCAM
+// recordings whose writer preallocated the file and never finished it).
+// Strict fails before any index work; non-strict opens as before.
+void TestStrictFailsOnZeroTail() {
+  StrictTestFileSpec spec;
+  spec.footer = false;
+  spec.rip = false;
+  spec.footerPointerOverride = 0;
+  spec.zeroTailBytes = 200000;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_zero_tail.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "ends with 200000 zero bytes"));
+
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_zero_tail_off.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+
+  // Exact measurement for the error message, and a zero run below the
+  // threshold isn't flagged.
+  for (size_t zeros : {size_t{200000}, size_t{1000}}) {
+    spec.zeroTailBytes = zeros;
+    const std::vector<uint8_t> bytes = BuildStrictTestFile(spec);
+    auto path = WriteTempFile(bytes, "mxfsrc_test_strict_zero_tail_probe.mxf");
+    {
+      MxfReader reader(path.string());
+      std::optional<FileIntegrity> integrity = ProbeFileIntegrity(reader);
+      CHECK(integrity.has_value());
+      if (integrity) {
+        CHECK(integrity->headerClosed);
+        CHECK(integrity->trailingZerosUnexpected == (zeros > kMaxExpectedTrailingZeroBytes));
+        if (integrity->trailingZerosUnexpected) {
+          CHECK(integrity->trailingZeroBytes == zeros);
+          CHECK(integrity->dataEnd == bytes.size() - zeros);
+        }
+      }
+    }
+    std::filesystem::remove(path);
+  }
+}
+
+// Header declares a Footer beyond EOF and there is no RIP (real case: the
+// first 40% of a finished 1.75 GB file, cut mid-frame by an aborted copy).
+void TestStrictFailsOnFooterBeyondEof() {
+  StrictTestFileSpec spec;
+  spec.footer = false;
+  spec.rip = false;
+  spec.footerPointerOverride = 1u << 30;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_footer_eof.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "the file is truncated"));
+
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_footer_eof_off.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
+// Header declares a Footer inside the file, but there's essence there, and
+// no RIP.
+void TestStrictFailsOnFooterPointerToNonPartition() {
+  StrictTestFileSpec spec;
+  spec.footer = false;
+  spec.rip = false;
+  spec.footerPointerOverride = 200;  // inside Header Metadata
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_footer_bad.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "no valid Footer Partition Pack"));
+}
+
+// A wrong Footer pointer is tolerated when a valid RIP is there (real case:
+// Omneon files, see header_parser.cpp's RIP fallback).
+void TestStrictToleratesBadFooterPointerWithValidRip() {
+  StrictTestFileSpec spec;
+  spec.footerPointerOverride = 200;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_footer_bad_rip.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
+// Closed header, no Index Table Segment anywhere: strict refuses rather than
+// running the full-file bitstream scan.
+void TestStrictFailsWithoutIndex() {
+  StrictTestFileSpec spec;
+  spec.indexedFrames = 0;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_no_index.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "no Index Table Segment"));
+
+  int64_t numFrames = -1;
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_no_index_off.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == spec.numFrames);
+}
+
+// Index covers fewer edit units than the header's Duration.
+void TestStrictFailsWhenIndexShorterThanDuration() {
+  StrictTestFileSpec spec;
+  spec.indexedFrames = 2;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_short_index.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "declares 4 edit units, but the Index Table covers only 2"));
+
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_short_index_off.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
+// Open header (growing/aborted recording): every strict check is skipped,
+// even with a zero tail, no footer and no index.
+void TestStrictIgnoresOpenHeader() {
+  StrictTestFileSpec spec;
+  spec.headerClosed = false;
+  spec.indexedFrames = 0;
+  spec.footer = false;
+  spec.rip = false;
+  spec.footerPointerOverride = 1u << 30;
+  spec.zeroTailBytes = 200000;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_open_header.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
 }  // namespace
 
 int main() {
@@ -1941,6 +2156,14 @@ int main() {
   TestUseAudioModeAlwaysFailsOnMismatch();
   TestUseAudioModeNeverSuppressesSupportedAudio();
   TestUseAudioModeAlwaysSucceedsOnVideoOnlySource();
+  TestStrictOpensIntactClosedFile();
+  TestStrictFailsOnZeroTail();
+  TestStrictFailsOnFooterBeyondEof();
+  TestStrictFailsOnFooterPointerToNonPartition();
+  TestStrictToleratesBadFooterPointerWithValidRip();
+  TestStrictFailsWithoutIndex();
+  TestStrictFailsWhenIndexShorterThanDuration();
+  TestStrictIgnoresOpenHeader();
 
   if (g_failures == 0) {
     std::cout << "all source_engine tests passed" << std::endl;
