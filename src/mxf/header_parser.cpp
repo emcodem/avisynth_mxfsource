@@ -1,9 +1,11 @@
 #include "mxf/header_parser.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <vector>
 
+#include "mxf/index_table.h"
 #include "mxf/partition.h"
 
 namespace mxfsrc {
@@ -288,6 +290,33 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isSourcePack
   }
 }
 
+// Generic Container element keys -- picture/sound/data items and the
+// system item's local sets alike -- all carry 0d 01 03 01 in bytes 8-11
+// (SMPTE 379), whatever their other bytes.
+bool IsEssenceContainerElementKey(const Ul& key) {
+  return key[8] == 0x0d && key[9] == 0x01 && key[10] == 0x03 && key[11] == 0x01;
+}
+
+// Offset of the first KLV at or after `start` that can't be Header Metadata
+// -- an Index Table Segment, an essence container element, a Partition Pack,
+// or bytes that aren't a KLV key at all -- never past `limit`. Only reads
+// KLV headers, so it costs one small read per metadata set.
+uint64_t ScanHeaderMetadataEnd(MxfReader& reader, uint64_t start, uint64_t limit) {
+  uint64_t pos = start;
+  while (pos + 17 <= limit && reader.Seek(pos)) {
+    KlvHeader klv{};
+    if (!ReadKlvHeader(reader, klv) || !LooksLikeKlvKey(klv.key)) break;
+    if (UlEquals(klv.key, kIndexTableSegmentKey) || IsPartitionPackKey(klv.key, nullptr) ||
+        IsEssenceContainerElementKey(klv.key)) {
+      break;
+    }
+    const uint64_t next = klv.valueOffset + klv.length;
+    if (next > limit) break;
+    pos = next;
+  }
+  return pos;
+}
+
 // Walks every local-set-coded metadata KLV in [partitionEnd, partitionEnd +
 // byteCount) into `sets`. Shared between the Header Partition's Header
 // Metadata and a Footer Partition's redundant copy of the same (see
@@ -481,6 +510,14 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   // the Footer and make both this metadata scan and EssenceWalker skip
   // every essence element in the file, so this fixup only applies when
   // RIP[1] actually resolves to a Body Partition Pack.
+  //
+  // RIP[1] is only an upper bound, though: the real end is found by walking
+  // KLV headers up to the first one that isn't metadata. Other real files
+  // (67 on the sample share, Harmonic/AJA UHD H.264) carry the essence in
+  // the Header Partition itself, after its Index Table Segments, and their
+  // only Body Partition sits near EOF -- jumping straight to RIP[1] there
+  // made this metadata scan walk tens of GB of essence KLV by KLV, and
+  // EssenceWalker skip all of it.
   if (rip && rip->size() >= 2 && (*rip)[0].byteOffset == 0) {
     const uint64_t nextPartitionOffset = (*rip)[1].byteOffset;
     if (nextPartitionOffset > headerMetadataEnd && nextPartitionOffset < reader.Size() &&
@@ -489,7 +526,8 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
       PartitionKind nextKind{};
       if (ReadKlvHeader(reader, nextKlv) && IsPartitionPackKey(nextKlv.key, &nextKind) &&
           nextKind == PartitionKind::kBody) {
-        headerMetadataEnd = nextPartitionOffset;
+        headerMetadataEnd =
+            std::max(headerMetadataEnd, ScanHeaderMetadataEnd(reader, partitionEnd, nextPartitionOffset));
       }
     }
   }

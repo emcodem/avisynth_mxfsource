@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iostream>
 
+#include "mxf/essence_walker.h"
 #include "mxf/header_parser.h"
 #include "synthetic_mxf.h"
 
@@ -282,6 +283,85 @@ void TestUlVersionByteIgnored() {
                    0x03, 0x01, 0x02, 0x10, 0x02, 0x00, 0x00, 0x00}, kKlvFillKey));
 }
 
+// Header Partition Pack's HeaderByteCount field: 16-byte key + 1-byte BER
+// length, then MajorVersion(2) MinorVersion(2) KAGSize(4) ThisPartition(8)
+// PreviousPartition(8) FooterPartition(8).
+void SetHeaderByteCount(std::vector<uint8_t>& file, uint64_t headerByteCount) {
+  for (int i = 0; i < 8; ++i) file[49 + i] = static_cast<uint8_t>(headerByteCount >> (56 - 8 * i));
+}
+
+// Fixup 1's original purpose: HeaderByteCount undercounts the metadata, and
+// the RIP's Body Partition entry shows where the Header Partition really
+// ends. Without the RIP the sets beyond HeaderByteCount are lost.
+void TestUndercountedHeaderByteCountRecoveredViaRip() {
+  SyntheticFile cfg;
+  const size_t metadataSize = BuildHeaderMetadataBlock(cfg).size();
+  for (bool withRip : {true, false}) {
+    std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+    SetHeaderByteCount(file, metadataSize / 2);
+    const uint64_t bodyOffset = file.size();
+    AppendPartitionPack(file, PartitionKind::kBody);
+    AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x11));
+    if (withRip) AppendRandomIndexPack(file, {{0, 0}, {1, bodyOffset}});
+    auto path = WriteTempFile(file, "mxfsrc_test_hbc_undercount.mxf");
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      if (withRip) {
+        CHECK(info.has_value());
+        if (info) {
+          CHECK(info->width == cfg.width && info->height == cfg.height);
+          CHECK(info->headerMetadataEnd == bodyOffset);
+        }
+      } else {
+        CHECK(!info || info->width != cfg.width);  // the test really cuts into needed sets
+      }
+    }
+    std::filesystem::remove(path);
+  }
+}
+
+// Real layout (67 Harmonic/AJA UHD H.264 files on the sample share): the
+// Header Partition carries the essence after its Index Table Segment, and
+// the only Body Partition (RIP[1]) holds the last part of the essence near
+// EOF. Fixup 1 used to take RIP[1] as the end of the Header Metadata, which
+// made the metadata scan walk the whole essence and EssenceWalker skip it.
+// Covered with an exact and an undercounted HeaderByteCount.
+void TestEssenceInHeaderPartitionNotTreatedAsMetadata() {
+  SyntheticFile cfg;
+  const size_t metadataSize = BuildHeaderMetadataBlock(cfg).size();
+  for (size_t headerByteCount : {metadataSize, metadataSize / 2}) {
+    std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+    SetHeaderByteCount(file, headerByteCount);
+    const uint64_t metadataEnd = file.size();
+    IndexTableSegmentSpec seg;
+    seg.editUnitByteCount = 16 + 1 + 16;
+    AppendIndexTableSegment(file, seg);
+    for (int i = 0; i < 3; ++i) AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x20));
+    const uint64_t bodyOffset = file.size();
+    AppendPartitionPack(file, PartitionKind::kBody);
+    for (int i = 0; i < 2; ++i) AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x30));
+    AppendRandomIndexPack(file, {{1, 0}, {1, bodyOffset}});
+    auto path = WriteTempFile(file, "mxfsrc_test_essence_in_header.mxf");
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      CHECK(info.has_value());
+      if (info) {
+        CHECK(info->width == cfg.width && info->height == cfg.height);
+        CHECK(info->headerMetadataEnd == metadataEnd);
+
+        EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, true, {});
+        EssenceElement element;
+        int videoElements = 0;
+        while (walker.Next(element, /*wantData=*/false)) videoElements += element.isVideo ? 1 : 0;
+        CHECK(videoElements == 5);
+      }
+    }
+    std::filesystem::remove(path);
+  }
+}
+
 // Single audio track, via a MultipleDescriptor wrapping the CDCI Descriptor
 // + one Sound Descriptor -- the common real-world case. Binds directly
 // (sole-candidate fallback) even though LinkedTrackID/TrackID default to 0
@@ -462,6 +542,8 @@ int main() {
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
   TestXavcLongGopUlClassification();
   TestUlVersionByteIgnored();
+  TestUndercountedHeaderByteCountRecoveredViaRip();
+  TestEssenceInHeaderPartitionNotTreatedAsMetadata();
   TestSingleAudioTrackResolved();
   TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
   TestMismatchedBitDepthMarksAudioUnsupported();
