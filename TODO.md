@@ -417,3 +417,31 @@ touching the ring buffer, the seek path, or audio output -- this project
 has repeatedly found real bugs (the cropping bug, both ring-buffer eviction
 bugs, the CRT crash) that synthetic unit tests alone missed. Don't skip the
 real-host step just because it's slower.
+
+## Open items from the 2026-10-16 corpus scan
+
+### Jump to the end of a long-GOP file re-decodes every frame separately
+
+Observed 2026-10-19 on `SERVER/SHARE/...`
+(39.2 GB, UHD H.264 long-GOP, 30020 frames), AviSynth+ via ffmpeg:
+
+```
+c = mxfsource("...FussballBL_HD_auf_UHD_AJA_FSHDR.mxf")
+c.Trim(c.FrameCount - 25, 0)
+```
+
+The 25 frames are correct (bit-identical to ffmpeg), but the serve-stats line
+reports `served 0 frame(s) from buffer, 26 frame(s) via fallback re-decode`:
+every frame, including the strictly sequential ones after the first, goes
+through `SeekAndDecode` instead of the ring buffer. Frame 29995 is requested
+twice. Each fallback decode starts again from the preceding keyframe, so for
+long-GOP UHD this is far slower than decoding the range once.
+
+Expected: after the first out-of-window request, the producer thread should
+continue from there, so the following frames come from the buffer (compare
+`TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait`, which
+covers a forward jump but apparently not this access pattern).
+`start_frame` avoids it when the caller knows the range up front.
+
+Not investigated yet: whether the cause is the jump distance, the
+end-of-stream position, or the access pattern of AviSynth's `Trim`.
