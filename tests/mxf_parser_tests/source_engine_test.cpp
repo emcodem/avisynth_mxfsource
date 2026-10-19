@@ -74,6 +74,16 @@ bool RunWithTimeout(Fn fn, std::chrono::milliseconds timeout) {
   return true;
 }
 
+// The synthetic files in this suite are mostly shaped like a growing
+// recording (Open header, no Footer/RIP, often no Index Table), which
+// OpenOptions::strict refuses. These tests are about decoding, not that
+// policy (see the TestStrict* tests for it).
+OpenOptions NonStrictOptions() {
+  OpenOptions options;
+  options.strict = false;
+  return options;
+}
+
 constexpr uint32_t kTrackNumber = 0x01010100;
 
 std::vector<uint8_t> MakeFramePayload(int width, int height, uint8_t marker) {
@@ -324,7 +334,7 @@ void TestSequentialPlayback() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());
     CHECK(res.status == OpenStatus::kOk);
     if (res.status != OpenStatus::kOk) {
       std::cerr << "Open error: " << res.error << std::endl;
@@ -365,7 +375,7 @@ void TestEvictionFallsBackToReDecode() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 3;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -409,7 +419,7 @@ void TestSeekAndDecodeFastPathLandsOnCorrectMidRangeFrame() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 3;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -456,7 +466,7 @@ void TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());  // default buffer_frames=300, eagerdecode=32
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());  // default buffer_frames=300, eagerdecode=32
     CHECK(res.status == OpenStatus::kOk);
     if (res.status != OpenStatus::kOk) {
       std::filesystem::remove(path);
@@ -500,7 +510,7 @@ void TestOpenPeekDoesNotEvictFrameZero() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;  // deliberately tiny: reproduces the original bug at buffer_frames=5
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -535,7 +545,7 @@ void TestRepeatedRequestForSameFrameSucceeds() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 5;  // matches the buffer_frames that exposed this in practice
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -573,7 +583,7 @@ void TestOpenSucceedsWithMinimalBufferOrEagerdecode() {
       if (bufferFrames == 300 && eagerdecode == 32) continue;  // that's every other test's default; skip here
 
       SourceEngine engine;
-      OpenOptions opts;
+      OpenOptions opts = NonStrictOptions();
       opts.buffer_frames = bufferFrames;
       opts.eagerdecode = eagerdecode;
       OpenResult res = engine.Open(path.string(), opts);
@@ -629,7 +639,7 @@ void TestOriginHandlingSkipsPreRollByDefault() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());  // handle_origin defaults to true
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());  // handle_origin defaults to true
     CHECK(res.status == OpenStatus::kOk);
     if (res.status != OpenStatus::kOk) {
       std::cerr << "Open error: " << res.error << std::endl;
@@ -665,7 +675,7 @@ void TestHandleOriginFalseDisablesSkip() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.handle_origin = false;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -701,7 +711,7 @@ void TestOriginHandlingAppliesToSeekAndDecodeFallback() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 3;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1077,7 +1087,7 @@ std::vector<uint8_t> BuildGopFileWithAudio(const std::vector<EncodedGopEntry>& e
 std::vector<std::vector<uint8_t>> DecodeAllSequentially(const std::string& path, int64_t count) {
   std::vector<std::vector<uint8_t>> planes(static_cast<size_t>(count));
   SourceEngine engine;
-  OpenResult res = engine.Open(path);
+  OpenResult res = engine.Open(path, NonStrictOptions());
   if (res.status != OpenStatus::kOk) {
     std::cerr << "DecodeAllSequentially: Open failed: " << res.error << std::endl;
     return planes;
@@ -1120,7 +1130,7 @@ void TestGopSeekAndDecodeFallbackByteIdenticalWithoutIndex() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_no_index.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;  // window=[13,14] after jumping to the last frame -- target below must be genuinely evicted
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1165,7 +1175,7 @@ void TestIndexTableAssistedSeekUsesIndexAndMatchesReference() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_with_index.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1210,7 +1220,7 @@ void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_fwdseek.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;  // tiny window: target below is far beyond it without any prior eviction
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1251,7 +1261,7 @@ void TestStartFrameHintGopServesFromBufferViaIndexAssistedJump() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_hint.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     // kGopSize == 5 -> keyframes at edit units 0, 5, 10. 7 is two edit units
     // past the keyframe at 5, so ResolveSeekStart should land the jump-start
     // there (plenty of runway; this file has no B frames, so reorderDelay is
@@ -1311,7 +1321,7 @@ void TestStartFrameHintIntraOnlyStartsProductionAtHint() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.start_frame_hint = 6;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1350,7 +1360,7 @@ void TestStartFrameHintOutOfRangeIgnored() {
 
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.start_frame_hint = numFrames;  // at, not past, the frame count -- still out of range
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1407,7 +1417,7 @@ void TestReorderDelayCompensationMatchesReferenceWithRealBFrames() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_bframes_indexed.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;  // tiny: every GetVideoFrame call below is a genuine SeekAndDecode
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1507,7 +1517,7 @@ void TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference() {
   std::vector<uint8_t> referenceAudio;
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(referencePath.string());
+    OpenResult res = engine.Open(referencePath.string(), NonStrictOptions());
     CHECK(res.status == OpenStatus::kOk);
     if (res.status == OpenStatus::kOk) {
       const int64_t totalSamples = static_cast<int64_t>(numFrames) * samplesPerEditUnit;
@@ -1538,7 +1548,7 @@ void TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference() {
   auto path = WriteTempFile(bytes, "mxfsrc_test_gop_hint_audio.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.start_frame_hint = target;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1598,7 +1608,7 @@ void TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());  // no hint at all -- exactly the reported repro's shape
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());  // no hint at all -- exactly the reported repro's shape
     CHECK(res.status == OpenStatus::kOk);
     if (res.status == OpenStatus::kOk) {
       // Deliberately NOT asserting exact expected *values* per display
@@ -1653,7 +1663,7 @@ void TestUnsupportedCodecFailsOpenCleanly() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());
     CHECK(res.status == OpenStatus::kUnsupportedCodec);
   }
 
@@ -1670,7 +1680,7 @@ void TestGetAudioSamplesSequentialMatchesExpectedBytes() {
                             "mxfsrc_test_engine_audio_seq.mxf");
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string());
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());
     CHECK(res.status == OpenStatus::kOk);
     if (res.status != OpenStatus::kOk) {
       std::cerr << "Open error: " << res.error << std::endl;
@@ -1706,7 +1716,7 @@ void TestGetAudioSamplesFreshReadAfterEviction() {
                             "mxfsrc_test_engine_audio_evict.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.buffer_frames = 2;
     opts.eagerdecode = 1;
     OpenResult res = engine.Open(path.string(), opts);
@@ -1758,7 +1768,7 @@ void TestGetAudioSamplesDoesNotHangOnEditUnitSampleCountMismatch() {
                             "mxfsrc_test_engine_audio_count_mismatch.mxf");
 
   auto engine = std::make_shared<SourceEngine>();
-  OpenResult res = engine->Open(path.string());
+  OpenResult res = engine->Open(path.string(), NonStrictOptions());
   CHECK(res.status == OpenStatus::kOk);
   if (res.status != OpenStatus::kOk) {
     std::cerr << "Open error: " << res.error << std::endl;
@@ -1810,7 +1820,7 @@ void TestGetAudioSamplesDoesNotStallWhenVideoNeverRequested() {
                             "mxfsrc_test_engine_audio_only_no_video.mxf");
 
   auto engine = std::make_shared<SourceEngine>();
-  OpenOptions opts;
+  OpenOptions opts = NonStrictOptions();
   opts.buffer_frames = 5;  // small margin so the bug (if reintroduced) triggers well within numFrames=50
   opts.eagerdecode = 2;
   OpenResult res = engine->Open(path.string(), opts);
@@ -1856,7 +1866,7 @@ void TestUseAudioModeSupportedDegradesOnMismatch() {
       WriteTempFile(BuildFileWithMismatchedAudio(4, 2, 2), "mxfsrc_test_engine_audio_mismatch_supported.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;  // use_audio defaults to UseAudioMode::kSupported
+    OpenOptions opts = NonStrictOptions();  // use_audio defaults to UseAudioMode::kSupported
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
     CHECK(!engine.ExposesAudio());
@@ -1870,7 +1880,7 @@ void TestUseAudioModeAlwaysFailsOnMismatch() {
   auto path = WriteTempFile(BuildFileWithMismatchedAudio(4, 2, 2), "mxfsrc_test_engine_audio_mismatch_always.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.use_audio = UseAudioMode::kAlways;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kUnsupportedCodec);
@@ -1886,7 +1896,7 @@ void TestUseAudioModeNeverSuppressesSupportedAudio() {
                             "mxfsrc_test_engine_audio_never.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.use_audio = UseAudioMode::kNever;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1902,7 +1912,7 @@ void TestUseAudioModeAlwaysSucceedsOnVideoOnlySource() {
   auto path = WriteTempFile(BuildFile(4, 2, 3), "mxfsrc_test_engine_audio_always_video_only.mxf");
   {
     SourceEngine engine;
-    OpenOptions opts;
+    OpenOptions opts = NonStrictOptions();
     opts.use_audio = UseAudioMode::kAlways;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
@@ -1923,6 +1933,10 @@ struct StrictTestFileSpec {
   bool rip = true;                   // write a RIP after it
   uint64_t footerPointerOverride = 0;  // nonzero: Header's FooterPartition field instead of the real offset
   size_t zeroTailBytes = 0;          // zero bytes appended at the very end
+  // No Body Partition: a CBR (constant bytes per edit unit, e.g. XAVC CBG)
+  // Index Table Segment and the essence follow the Header Metadata
+  // directly. indexedFrames is ignored.
+  bool cbrIndexInHeader = false;
 };
 
 std::vector<uint8_t> BuildStrictTestFile(const StrictTestFileSpec& spec) {
@@ -1938,6 +1952,22 @@ std::vector<uint8_t> BuildStrictTestFile(const StrictTestFileSpec& spec) {
 
   std::vector<std::vector<uint8_t>> payloads;
   for (int i = 0; i < spec.numFrames; ++i) payloads.push_back(MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+
+  if (spec.cbrIndexInHeader) {
+    IndexTableSegmentSpec cbr;
+    cbr.editUnitByteCount = static_cast<uint32_t>(16 + BerLengthSize(payloads[0].size()) + payloads[0].size());
+    std::vector<uint8_t> cbrBytes;
+    AppendIndexTableSegment(cbrBytes, cbr);
+    file.insert(file.end(), cbrBytes.begin(), cbrBytes.end());
+    for (const auto& payload : payloads) AppendEssenceElement(file, kTrackNumber, payload);
+    // Header Partition Pack value (from byte 17): IndexByteCount at +40,
+    // IndexSID at +48.
+    for (int i = 0; i < 8; ++i) file[57 + i] = static_cast<uint8_t>(uint64_t{cbrBytes.size()} >> (56 - 8 * i));
+    file[68] = 1;
+    for (int i = 0; i < 8; ++i) file[41 + i] = 0;  // FooterPartition unknown, as in a growing file
+    file.insert(file.end(), spec.zeroTailBytes, 0);
+    return file;
+  }
 
   IndexTableSegmentSpec segSpec;
   segSpec.indexDuration = spec.indexedFrames;
@@ -2111,17 +2141,72 @@ void TestStrictFailsWhenIndexShorterThanDuration() {
   CHECK(res.status == OpenStatus::kOk);
 }
 
-// Open header (growing/aborted recording): every strict check is skipped,
-// even with a zero tail, no footer and no index.
-void TestStrictIgnoresOpenHeader() {
+// Open header, no Footer (growing/aborted recording) with an index reached
+// via the RIP: opens with what the index covers, even though the header's
+// not-yet-final Duration claims more.
+void TestStrictOpensGrowingFileWithRipIndex() {
   StrictTestFileSpec spec;
   spec.headerClosed = false;
-  spec.indexedFrames = 0;
+  spec.footer = false;
+  spec.indexedFrames = 2;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_growing_rip.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
+// Growing file whose only index is a CBR/CBG segment in the Header
+// Partition, no RIP, no Body Partition: reachable without a scan.
+void TestStrictOpensGrowingFileWithCbrIndexInHeader() {
+  StrictTestFileSpec spec;
+  spec.headerClosed = false;
   spec.footer = false;
   spec.rip = false;
-  spec.footerPointerOverride = 1u << 30;
+  spec.cbrIndexInHeader = true;
+  int64_t numFrames = -1;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_growing_cbr.mxf", &numFrames);
+  CHECK(res.status == OpenStatus::kOk);
+  CHECK(numFrames == spec.numFrames);
+}
+
+// Growing file whose index isn't reachable (no RIP): strict refuses instead
+// of the full-file scan it used to fall back to.
+void TestStrictFailsGrowingFileWithoutReachableIndex() {
+  StrictTestFileSpec spec;
+  spec.headerClosed = false;
+  spec.footer = false;
+  spec.rip = false;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_growing_no_index.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "no Index Table Segment"));
+
+  res = OpenStrictTestFile(spec, false, "mxfsrc_test_strict_growing_no_index_off.mxf");
+  CHECK(res.status == OpenStatus::kOk);
+}
+
+// A zero tail fails even with an Open header (e.g. preallocated recording).
+void TestStrictFailsZeroTailWithOpenHeader() {
+  StrictTestFileSpec spec;
+  spec.headerClosed = false;
+  spec.footer = false;
+  spec.rip = false;
+  spec.cbrIndexInHeader = true;
   spec.zeroTailBytes = 200000;
-  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_open_header.mxf");
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_open_zero_tail.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "ends with 200000 zero bytes"));
+}
+
+// Open header but a Closed Footer: the file is finished, so the index must
+// cover the Duration exactly as with a Closed header.
+void TestStrictTreatsClosedFooterAsFinished() {
+  StrictTestFileSpec spec;
+  spec.headerClosed = false;
+  spec.indexedFrames = 2;
+  OpenResult res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_closed_footer_short.mxf");
+  CHECK(res.status == OpenStatus::kDamagedFile);
+  CHECK(ErrorContains(res, "declares 4 edit units, but the Index Table covers only 2"));
+
+  spec.indexedFrames = 4;
+  res = OpenStrictTestFile(spec, true, "mxfsrc_test_strict_closed_footer_ok.mxf");
   CHECK(res.status == OpenStatus::kOk);
 }
 
@@ -2163,7 +2248,11 @@ int main() {
   TestStrictToleratesBadFooterPointerWithValidRip();
   TestStrictFailsWithoutIndex();
   TestStrictFailsWhenIndexShorterThanDuration();
-  TestStrictIgnoresOpenHeader();
+  TestStrictOpensGrowingFileWithRipIndex();
+  TestStrictOpensGrowingFileWithCbrIndexInHeader();
+  TestStrictFailsGrowingFileWithoutReachableIndex();
+  TestStrictFailsZeroTailWithOpenHeader();
+  TestStrictTreatsClosedFooterAsFinished();
 
   if (g_failures == 0) {
     std::cout << "all source_engine tests passed" << std::endl;

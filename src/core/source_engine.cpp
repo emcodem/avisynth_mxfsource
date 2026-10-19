@@ -155,13 +155,16 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   // OpenOptions::strict: read-only checks, run before the index build so a
   // damaged file fails in a few reads instead of first paying for a
   // full-file bitstream scan.
-  bool strictClosed = false;
+  // strictFinished: the writer declared the file finished (Closed Footer,
+  // or else Closed header), so its Duration is final and the index must
+  // cover it.
+  bool strictFinished = false;
   if (options.strict) {
     if (std::optional<FileIntegrity> integrity = ProbeFileIntegrity(*reader_)) {
       if (std::optional<std::string> error = CheckStrictIntegrity(*integrity)) {
         return {OpenStatus::kDamagedFile, *error};
       }
-      strictClosed = integrity->headerClosed;
+      strictFinished = integrity->Finished();
     }
   }
 
@@ -196,10 +199,15 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     // already treats as "no index available, use the
     // from-essence-element-0 fallback" -- never a hard Open() failure.
     videoIndex_ = BuildEssenceIndex(*reader_, streamInfo_.bodySid);
-    if ((!videoIndex_ || videoIndex_->Empty()) && strictClosed) {
+    if ((!videoIndex_ || videoIndex_->Empty()) && options.strict) {
+      // Strict never builds an index by walking the whole file, finished or
+      // not: a growing file opens only if its index is reachable directly
+      // (Header Partition, e.g. a CBR/CBG segment, or partitions listed in
+      // the RIP).
       return {OpenStatus::kDamagedFile,
-              "strict: Header Partition is Closed but the file has no Index Table Segment; opening it would need "
-              "a full-file bitstream scan (disable strict to open it anyway)"};
+              "strict: no Index Table Segment found in the Header Partition or any partition listed in a Random "
+              "Index Pack; opening the file would need a full-file bitstream scan (disable strict to open it "
+              "anyway)"};
     }
     if ((!videoIndex_ || videoIndex_->Empty())) {
       // No real SMPTE Index Table Segment at all (e.g. a truncated file
@@ -237,9 +245,9 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   // override, or the Index Table fallback above), so this is safe to derive.
   const int64_t rawFrameCount = originSkip_ + streamInfo_.numFrames;
 
-  if (strictClosed && videoIndex_ && videoIndex_->HighestCoveredEditUnit() + 1 < rawFrameCount) {
+  if (strictFinished && videoIndex_ && videoIndex_->HighestCoveredEditUnit() + 1 < rawFrameCount) {
     return {OpenStatus::kDamagedFile,
-            "strict: Header Partition is Closed and declares " + std::to_string(rawFrameCount) +
+            "strict: the file is finalized (Closed Partition) and declares " + std::to_string(rawFrameCount) +
                 " edit units, but the Index Table covers only " +
                 std::to_string(videoIndex_->HighestCoveredEditUnit() + 1) +
                 "; the file is incomplete or damaged (disable strict to open it anyway)"};

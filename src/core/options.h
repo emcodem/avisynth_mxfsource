@@ -110,17 +110,20 @@ struct OpenOptions {
 
   // Refuse damaged files instead of opening whatever can be salvaged --
   // for automated pipelines, where a silently short or slow-to-open file is
-  // worse than an explicit error. Applies only when the Header Partition is
-  // Closed (the writer declared the file finished); an Open header is a
-  // growing or aborted recording, expected to be incomplete, and opens as
-  // usual. With a Closed header, Open() fails when:
+  // worse than an explicit error. Open() fails when:
   //   - the file ends with an unexpected run of zero bytes
-  //     (see mxf/integrity.h's kMaxExpectedTrailingZeroBytes),
-  //   - the header declares a Footer Partition that isn't there (e.g.
+  //     (see mxf/integrity.h's kMaxExpectedTrailingZeroBytes), whatever
+  //     the partition statuses,
+  //   - no Index Table Segment is reachable without scanning the essence
+  //     (Header Partition, e.g. a CBR/CBG segment, or partitions listed in
+  //     the RIP) -- strict never runs the full-file bitstream scan of
+  //     mxf/bitstream_index.h,
+  //   - a Closed header declares a Footer Partition that isn't there (e.g.
   //     beyond EOF) and there is no Random Index Pack,
-  //   - there is no Index Table Segment at all (no full-file bitstream
-  //     scan, see mxf/bitstream_index.h), or
-  //   - the index covers fewer edit units than the header's Duration.
+  //   - the file is finished (a Closed Footer Partition, or else a Closed
+  //     header) and the index covers fewer edit units than its Duration.
+  //     An unfinished (growing/aborted) recording has no final Duration, so
+  //     it opens with whatever its index covers.
   // On by default. Exposed to scripts as MxfSource(..., strict=true/false).
   bool strict = true;
 };

@@ -20,6 +20,15 @@ namespace {
 
 int g_failures = 0;
 
+// The synthetic file served here is shaped like a growing recording (Open
+// header, no Footer/RIP, no Index Table), which OpenOptions::strict
+// refuses. These tests are about HTTP access, not that policy.
+OpenOptions NonStrictOptions() {
+  OpenOptions options;
+  options.strict = false;
+  return options;
+}
+
 #define CHECK(cond)                                                             \
   do {                                                                          \
     if (!(cond)) {                                                              \
@@ -54,7 +63,7 @@ void TestSequentialPlaybackOverHttp() {
   MiniHttpServer server(BuildFile(width, height, numFrames));
 
   SourceEngine engine;
-  OpenResult res = engine.Open(server.BaseUrl() + "/test.mxf");
+  OpenResult res = engine.Open(server.BaseUrl() + "/test.mxf", NonStrictOptions());
   CHECK(res.status == OpenStatus::kOk);
   if (res.status != OpenStatus::kOk) {
     std::cerr << "Open error: " << res.error << std::endl;
@@ -79,7 +88,7 @@ void TestSeekAndDecodeFallbackCarriesCustomHeaders() {
   server.SetRequiredHeader("X-Test-Auth", "secret123");
 
   SourceEngine engine;
-  OpenOptions opts;
+  OpenOptions opts = NonStrictOptions();
   opts.buffer_frames = 3;  // small window: forces the eviction/fallback path below
   opts.http_headers = "X-Test-Auth: secret123\r\n";
   OpenResult res = engine.Open(server.BaseUrl() + "/test.mxf", opts);
@@ -112,7 +121,7 @@ void TestMissingHeaderIsRejected() {
   server.SetRequiredHeader("X-Test-Auth", "secret123");
 
   SourceEngine engine;
-  OpenResult res = engine.Open(server.BaseUrl() + "/test.mxf");  // no http_headers set
+  OpenResult res = engine.Open(server.BaseUrl() + "/test.mxf", NonStrictOptions());  // no http_headers set
   CHECK(res.status != OpenStatus::kOk);
 }
 

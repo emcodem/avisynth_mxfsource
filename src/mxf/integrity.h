@@ -37,6 +37,11 @@ struct FileIntegrity {
   // A RIP parses at EOF, its first entry is offset 0 and its last entry
   // holds a Partition Pack whose ThisPartition equals that offset.
   bool ripValid = false;
+  // A Closed Footer Partition Pack was found, via footerPartition or the
+  // RIP's last entry. Takes precedence over headerStatus: it means the
+  // writer finished the file, and its Header Metadata copy (if any) is what
+  // ParseMxfHeader already reads Duration from.
+  bool closedFooterFound = false;
 
   // Number of zero bytes at the end of the file, and where the non-zero data
   // ends (fileSize - trailingZeroBytes). Only measured when the last
@@ -44,6 +49,11 @@ struct FileIntegrity {
   uint64_t trailingZeroBytes = 0;
   uint64_t dataEnd = 0;
   bool trailingZerosUnexpected = false;
+
+  // The writer declared the file finished: a Closed Footer exists, or else
+  // the Header Partition itself is Closed. An unfinished file is a growing
+  // or aborted recording whose Duration isn't final yet.
+  bool Finished() const { return closedFooterFound || headerClosed; }
 };
 
 // Returns nullopt only if the Header Partition Pack itself can't be read
@@ -51,11 +61,10 @@ struct FileIntegrity {
 std::optional<FileIntegrity> ProbeFileIntegrity(MxfReader& reader);
 
 // The strict-mode checks that need nothing but FileIntegrity: an
-// unexpected zero tail, or a Footer Partition the Closed header promises but
-// that isn't there (with no RIP to say otherwise). Returns the error message
-// for the first failing check, nullopt if the file passes. Never fails a file
-// whose Header Partition is not Closed -- an Open header is a growing or
-// aborted recording, expected to be incomplete.
+// unexpected zero tail (whatever the partition statuses), or a Footer
+// Partition a Closed header promises but that isn't there (with no RIP to
+// say otherwise). Returns the error message for the first failing check,
+// nullopt if the file passes.
 std::optional<std::string> CheckStrictIntegrity(const FileIntegrity& integrity);
 
 }  // namespace mxfsrc

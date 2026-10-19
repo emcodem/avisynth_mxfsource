@@ -7,18 +7,27 @@ namespace mxfsrc {
 
 namespace {
 
+struct ValidatedPartition {
+  PartitionPack pack;
+  PartitionStatus status = PartitionStatus::kUnknown;
+};
+
 // Reads the Partition Pack at `offset` and accepts it only if its own
 // ThisPartition field equals `offset` -- a pointer into essence or zero
 // fill would have to reproduce both a Partition Pack key and its own
 // absolute byte offset to pass.
-std::optional<PartitionPack> ReadSelfReferencingPartitionPack(MxfReader& reader, uint64_t offset) {
+std::optional<ValidatedPartition> ReadSelfReferencingPartitionPack(MxfReader& reader, uint64_t offset) {
   if (offset >= reader.Size() || !reader.Seek(offset)) return std::nullopt;
   KlvHeader klv{};
   if (!ReadKlvHeader(reader, klv)) return std::nullopt;
   if (!IsPartitionPackKey(klv.key, nullptr)) return std::nullopt;
   std::optional<PartitionPack> pack = ReadPartitionPackValue(reader, klv);
   if (!pack || pack->thisPartition != offset) return std::nullopt;
-  return pack;
+  return ValidatedPartition{*pack, ClassifyPartitionStatus(klv.key)};
+}
+
+bool IsClosedFooter(const std::optional<ValidatedPartition>& p) {
+  return p && p->pack.kind == PartitionKind::kFooter && IsPartitionClosed(p->status);
 }
 
 // Reads [offset, offset+len) into `buf` and reports whether it is all zero.
@@ -91,13 +100,17 @@ std::optional<FileIntegrity> ProbeFileIntegrity(MxfReader& reader) {
   out.footerPartition = header->footerPartition;
 
   if (out.footerPartition != 0) {
-    std::optional<PartitionPack> footer = ReadSelfReferencingPartitionPack(reader, out.footerPartition);
-    out.footerValid = footer && footer->kind == PartitionKind::kFooter;
+    std::optional<ValidatedPartition> footer = ReadSelfReferencingPartitionPack(reader, out.footerPartition);
+    out.footerValid = footer && footer->pack.kind == PartitionKind::kFooter;
+    out.closedFooterFound = IsClosedFooter(footer);
   }
 
   if (auto rip = ReadRandomIndexPack(reader)) {
-    out.ripValid = !rip->empty() && rip->front().byteOffset == 0 &&
-                   ReadSelfReferencingPartitionPack(reader, rip->back().byteOffset).has_value();
+    if (!rip->empty() && rip->front().byteOffset == 0) {
+      std::optional<ValidatedPartition> last = ReadSelfReferencingPartitionPack(reader, rip->back().byteOffset);
+      out.ripValid = last.has_value();
+      out.closedFooterFound = out.closedFooterFound || IsClosedFooter(last);
+    }
   }
 
   const uint64_t tailLen = std::min<uint64_t>(out.fileSize, kMaxExpectedTrailingZeroBytes);
@@ -110,16 +123,19 @@ std::optional<FileIntegrity> ProbeFileIntegrity(MxfReader& reader) {
 }
 
 std::optional<std::string> CheckStrictIntegrity(const FileIntegrity& integrity) {
-  if (!integrity.headerClosed) return std::nullopt;
-
+  // Whatever the partition statuses say: a growing file preallocated with
+  // zeros is as unusable for an automated pipeline as a broken one.
   if (integrity.trailingZerosUnexpected) {
-    return "strict: Header Partition is Closed but the file ends with " +
-           std::to_string(integrity.trailingZeroBytes) + " zero bytes (data ends at byte " +
-           std::to_string(integrity.dataEnd) + " of " + std::to_string(integrity.fileSize) +
+    return "strict: the file ends with " + std::to_string(integrity.trailingZeroBytes) +
+           " zero bytes (data ends at byte " + std::to_string(integrity.dataEnd) + " of " +
+           std::to_string(integrity.fileSize) +
            "); the file is incomplete or damaged (disable strict to open it anyway)";
   }
 
-  if (integrity.footerPartition != 0 && !integrity.footerValid && !integrity.ripValid) {
+  // A Closed header promises a Footer; an Open one (growing file) usually
+  // doesn't know where it will be yet.
+  if (integrity.headerClosed && !integrity.closedFooterFound && integrity.footerPartition != 0 &&
+      !integrity.footerValid && !integrity.ripValid) {
     if (integrity.footerPartition >= integrity.fileSize) {
       return "strict: Header Partition is Closed and declares the Footer Partition at byte " +
              std::to_string(integrity.footerPartition) + ", but the file is only " +
