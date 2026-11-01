@@ -34,8 +34,8 @@ the video frames:
 - **Both hosts, one engine.** AviSynth+ and VapourSynth plugins share one
   core and take the same parameters.
 - **Wide codec coverage** through libavcodec: MPEG-2 (XDCAM HD/HD422, D-10/
-  IMX), H.264 (AVC-Intra, XAVC, XAVC-L), DV, ProRes (incl. 4444, 12 bit),
-  DNxHD/DNxHR and uncompressed video. See [Video output formats](#video-output-formats).
+  IMX), H.264 (AVC-Intra, XAVC, XAVC-L), ProRes (incl. 4444, 12 bit),
+  DNxHD/DNxHR and uncompressed video. See [Supported MXF files](#supported-mxf-files).
 - **Audio.** All audio tracks are mixed into one interleaved PCM stream,
   including D-10/IMX 8-channel AES3 and AES3-wrapped PCM; see [Audio](#audio).
 - **Correct frame counts and field order**, with the MXF SourcePackage
@@ -236,6 +236,43 @@ Status:
   yuv444p12 output and 12-bit ProRes 4444 (codec tag from the coding UL);
   block-read resync over raw padding and garbage. Each fix was checked
   bit-exactly against ffmpeg on real files from the scan.
+
+## Supported MXF files
+
+**MXF structure**
+
+| | Status |
+|---|---|
+| OP1a, frame-wrapped essence (one KLV per edit unit) | supported |
+| Index Table present (in the Header, Body or Footer Partition) | required by [strict mode](#strict-mode); without strict, a file with no index is decoded from the start |
+| Header Open/Incomplete, truncated or growing files | refused in strict mode; without strict, opened as far as they can be read |
+| OP-Atom, clip-wrapped essence (one KLV for the whole track; e.g. P2 DV and AVC-Intra) | **not supported**: strict mode refuses it, without strict it exposes only the first frame or times out |
+| OP1b with several BodySIDs (e.g. P2 AVC-LongG) | **not supported**: the per-stream indexes are not separated |
+
+One video track per file; every audio track is mixed into one stream.
+
+**Video codecs** (decoded by libavcodec; output formats in [Video output formats](#video-output-formats))
+
+| Codec | Typical source | Checked on real files |
+|---|---|---|
+| MPEG-2, 4:2:2 and 4:2:0 | XDCAM HD / HD422, D-10 / IMX | yes |
+| H.264, 8 and 10 bit | AVC-Intra, XAVC, XAVC-L (also UHD), generic H.264 | yes |
+| Apple ProRes 422, 4444, 4444 XQ | | yes |
+| DNxHD / DNxHR (incl. HQX, 444, 10 and 12 bit) | | yes |
+| Uncompressed 8-bit 4:2:2 (UYVY) | | yes |
+| DV, JPEG 2000, MPEG-4, FFV1 | | recognized and mapped, **not verified** against real MXF files |
+
+Anything libavcodec decodes to another pixel format (for example ProRes with
+alpha) fails at open with a clear message.
+
+**Audio** (details and `use_audio` policy in [Audio](#audio))
+
+- Supported: uncompressed linear PCM, 16/24/32 bit, in SMPTE 382 Generic
+  Container sound elements (WAVE or AES3 descriptors) and in the D-10/IMX
+  8-channel AES3 element.
+- Not supported: compressed audio (AC-3, MP2, AAC), big-endian AIFF coding, and
+  tracks that disagree on bit depth or sample rate. Such files play as
+  video-only by default, or fail to open with `use_audio="always"`.
 
 ## Parameters
 
