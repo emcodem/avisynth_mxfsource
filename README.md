@@ -724,6 +724,12 @@ cmake --build build -- -j$(nproc)
 
 Outputs `build/src/avs/mxfsource_avs.so` and `build/src/vs/mxfsource_vs.so`.
 
+The FFmpeg libraries are copied next to each plugin and found through an
+`$ORIGIN` run path, so a plugin directory with the `.so` and the three
+`libav*`/`libswresample` files can be moved anywhere. The prebuilt binaries
+need glibc 2.38 or newer and OpenSSL 3 (for example Ubuntu 24.04, Debian 13);
+build from source on older distributions.
+
 ## Verify
 
 `samples/test.avs`/`test.vpy` point at `path/to/file.mxf` as a placeholder --
