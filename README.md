@@ -7,11 +7,57 @@ seek index. It's designed for the ffmpeg-processing use case: frames are
 always decoded forward, frame 0, 1, 2, ... to EOF. A background thread walks
 the MXF file and decodes ahead into a configurable ring buffer (default 300
 frames) so the host's own prefetch/read-ahead requests are served from cache.
-See `docs/plan.md`-equivalent context in the design plan for the full
-rationale and architecture (partition/KLV parser, avcodec decode layer,
-shared core engine, thin AviSynth+/VapourSynth adapters).
 
-Current status:
+## Features
+
+- **Both hosts, one engine.** AviSynth+ and VapourSynth plugins share one
+  core and take the same parameters.
+- **Forward-only, fast open.** No full-file scan: the file is opened from
+  its header, footer/RIP and Index Table, so multi-GB and UHD files open in
+  about a second. Seeking is served from a ring buffer, with Index Table
+  lookups for jumps outside it.
+- **Wide codec coverage** through libavcodec: MPEG-2 (XDCAM HD/HD422, D-10/
+  IMX), H.264 (AVC-Intra, XAVC, XAVC-L), DV, ProRes (incl. 4444, 12 bit),
+  DNxHD/DNxHR and uncompressed video. See [Video output formats](#video-output-formats).
+- **Audio.** All audio tracks are mixed into one interleaved PCM stream,
+  including D-10/IMX 8-channel AES3 and AES3-wrapped PCM; see [Audio](#audio).
+- **Correct frame counts and field order**, with the MXF SourcePackage
+  `Origin` trim honored by default (`handle_origin`).
+- **[Strict mode](#strict-mode)** (default on): damaged or incomplete files
+  fail fast with a precise message instead of silently producing wrong output.
+- **[HTTP, HTTPS and S3 presigned URLs](#http-https-and-s3-presigned-urls)**
+  as a source, with range requests, retries and no download to disk.
+- **Published index for distributed processing.** `MxfExtractIndex` scans a
+  file once and publishes the index (to a path or a presigned PUT URL);
+  other machines open the same file with `indexurl=` and skip the scan.
+- **Long and non-ASCII paths** on Windows.
+- **Windows (MSVC) and Linux (gcc/clang)** builds; see [Build](#build).
+
+## Quick start
+
+AviSynth+:
+
+```
+LoadPlugin("mxfsource.dll")
+MxfSource("D:\clips\interview.mxf")                       # local file
+MxfSource("https://example.com/bucket/interview.mxf?X-Amz-...")   # presigned URL
+```
+
+VapourSynth:
+
+```python
+r = core.mxfsource.MxfSource("interview.mxf")
+clip = r if isinstance(r, vs.VideoNode) else r["clip"]
+```
+
+All parameters are listed under [Parameters](#parameters).
+
+## Development history
+
+The notes below record how the plugin was built, phase by phase, and what
+real-world files taught along the way. They are kept for reference.
+
+Status:
 - **Phase 0 (scaffolding) -- done.** The build system and both plugin ABIs
   are wired up and verified end to end via the actual production pipeline
   (`ffmpeg -f avisynth -i test.avs` and `vspipe -c y4m test.vpy - | ffmpeg`).
@@ -227,7 +273,65 @@ publish and fails.
   wide-character API. On Linux paths are byte strings and opened as they
   are.
 - **`http://` / `https://` URLs** for `file`, with `httpheaders` for
-  authentication (S3 presigned URLs need none).
+  authentication (S3 presigned URLs need none). See
+  [HTTP, HTTPS and S3 presigned URLs](#http-https-and-s3-presigned-urls).
+
+### HTTP, HTTPS and S3 presigned URLs
+
+`file` can be an `http(s)://` URL. The MXF is streamed over HTTP with
+libcurl and never downloaded to disk, so a presigned S3 object (or any
+HTTP server that supports byte ranges) works like a local path:
+
+```
+MxfSource("https://my-bucket.s3.eu-central-1.amazonaws.com/clip.mxf?X-Amz-Algorithm=...&X-Amz-Signature=...")
+```
+
+**Authentication.**
+- An S3 **presigned GET URL** carries its authorization in the query string,
+  so `httpheaders` is not needed.
+- For a server that wants a header, pass it in `httpheaders`, e.g.
+  `httpheaders="Authorization: Bearer <token>\r\n"`. The headers are sent
+  with every request for the source file.
+- The URL's signature expires. A `403` is reported as
+  `HTTP 403 Forbidden (if this is an S3 presigned URL, it may have expired)`.
+  Make the URL valid for as long as the job runs: the file is read for the
+  whole playback, not just at open.
+
+**How the file is read.**
+- Open sends one ranged `GET` for the first byte (never `HEAD`, because a
+  presigned URL is signed for one method, usually `GET`) and takes the file
+  size from `Content-Range`.
+- Reading is sequential, with up to 4 MiB read ahead. A forward jump of up
+  to 256 KiB is skipped on the open connection; a larger or backward jump
+  starts a new request with a `Range` header.
+- A server without range support still works. Seeking is then emulated by
+  discarding data or restarting the download, which can be slow, and a
+  warning is logged once.
+- Transient failures (connect, DNS, timeout, reset, TLS connect, empty
+  reply, HTTP 5xx) are retried twice with 0.5 s and 1 s backoff, resuming
+  at the byte where the transfer stopped. Other errors (`403`, `404`,
+  `416`, ...) fail at once.
+- Connect timeout is 15 s; a transfer below 512 bytes/s for 30 s is
+  aborted. TLS certificates are verified and up to 5 redirects are followed.
+
+**Strict mode over HTTP.** The same checks apply as for local files, and
+each one costs a ranged request (footer, RIP, index), not a download.
+
+**Publishing and reusing an index.** `MxfExtractIndex(file, targeturl)`
+builds the index of a file (local or HTTP) and writes it as JSON to
+`targeturl`: a local path, or an `http(s)://` URL written with a single
+`PUT`. With S3 that means a **presigned PUT URL**. Other machines then use
+`MxfSource(file, indexurl=<presigned GET URL or path>)` against a
+byte-identical copy of the file and skip the scan.
+- A presigned URL is valid for one method only: use one URL to write the
+  index and a different one to read it back.
+- No custom headers are sent for the index transfer, so use presigned URLs
+  or open paths for `targeturl` and `indexurl`.
+- A fetched index is checked against the file (version, BodySID, and that
+  its last entry lies within the file size). Any mismatch fails the open;
+  it never falls back to a local scan.
+- When indexing an HTTP source, the index sections are fetched with
+  parallel ranged requests.
 
 ### Video output formats
 
