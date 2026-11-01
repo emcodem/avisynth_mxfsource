@@ -33,6 +33,11 @@ struct EssenceResyncResult {
   // scanHardEndBound's own comment in index_table.h for why it's kept
   // separate from essenceStartOffset above).
   uint64_t scanHardEndBound;
+  // A resync was needed (no valid KLV at a spot reached). Reported
+  // (EssenceIndex::EssenceStartResyncs): with the partition content base
+  // (see IndexRangeStart) it means damage or a writer whose IndexByteCount
+  // ends inside a trailing KLV Fill (seen: a Cambria footer, intact file).
+  bool resynced = false;
 };
 
 // A partition's own declared HeaderByteCount+IndexByteCount is supposed to
@@ -52,6 +57,9 @@ struct EssenceResyncResult {
 // track this partition's essence belongs to.
 EssenceResyncResult ResyncToActualEssenceStart(MxfReader& reader, uint64_t candidate) {
   uint64_t pos = candidate;
+  bool resynced = false;
+  // Every resync together searches at most kMaxResyncBytes past `candidate`.
+  const uint64_t resyncLimit = candidate + kMaxResyncBytes;
   for (int guard = 0; guard < 8; ++guard) {  // a handful of Fill items at most, never unbounded
     // True EOF, reached only via real, successfully-parsed KLVs: proves
     // there's no essence anywhere between `candidate` and end of file, which
@@ -66,8 +74,8 @@ EssenceResyncResult ResyncToActualEssenceStart(MxfReader& reader, uint64_t candi
     // Footer Partition's own Index Table Segment (covering the file's true
     // final edit units) undercounted-and-rejected by
     // ScanPartitionForIndexSegments's hardEnd check.
-    if (pos >= reader.Size()) return {candidate, pos};
-    if (!reader.Seek(pos)) return {candidate, candidate};
+    if (pos >= reader.Size()) return {candidate, pos, resynced};
+    if (!reader.Seek(pos)) return {candidate, candidate, resynced};
     KlvHeader klv{};
     // A failed parse here isn't just "no valid key at pos" -- since
     // `candidate` is itself only an estimate (see the undercount note
@@ -81,16 +89,17 @@ EssenceResyncResult ResyncToActualEssenceStart(MxfReader& reader, uint64_t candi
     // partition's Index Table Segment for essentially arbitrary reasons
     // (whichever way that specific binary content happens to BER-decode).
     if (!ReadKlvHeader(reader, klv) || !LooksLikeKlvKey(klv.key)) {
-      if (!reader.Seek(pos + 1) || !ResyncToUlDesignator(reader)) return {candidate, candidate};
+      resynced = true;
+      if (!reader.Seek(pos + 1) || !ResyncToUlDesignator(reader, resyncLimit)) return {candidate, candidate, true};
       pos = reader.Tell();
       continue;
     }
-    if (IsEssenceElementKey(klv.key)) return {pos, pos};
+    if (IsEssenceElementKey(klv.key)) return {pos, pos, resynced};
     const uint64_t valueEnd = klv.valueOffset + klv.length;
-    if (valueEnd > reader.Size()) return {candidate, candidate};
+    if (valueEnd > reader.Size()) return {candidate, candidate, resynced};
     pos = valueEnd;
   }
-  return {candidate, pos};
+  return {candidate, pos, resynced};
 }
 
 }  // namespace
@@ -150,6 +159,40 @@ std::vector<IndexTableEntry> GetIndexEntryArray(const LocalTagMap& set, uint16_t
 
 namespace {
 
+// True if an Index Table Segment starts at `pos`, after any KLV Fill.
+bool IndexSegmentAt(MxfReader& reader, uint64_t pos) {
+  pos = PartitionContentStart(reader, pos, reader.Size());
+  KlvHeader klv{};
+  return reader.Seek(pos) && ReadKlvHeader(reader, klv) && UlEquals(klv.key, kIndexTableSegmentKey);
+}
+
+// Where a partition's Index Table data starts: HeaderByteCount bytes after
+// PartitionContentStart (real writers count from there, not from the end of
+// the Partition Pack -- see partition.h). Measured on real K2 Summit files:
+// counting from the Partition Pack put the start 340 bytes too early, into
+// the Fill's random-byte value, and the Footer's last segment was lost
+// (strict refused the intact files with "the Index Table covers only 2880"
+// of 3000 edit units). The old base is kept where the segment is found only
+// there, so a writer counting from the Partition Pack still works; with no
+// segment at either, the start stays the old estimate and
+// ScanPartitionForIndexSegments resyncs from there, as before. A
+// HeaderByteCount that doesn't fit in the file (seen: 0xFFFFFFFFFFFFFFFF)
+// is unknown: the Index Table then starts where the Header Metadata ends,
+// found by the bounded ScanHeaderMetadataEnd. A partition without Index
+// Table data takes the corrected base too, so its essence start (see
+// ResyncToActualEssenceStart) is exact.
+uint64_t IndexRangeStart(MxfReader& reader, uint64_t partitionEnd, const PartitionPack& pack) {
+  const uint64_t size = reader.Size();
+  const uint64_t contentStart = PartitionContentStart(reader, partitionEnd, size);
+  if (contentStart > size || pack.headerByteCount > size - contentStart) {
+    return ScanHeaderMetadataEnd(reader, contentStart, size);
+  }
+  const uint64_t corrected = contentStart + pack.headerByteCount;
+  const uint64_t old = partitionEnd + pack.headerByteCount;
+  if (corrected == old || pack.indexByteCount == 0 || IndexSegmentAt(reader, corrected)) return corrected;
+  return old;
+}
+
 std::optional<IndexScanPartition> ReadOnePartitionForIndex(MxfReader& reader, uint64_t offset) {
   if (offset >= reader.Size()) return std::nullopt;
   if (!reader.Seek(offset)) return std::nullopt;
@@ -166,11 +209,12 @@ std::optional<IndexScanPartition> ReadOnePartitionForIndex(MxfReader& reader, ui
   scan.bodySid = pack->bodySid;
   scan.indexSid = pack->indexSid;
   const uint64_t partitionEnd = klv.valueOffset + klv.length;
-  scan.indexByteRangeStart = partitionEnd + pack->headerByteCount;
+  scan.indexByteRangeStart = IndexRangeStart(reader, partitionEnd, *pack);
   scan.indexByteRangeEnd = scan.indexByteRangeStart + pack->indexByteCount;
   const EssenceResyncResult resync = ResyncToActualEssenceStart(reader, scan.indexByteRangeEnd);
   scan.essenceStartOffset = resync.essenceStartOffset;
   scan.scanHardEndBound = resync.scanHardEndBound;
+  scan.essenceStartResynced = resync.resynced;
   scan.bodyOffset = pack->bodyOffset;
   return scan;
 }
@@ -234,9 +278,13 @@ std::vector<IndexTableSegment> ScanPartitionForIndexSegments(MxfReader& reader, 
     if (reader.Tell() >= rangeEnd) break;  // rough guide: stop looking for a *new* segment past here
     const uint64_t klvStart = reader.Tell();
     KlvHeader klv{};
-    if (!ReadKlvHeader(reader, klv)) break;
+    // A failed parse (e.g. a BER length of more than 8 bytes) means "not a
+    // KLV boundary here" just like a key that isn't one -- seen when the
+    // start estimate lands inside a Fill's random-byte value -- so it gets
+    // the same bounded resync below instead of ending the scan.
+    const bool parsed = ReadKlvHeader(reader, klv);
 
-    if (!LooksLikeKlvKey(klv.key)) {
+    if (!parsed || !LooksLikeKlvKey(klv.key)) {
       // Some real recorders pad this region to a KAG boundary with raw
       // zero bytes instead of a spec-compliant KLV Fill Item (observed:
       // Atomos Shogun XAVC-Intra/XAVC-L recordings -- see klv.h's
@@ -418,6 +466,10 @@ void FlattenSegmentInto(const IndexTableSegment& seg, uint64_t fileSize, const s
                         const std::vector<IndexScanPartition>& partitionsByOffset, std::vector<FlatIndexEntry>& out) {
   if (seg.editUnitByteCount != 0) {
     if (seg.essenceContainerBaseOffset >= fileSize) return;
+    // Not even one edit unit fits: a placeholder, not an index (seen: an
+    // unfinished recording's only segment, EditUnitByteCount 0xFFFFFFFF and
+    // IndexDuration 0, which made a 1-frame "index" of a 336 MB file).
+    if (seg.editUnitByteCount > fileSize - seg.essenceContainerBaseOffset) return;
     const uint64_t maxIterationsThatFit =
         (fileSize - seg.essenceContainerBaseOffset) / seg.editUnitByteCount + 1;
     const int64_t iterations = seg.indexDuration > 0
@@ -511,7 +563,13 @@ std::optional<EssenceIndex> FinishBuildingIndex(const std::vector<IndexScanParti
                   [](const FlatIndexEntry& a, const FlatIndexEntry& b) { return a.editUnit == b.editUnit; }),
       flat.end());
 
-  return EssenceIndex(std::move(flat));
+  EssenceIndex index(std::move(flat));
+  std::vector<uint64_t> resynced;
+  for (const auto& partition : scanPartitions) {
+    if (partition.essenceStartResynced) resynced.push_back(partition.partitionOffset);
+  }
+  index.SetEssenceStartResyncs(std::move(resynced));
+  return index;
 }
 
 }  // namespace

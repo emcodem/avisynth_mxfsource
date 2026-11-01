@@ -81,6 +81,52 @@ bool SkipNextVideoElement(EssenceWalker& walker) {
 
 SourceEngine::SourceEngine() = default;
 
+FieldOrder SourceEngine::FieldOrderOf(const NormalizedFrame& frame) const {
+  if (frame.fieldOrder != FieldOrder::kUnknown) return frame.fieldOrder;
+  switch (streamInfo_.frameLayout) {
+    case 0:  // FullFrame
+    case 4:  // SegmentedFrame (PsF): progressive content
+      return FieldOrder::kProgressive;
+    case 1:  // SeparateFields
+    case 3:  // MixedFields
+      return streamInfo_.fieldDominance == 1 ? FieldOrder::kTff : FieldOrder::kUnknown;
+    default:
+      return FieldOrder::kUnknown;
+  }
+}
+
+EssenceWalkerOptions SourceEngine::WalkerOptions() {
+  EssenceWalkerOptions walkerOptions;
+  walkerOptions.maxResyncBytes = strict_ ? 0 : kMaxResyncBytes;
+  walkerOptions.onDamage = [this](const WalkDamage& damage) { LogWalkDamage(damage); };
+  return walkerOptions;
+}
+
+void SourceEngine::LogWalkDamage(const WalkDamage& damage) {
+  {
+    std::lock_guard<std::mutex> lock(damageLogMutex_);
+    if (std::find(loggedDamageOffsets_.begin(), loggedDamageOffsets_.end(), damage.offset) !=
+        loggedDamageOffsets_.end()) {
+      return;
+    }
+    loggedDamageOffsets_.push_back(damage.offset);
+  }
+  std::string line = "[MxfSource] " + path_ + ": no valid KLV at byte " + std::to_string(damage.offset) +
+                     " (the file is damaged there); ";
+  if (damage.resumed) {
+    line += "skipped " + std::to_string(damage.resumedAt - damage.offset) + " bytes to the next key at byte " +
+            std::to_string(damage.resumedAt);
+  } else if (damage.badLength) {
+    line += "unreadable KLV header (invalid length field), the essence after it is not reachable";
+  } else if (strict_) {
+    line += "strict: not resyncing, the essence after it is not reachable";
+  } else {
+    line += "no key found within " + std::to_string(kMaxResyncBytes / (1024 * 1024)) +
+            " MiB, the essence after it is not reachable";
+  }
+  AppendLogLine(line);
+}
+
 void SourceEngine::AppendLogLine(const std::string& line) const {
   fprintf(stderr, "%s\n", line.c_str());
   fflush(stderr);
@@ -155,6 +201,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   // damaged file fails in a few reads instead of first paying for a
   // full-file bitstream scan. Same functions, same order as MxfExtractIndex
   // (core/index_policy.h), so both accept and refuse the same files.
+  strict_ = options.strict;
   const IntegrityCheckResult integrity = CheckIntegrityBeforeIndex(*reader_, options.strict);
   if (integrity.error) return {OpenStatus::kDamagedFile, *integrity.error};
   if (!streamInfo_.hasVideo) return {OpenStatus::kParseError, "no video track found in Header Metadata"};
@@ -195,6 +242,10 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
       if (built.fromBitstreamScan) {
         AppendLogLine("[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
                       "bitstream headers (" + std::to_string(built.index->GetEntries().size()) + " edit units)");
+      }
+      for (uint64_t partitionOffset : built.index->EssenceStartResyncs()) {
+        AppendLogLine("[MxfSource] " + path_ + ": the end of the metadata/index declared by the partition at byte " +
+                      std::to_string(partitionOffset) + " is not on a KLV boundary; found the next KLV by a resync");
       }
       videoIndex_ = std::move(built.index);
     }
@@ -317,7 +368,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     hintReorderDelay_ = seek.reorderDelay;
   }
   walker_ = std::make_unique<EssenceWalker>(*reader_, walkerStartOffset, streamInfo_.videoTrackNumber,
-                                             streamInfo_.hasVideo, audioTrackNumbersForWalker);
+                                             streamInfo_.hasVideo, audioTrackNumbersForWalker, WalkerOptions());
 
   const int capacity = options.buffer_frames > 0 ? options.buffer_frames : 300;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : 32;
@@ -583,7 +634,8 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
     // below) since it holds a reference member and can't be reassigned
     // once the branch's own start offset is known. Video-only fallback --
     // audio has its own independent fresh-reader path, FreshReadAudioBlock.
-    EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
+    EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {},
+                            WalkerOptions());
     for (int64_t i = seek.editUnit; i < essenceTarget; ++i) {
       if (!SkipNextVideoElement(freshWalker)) return nullptr;  // ran out of essence before reaching target
     }
@@ -606,7 +658,8 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
   const int64_t iterations = std::max<int64_t>(1, essenceTarget - seek.editUnit - seek.reorderDelay + 1);
   const int64_t adjustedTarget = seek.editUnit + iterations - 1;
 
-  EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {});
+  EssenceWalker freshWalker(freshReader, seek.byteOffset, streamInfo_.videoTrackNumber, streamInfo_.hasVideo, {},
+                            WalkerOptions());
   bool essenceExhausted = false;
   EssenceElement scratch;
   for (int64_t i = seek.editUnit; i <= adjustedTarget; ++i) {
@@ -1044,7 +1097,8 @@ std::shared_ptr<AudioBlock> SourceEngine::FreshReadAudioBlock(uint64_t byteOffse
   // hasVideo=false: video (and any other track) is skipped over cheaply via
   // EssenceWalker's generic unmatched-KLV path, no different from any other
   // untracked track -- this fallback only ever needs audio.
-  EssenceWalker freshWalker(freshReader, byteOffset, /*videoTrackNumber=*/{}, /*hasVideo=*/false, audioTrackNumbers);
+  EssenceWalker freshWalker(freshReader, byteOffset, /*videoTrackNumber=*/{}, /*hasVideo=*/false, audioTrackNumbers,
+                            WalkerOptions());
 
   const size_t numTracks = audioTrackNumbers.size();
   std::vector<EssenceElement> group(numTracks);

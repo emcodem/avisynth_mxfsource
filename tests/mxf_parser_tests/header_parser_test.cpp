@@ -290,35 +290,71 @@ void SetHeaderByteCount(std::vector<uint8_t>& file, uint64_t headerByteCount) {
   for (int i = 0; i < 8; ++i) file[49 + i] = static_cast<uint8_t>(headerByteCount >> (56 - 8 * i));
 }
 
-// Fixup 1's original purpose: HeaderByteCount undercounts the metadata, and
-// the RIP's Body Partition entry shows where the Header Partition really
-// ends. Without the RIP the sets beyond HeaderByteCount are lost.
-void TestUndercountedHeaderByteCountRecoveredViaRip() {
+// HeaderByteCount undercounts the metadata (real files: D-10 from IBM's mxf
+// processor and MXFTK, K2, ffmpeg's muxer -- the cut-off picture descriptor
+// or sound track lost the video or, silently, all audio). The sets beyond it
+// are read with or without a RIP (Fixup 1 only covers RIP[1] = Body
+// Partition), down to a HeaderByteCount of 1 or one beyond the file size
+// (real: 0xFFFFFFFFFFFFFFFF). The metadata ends at the Body Partition Pack.
+void TestUndercountedHeaderByteCountRecovered() {
   SyntheticFile cfg;
+  SyntheticAudioTrack audio;
+  audio.channelCount = 2;
+  audio.sampleRate = 48000;
+  audio.bitsPerSample = 24;
+  cfg.audioTracks = {audio};
   const size_t metadataSize = BuildHeaderMetadataBlock(cfg).size();
   for (bool withRip : {true, false}) {
-    std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
-    SetHeaderByteCount(file, metadataSize / 2);
-    const uint64_t bodyOffset = file.size();
-    AppendPartitionPack(file, PartitionKind::kBody);
-    AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x11));
-    if (withRip) AppendRandomIndexPack(file, {{0, 0}, {1, bodyOffset}});
-    auto path = WriteTempFile(file, "mxfsrc_test_hbc_undercount.mxf");
-    {
-      MxfReader reader(path.string());
-      auto info = ParseMxfHeader(reader);
-      if (withRip) {
+    for (uint64_t headerByteCount : {uint64_t{metadataSize / 2}, uint64_t{1}, ~uint64_t{0}}) {
+      std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+      SetHeaderByteCount(file, headerByteCount);
+      const uint64_t bodyOffset = file.size();
+      AppendPartitionPack(file, PartitionKind::kBody);
+      AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x11));
+      if (withRip) AppendRandomIndexPack(file, {{0, 0}, {1, bodyOffset}});
+      auto path = WriteTempFile(file, "mxfsrc_test_hbc_undercount.mxf");
+      {
+        MxfReader reader(path.string());
+        auto info = ParseMxfHeader(reader);
         CHECK(info.has_value());
         if (info) {
           CHECK(info->width == cfg.width && info->height == cfg.height);
+          CHECK(info->audioTracks.size() == 1);
+          CHECK(info->audioConfigSupported);
           CHECK(info->headerMetadataEnd == bodyOffset);
         }
-      } else {
-        CHECK(!info || info->width != cfg.width);  // the test really cuts into needed sets
       }
+      std::filesystem::remove(path);
     }
-    std::filesystem::remove(path);
   }
+}
+
+// Undercounted HeaderByteCount, no RIP, essence directly after the metadata
+// (no Index Table Segment in between): the walk past the declared end stops
+// at the first essence element, so EssenceWalker still sees every frame.
+void TestMetadataWalkPastDeclaredEndStopsAtEssence() {
+  SyntheticFile cfg;
+  const size_t metadataSize = BuildHeaderMetadataBlock(cfg).size();
+  std::vector<uint8_t> file = BuildSyntheticHeader(cfg);
+  SetHeaderByteCount(file, metadataSize / 2);
+  const uint64_t metadataEnd = file.size();
+  for (int i = 0; i < 3; ++i) AppendEssenceElement(file, cfg.videoTrackNumber, std::vector<uint8_t>(16, 0x20));
+  auto path = WriteTempFile(file, "mxfsrc_test_hbc_essence_follows.mxf");
+  {
+    MxfReader reader(path.string());
+    auto info = ParseMxfHeader(reader);
+    CHECK(info.has_value());
+    if (info) {
+      CHECK(info->width == cfg.width && info->height == cfg.height);
+      CHECK(info->headerMetadataEnd == metadataEnd);
+      EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, true, {});
+      EssenceElement element;
+      int videoElements = 0;
+      while (walker.Next(element, /*wantData=*/false)) videoElements += element.isVideo ? 1 : 0;
+      CHECK(videoElements == 3);
+    }
+  }
+  std::filesystem::remove(path);
 }
 
 // Real layout (67 Harmonic/AJA UHD H.264 files on the sample share): the
@@ -639,7 +675,8 @@ int main() {
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
   TestXavcLongGopUlClassification();
   TestUlVersionByteIgnored();
-  TestUndercountedHeaderByteCountRecoveredViaRip();
+  TestUndercountedHeaderByteCountRecovered();
+  TestMetadataWalkPastDeclaredEndStopsAtEssence();
   TestEssenceInHeaderPartitionNotTreatedAsMetadata();
   TestLowerLevelSourcePackageDoesNotOverrideFilePackage();
   TestSingleAudioTrackResolved();

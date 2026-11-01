@@ -125,25 +125,28 @@ struct KlvHeader {
 bool ReadKlvHeader(MxfReader& reader, KlvHeader& out);
 
 // Every legitimate KLV key begins with the SMPTE UL registry designator
-// (06.0E.2B.34, ST 298). Some real-world recorders (observed: Atomos Shogun
-// XAVC-Intra/XAVC-L recordings) pad a partition out to a KAG boundary using
-// raw zero bytes instead of a spec-compliant KLV Fill Item -- such a run of
-// zeros parses as a spurious zero-length "KLV" with an all-zero key, and
-// naively trusting its (bogus) length field walks forward one KLV-header's
-// worth of bytes at a time, which is generally not a multiple of the
-// actual pad length. That desyncs a naive walk so it lands misaligned
-// inside real KLV data afterward and fails outright instead of just
-// skipping the padding. Shared by EssenceWalker and the Index Table
-// Segment partition scanner (mxf/index_table.h), both of which walk
-// forward through a byte range that can contain this kind of padding.
+// (06.0E.2B.34, ST 298). In an intact file every byte belongs to a KLV, so
+// a walk that starts on a KLV boundary always finds the next key right
+// where the previous value ends. Anything else there means the walk started
+// at a wrong offset or the file is damaged. (The "raw zero padding" once
+// blamed on Atomos Shogun recordings was such a wrong offset: counted from
+// the end of the Partition Pack instead of from after its KAG Fill, see
+// PartitionContentStart in mxf/partition.h, the walk started inside a KLV
+// Fill's zero value. Those files are intact KLV for KLV.)
 bool LooksLikeKlvKey(const Ul& key);
+
+// The farthest any resync searches for the next key after a spot where no
+// valid KLV starts -- so a damaged file never makes a walk read on to its
+// end (100+ GB over SMB).
+inline constexpr uint64_t kMaxResyncBytes = 10 * 1024 * 1024;
 
 // Scans forward from the reader's current position for the next occurrence
 // of the UL designator, leaving the reader positioned exactly at its first
 // byte so the caller can retry ReadKlvHeader there. Returns false if no
-// designator starts before `limit` (or EOF). Reads in growing blocks
-// (4 KiB up to 1 MiB) searched with memchr, so a long run of zeros or
-// garbage costs a few large reads, not one read per byte.
-bool ResyncToUlDesignator(MxfReader& reader, uint64_t limit = UINT64_MAX);
+// designator starts before `limit` (or EOF); callers pass a limit no more
+// than kMaxResyncBytes ahead. Reads in growing blocks (4 KiB up to 1 MiB)
+// searched with memchr, so a long run of zeros or garbage costs a few large
+// reads, not one read per byte.
+bool ResyncToUlDesignator(MxfReader& reader, uint64_t limit);
 
 }  // namespace mxfsrc

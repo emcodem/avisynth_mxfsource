@@ -95,6 +95,17 @@ class SourceEngine {
   // before any real GetVideoFrame(0) call arrived.
   const NormalizedFrame& FirstFrame() const { return *firstFrame_; }
 
+  // A decoded frame's field order: the decoder's own report if it has one,
+  // otherwise the MXF picture descriptor's (FrameLayout/FieldDominance). Only
+  // descriptor combinations verified against real files map to a value:
+  // FullFrame/SegmentedFrame = progressive, SeparateFields/MixedFields with
+  // field 1 dominant = TFF (XDCAM HD422, XAVC, D-10, K2 SD agree with the
+  // bitstream); anything else stays kUnknown.
+  FieldOrder FieldOrderOf(const NormalizedFrame& frame) const;
+  // The clip's field order, from its first decoded frame -- for hosts that
+  // take one value per clip (AviSynth's VideoInfo/GetParity).
+  FieldOrder ClipFieldOrder() const { return FieldOrderOf(*firstFrame_); }
+
   // Blocks until frame `n` is decoded or the stream ends/errors. If `n` has
   // fallen behind the ring buffer's window (evicted, e.g. a genuine
   // backward seek -- forward waits are always satisfied normally and never
@@ -239,7 +250,16 @@ class SourceEngine {
   // formatting.
   void AppendLogLine(const std::string& line) const;
 
+  // Options for every EssenceWalker this engine creates: no resync past
+  // damage in strict mode, a bounded one otherwise, each damaged spot
+  // logged once (the fallback paths re-walk the same bytes).
+  EssenceWalkerOptions WalkerOptions();
+  void LogWalkDamage(const WalkDamage& damage);
+
   std::string path_;
+  bool strict_ = true;
+  std::mutex damageLogMutex_;
+  std::vector<uint64_t> loggedDamageOffsets_;
   std::string logFile_;
   std::string httpHeaders_;
   // Number of leading video essence elements to discard before essence

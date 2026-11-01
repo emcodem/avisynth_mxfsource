@@ -20,6 +20,7 @@
 using mxfsrc::ExtractAndPublishIndex;
 using mxfsrc::ExtractIndexResult;
 using mxfsrc::FetchStatus;
+using mxfsrc::FieldOrder;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
 using mxfsrc::OpenResult;
@@ -188,6 +189,13 @@ const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instan
     UnpackUyvyToYuv422Planar(*frame, out, vsapi);
   } else {
     CopyPlanarFrame(*frame, out, vsapi, d->bytesPerSample);
+  }
+  // _FieldBased: 0 progressive, 1 BFF, 2 TFF; left unset when unknown (see
+  // SourceEngine::FieldOrderOf).
+  const FieldOrder fieldOrder = d->engine->FieldOrderOf(*frame);
+  if (fieldOrder != FieldOrder::kUnknown) {
+    const int64_t fieldBased = fieldOrder == FieldOrder::kTff ? 2 : fieldOrder == FieldOrder::kBff ? 1 : 0;
+    vsapi->mapSetInt(vsapi->getFramePropertiesRW(out), "_FieldBased", fieldBased, maReplace);
   }
   return out;
 }

@@ -312,6 +312,65 @@ void TestCbrWithoutDurationStopsAtFooterPartition() {
   std::filesystem::remove(path);
 }
 
+// Real layout (K2 Summit, D-10/IMX, ffmpeg, Telestream): a KLV Fill pads the
+// Partition Pack to the KAG, and HeaderByteCount/IndexByteCount count from
+// the first KLV after it (the Primer Pack). The Fill's value is random bytes
+// (a bad BER length when read as a KLV), and the segment lies beyond
+// partitionEnd + HeaderByteCount + IndexByteCount, so counting from the
+// Partition Pack lost it (8 intact K2 files refused by strict). Also covered:
+// a writer that counts from the Partition Pack (Fill included in
+// HeaderByteCount), and a HeaderByteCount beyond the file size (real:
+// 0xFFFFFFFFFFFFFFFF), where the index starts where the metadata ends.
+void TestIndexByteCountsCountFromAfterPartitionPackFill() {
+  IndexTableSegmentSpec spec;
+  spec.indexDuration = 5;
+  spec.editUnitByteCount = 100;
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, spec);
+  constexpr uint8_t kFillValueSize = 120;
+  constexpr uint64_t kFillSize = 16 + 1 + kFillValueSize;
+  constexpr uint64_t kMetadataSize = 64;  // a Primer Pack standing in for the Header Metadata
+  CHECK(kFillSize > segBytes.size());     // the old estimate's range ends before the segment
+  for (uint64_t headerByteCount : {kMetadataSize, kFillSize + kMetadataSize, ~uint64_t{0}}) {
+    std::vector<uint8_t> file;
+    AppendPartitionPackWithFields(file, PartitionKind::kHeader, TestPartitionStatus::kClosedComplete, 0, 0,
+                                  headerByteCount, segBytes.size(), /*indexSid=*/1);
+    AppendKlvHeader(file, kKlvFillKey, kFillValueSize);
+    file.insert(file.end(), kFillValueSize, 0x9f);
+    AppendKlvHeader(file, kPrimerPackKey, kMetadataSize - 17);
+    file.insert(file.end(), kMetadataSize - 17, 0);
+    file.insert(file.end(), segBytes.begin(), segBytes.end());
+    file.insert(file.end(), 5 * 100, 0);
+    auto path = WriteTempFile(file, "mxfsrc_test_its_fill_after_pack.mxf");
+    {
+      MxfReader reader(path.string());
+      auto index = BuildEssenceIndex(reader, /*videoBodySid=*/1);
+      CHECK(index.has_value());
+      if (index) CHECK(index->HighestCoveredEditUnit() == 4);
+    }
+    std::filesystem::remove(path);
+  }
+}
+
+// An unfinished recording's placeholder segment (real: CBR,
+// EditUnitByteCount 0xFFFFFFFF, IndexDuration 0) indexes nothing; it used to
+// yield a 1-entry index, so strict opened a 336 MB file as 1 frame.
+void TestCbrPlaceholderSegmentIsNoIndex() {
+  IndexTableSegmentSpec spec;
+  spec.indexDuration = 0;
+  spec.editUnitByteCount = 0xFFFFFFFF;
+  std::vector<uint8_t> segBytes;
+  AppendIndexTableSegment(segBytes, spec);
+  auto bytes = BuildSingleIndexPartitionFile(segBytes, /*headerByteCount=*/64, /*indexSid=*/1,
+                                             /*essenceTrailerSize=*/1000);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_its_cbr_placeholder.mxf");
+  {
+    MxfReader reader(path.string());
+    CHECK(!BuildEssenceIndex(reader, /*videoBodySid=*/1).has_value());
+  }
+  std::filesystem::remove(path);
+}
+
 void TestNoIndexTableAnywhereReturnsNullopt() {
   std::vector<uint8_t> file;
   AppendPartitionPackWithFields(file, PartitionKind::kHeader, TestPartitionStatus::kClosedComplete, 0, 0,
@@ -573,6 +632,8 @@ int main() {
   TestFindPrecedingKeyframeOutsideCoveredRange();
   TestCbrSegmentFlattenFormula();
   TestCbrWithoutDurationStopsAtFooterPartition();
+  TestIndexByteCountsCountFromAfterPartitionPackFill();
+  TestCbrPlaceholderSegmentIsNoIndex();
   TestNoIndexTableAnywhereReturnsNullopt();
   TestMalformedSegmentIsSkippedNotFatal();
   TestOutOfBoundsOffsetIsDropped();

@@ -45,6 +45,13 @@ struct MxfStreamInfo {
   int64_t numFrames = -1;  // -1 = unknown after Header Metadata alone
   CodecFamily videoCodec = CodecFamily::kUnknown;
   Ul pictureEssenceCoding{};
+  // Picture descriptor FrameLayout (tag 0x320C, SMPTE 377-1: 0 FullFrame,
+  // 1 SeparateFields, 2 OneField, 3 MixedFields, 4 SegmentedFrame) and
+  // FieldDominance (0x3212: which field comes first in time), -1 if absent.
+  // Only the fallback for the field order when the decoder doesn't report it
+  // (see SourceEngine::FieldOrderOf).
+  int frameLayout = -1;
+  int fieldDominance = -1;
   // Track.TrackNumber (baseline tag 0x4804): the last 4 bytes of an Essence
   // Element KLV key identify which Track it belongs to (see FFmpeg
   // mxfdec.c's mxf_essence_element_key matching) -- Phase 2's essence

@@ -86,6 +86,8 @@ constexpr uint16_t kDescriptorPictureEssenceCoding = 0x3201;
 constexpr uint16_t kDescriptorSoundEssenceCompression = 0x3D06;
 constexpr uint16_t kDescriptorStoredWidth = 0x3203;
 constexpr uint16_t kDescriptorStoredHeight = 0x3202;
+constexpr uint16_t kDescriptorFrameLayout = 0x320C;
+constexpr uint16_t kDescriptorFieldDominance = 0x3212;
 constexpr uint16_t kDescriptorSampleRate = 0x3D03;
 constexpr uint16_t kDescriptorChannelCount = 0x3D07;
 constexpr uint16_t kDescriptorQuantizationBits = 0x3D01;
@@ -111,6 +113,10 @@ bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   if (width == 0 || height == 0) return false;
   info.width = width;
   info.height = height;
+  auto frameLayout = d.find(tag::kDescriptorFrameLayout);
+  if (frameLayout != d.end() && frameLayout->second.size() == 1) info.frameLayout = frameLayout->second[0];
+  auto fieldDominance = d.find(tag::kDescriptorFieldDominance);
+  if (fieldDominance != d.end() && fieldDominance->second.size() == 1) info.fieldDominance = fieldDominance->second[0];
   Ul coding{};
   if (GetUl(d, tag::kDescriptorPictureEssenceCoding, coding)) {
     info.pictureEssenceCoding = coding;
@@ -300,59 +306,71 @@ void ResolvePackage(const Ul& packageUid, const RawSets& sets, bool isFilePackag
   }
 }
 
-// Generic Container element keys -- picture/sound/data items and the
-// system item's local sets alike -- all carry 0d 01 03 01 in bytes 8-11
-// (SMPTE 379), whatever their other bytes.
-bool IsEssenceContainerElementKey(const Ul& key) {
-  return key[8] == 0x0d && key[9] == 0x01 && key[10] == 0x03 && key[11] == 0x01;
+// A partition's HeaderByteCount as a byte count from `partitionEnd`: it
+// counts from PartitionContentStart (after the Partition Pack's KAG Fill).
+// A value that can't fit in the file is passed on unchanged, so
+// ReadMetadataSets treats it as unknown.
+uint64_t DeclaredMetadataByteCount(MxfReader& reader, uint64_t partitionEnd, uint64_t headerByteCount) {
+  const uint64_t size = reader.Size();
+  const uint64_t contentStart = PartitionContentStart(reader, partitionEnd, size);
+  if (contentStart > size || headerByteCount > size - contentStart) return headerByteCount;
+  return contentStart - partitionEnd + headerByteCount;
 }
 
-// Offset of the first KLV at or after `start` that can't be Header Metadata
-// -- an Index Table Segment, an essence container element, a Partition Pack,
-// or bytes that aren't a KLV key at all -- never past `limit`. Only reads
-// KLV headers, so it costs one small read per metadata set.
-uint64_t ScanHeaderMetadataEnd(MxfReader& reader, uint64_t start, uint64_t limit) {
-  uint64_t pos = start;
-  while (pos + 17 <= limit && reader.Seek(pos)) {
-    KlvHeader klv{};
-    if (!ReadKlvHeader(reader, klv) || !LooksLikeKlvKey(klv.key)) break;
-    if (UlEquals(klv.key, kIndexTableSegmentKey) || IsPartitionPackKey(klv.key, nullptr) ||
-        IsEssenceContainerElementKey(klv.key)) {
-      break;
-    }
-    const uint64_t next = klv.valueOffset + klv.length;
-    if (next > limit) break;
-    pos = next;
-  }
-  return pos;
-}
+// Walks every local-set-coded metadata KLV starting at `partitionEnd` into
+// `sets`. Shared between the Header Partition's Header Metadata and a Footer
+// Partition's redundant copy of the same (see ParseMxfHeader's
+// footer-precedence handling below) -- identical format, just a different
+// partition's byte range.
+//
+// `byteCount` is where the metadata is declared to end, relative to
+// `partitionEnd` (the caller already counts it from PartitionContentStart,
+// see partition.h). It can still fall short of the real end (seen on
+// D-10/IMX from IBM's mxf processor and MXFTK, K2, ffmpeg's own muxer:
+// the last sets -- often the picture descriptor or the sound track's
+// Sequence -- crossed it, which lost the video or, silently, all audio), so
+// the walk goes on past it through further metadata, Primer and Fill KLVs
+// and stops at the first KLV that can't be metadata (EndsHeaderMetadata), at
+// `limit` (the next partition or the file size), or at the hard bounds
+// kMaxHeaderMetadataOverrun / kMaxHeaderMetadataSize. A byteCount beyond
+// `limit` (seen: HeaderByteCount 0xFFFFFFFFFFFFFFFF) counts as unknown, so
+// only the stop rules and kMaxHeaderMetadataSize apply. Returns where the
+// metadata really ends -- never before the declared end, so a walk stopping
+// early inside the declared region (e.g. on raw zero padding) leaves the
+// result as before -- or nullopt on a malformed local set.
+std::optional<uint64_t> ReadMetadataSets(MxfReader& reader, uint64_t partitionEnd, uint64_t byteCount, uint64_t limit,
+                                         RawSets& sets) {
+  limit = std::min(limit, reader.Size());
+  const bool byteCountKnown = limit >= partitionEnd && byteCount <= limit - partitionEnd;
+  const uint64_t declaredEnd = byteCountKnown ? partitionEnd + byteCount : partitionEnd;
+  const uint64_t overrunLimit = std::min(
+      limit, byteCountKnown ? declaredEnd + kMaxHeaderMetadataOverrun : partitionEnd + kMaxHeaderMetadataSize);
+  if (!reader.Seek(partitionEnd)) return std::nullopt;
 
-// Walks every local-set-coded metadata KLV in [partitionEnd, partitionEnd +
-// byteCount) into `sets`. Shared between the Header Partition's Header
-// Metadata and a Footer Partition's redundant copy of the same (see
-// ParseMxfHeader's footer-precedence handling below) -- identical format,
-// just a different partition's byte range.
-bool ReadMetadataSets(MxfReader& reader, uint64_t partitionEnd, uint64_t byteCount, RawSets& sets) {
-  const uint64_t metadataEnd = partitionEnd + byteCount;
-  if (!reader.Seek(partitionEnd)) return false;
-
-  while (reader.Tell() + 16 + 1 <= metadataEnd && reader.Tell() < reader.Size()) {
+  uint64_t pos = partitionEnd;
+  const uint64_t walkLimit = std::min(limit, partitionEnd + kMaxHeaderMetadataSize);
+  while (pos + 16 + 1 <= walkLimit) {
+    if (!reader.Seek(pos)) break;
     KlvHeader klv{};
     if (!ReadKlvHeader(reader, klv)) break;
     const uint64_t valueEnd = klv.valueOffset + klv.length;
-    if (valueEnd > metadataEnd) break;
-
-    if (UlEquals(klv.key, kKlvFillKey) || UlEquals(klv.key, kPrimerPackKey)) {
-      reader.Seek(valueEnd);
-      continue;
+    if (valueEnd > declaredEnd) {
+      // Past (or crossing) the declared end: only further metadata counts.
+      if (pos >= overrunLimit || valueEnd > limit || EndsHeaderMetadata(klv.key)) break;
     }
-    if (!IsLocalSetKey(klv.key)) {
-      reader.Seek(valueEnd);
+    if (UlEquals(klv.key, kKlvFillKey) || UlEquals(klv.key, kPrimerPackKey) || !IsLocalSetKey(klv.key)) {
+      pos = valueEnd;
       continue;
     }
 
     LocalTagMap parsed;
-    if (!ReadLocalSet(reader, klv.length, parsed)) return false;
+    if (!ReadLocalSet(reader, klv.length, parsed)) {
+      // Inside the declared region a malformed set fails the parse, as
+      // before; past it, it just isn't metadata.
+      if (valueEnd > declaredEnd) break;
+      return std::nullopt;
+    }
+    pos = valueEnd;
 
     const SetType type = ClassifySetType(klv.key);
     Ul instanceUid{};
@@ -364,9 +382,8 @@ bool ReadMetadataSets(MxfReader& reader, uint64_t partitionEnd, uint64_t byteCou
       }
       sets.byInstanceUid[instanceUid] = std::move(parsed);
     }
-    reader.Seek(valueEnd);
   }
-  return true;
+  return std::max(pos, declaredEnd);
 }
 
 // Resolves a full RawSets (as produced by ReadMetadataSets) into a fresh
@@ -541,7 +558,11 @@ bool TryOverrideFromFooterPartition(MxfReader& reader, uint64_t candidateOffset,
 
   const uint64_t footerPartitionEnd = footerKlv.valueOffset + footerKlv.length;
   RawSets footerSets;
-  if (!ReadMetadataSets(reader, footerPartitionEnd, footerPartition->headerByteCount, footerSets)) return false;
+  if (!ReadMetadataSets(reader, footerPartitionEnd,
+                        DeclaredMetadataByteCount(reader, footerPartitionEnd, footerPartition->headerByteCount),
+                        reader.Size(), footerSets)) {
+    return false;
+  }
 
   MxfStreamInfo footerInfo = ResolveStreamInfo(footerSets);
   if (!footerInfo.hasVideo) return false;
@@ -577,7 +598,7 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   if (!partition) return fail("failed to parse Header Partition Pack");
 
   const uint64_t partitionEnd = partitionKlv.valueOffset + partitionKlv.length;
-  uint64_t headerMetadataEnd = partitionEnd + partition->headerByteCount;
+  uint64_t headerMetadataEnd = partitionEnd + DeclaredMetadataByteCount(reader, partitionEnd, partition->headerByteCount);
 
   // The Random Index Pack (see mxf/partition.h), if present, is read once
   // and used for two independent fixups below -- both observed on a real
@@ -628,10 +649,26 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
     }
   }
 
-  RawSets headerSets;
-  if (!ReadMetadataSets(reader, partitionEnd, headerMetadataEnd - partitionEnd, headerSets)) {
-    return fail("malformed local-set metadata KLV");
+  // The metadata may run past the (possibly corrected) declared end, but
+  // never into the next partition known from the RIP or FooterPartition.
+  // An offset inside the declared region is a bad pointer, not a bound.
+  const uint64_t declaredByteCount = headerMetadataEnd - partitionEnd;
+  const uint64_t declaredEnd =
+      declaredByteCount <= reader.Size() - std::min(reader.Size(), partitionEnd) ? headerMetadataEnd : partitionEnd;
+  uint64_t metadataLimit = reader.Size();
+  auto boundBy = [&](uint64_t offset) {
+    if (offset >= declaredEnd && offset > partitionEnd) metadataLimit = std::min(metadataLimit, offset);
+  };
+  if (rip) {
+    for (const auto& entry : *rip) boundBy(entry.byteOffset);
   }
+  if (partition->footerPartition != 0) boundBy(partition->footerPartition);
+
+  RawSets headerSets;
+  std::optional<uint64_t> realMetadataEnd =
+      ReadMetadataSets(reader, partitionEnd, declaredByteCount, metadataLimit, headerSets);
+  if (!realMetadataEnd) return fail("malformed local-set metadata KLV");
+  headerMetadataEnd = *realMetadataEnd;
 
   MxfStreamInfo info = ResolveStreamInfo(headerSets);
   info.headerMetadataEnd = headerMetadataEnd;

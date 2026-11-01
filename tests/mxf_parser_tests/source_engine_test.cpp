@@ -577,6 +577,62 @@ void TestRepeatedRequestForSameFrameSucceeds() {
 // 0, and Open()'s Peek(0) call (which deliberately never advances the
 // watermark) had nothing to wake it. Covers both buffer_frames=1 and
 // eagerdecode=1 individually, since either alone is enough to hit margin_=1.
+// Field order: the decoder's own report wins; raw UYVY reports none, so the
+// picture descriptor decides, and only the combinations verified against
+// real files (XDCAM HD422, XAVC, D-10, K2 SD all agree with the bitstream)
+// map to a value -- FullFrame/SegmentedFrame = progressive, SeparateFields/
+// MixedFields with field 1 dominant = TFF. Everything else stays unknown
+// (no BFF from the descriptor: no real sample backs it).
+void TestFieldOrderFromDecoderElseDescriptor() {
+  struct Case {
+    int frameLayout;
+    int fieldDominance;
+    FieldOrder expected;
+  };
+  const Case cases[] = {
+      {-1, -1, FieldOrder::kUnknown},    {0, -1, FieldOrder::kProgressive}, {4, -1, FieldOrder::kProgressive},
+      {1, 1, FieldOrder::kTff},          {3, 1, FieldOrder::kTff},          {1, 2, FieldOrder::kUnknown},
+      {1, -1, FieldOrder::kUnknown},     {2, 1, FieldOrder::kUnknown},
+  };
+  const int width = 4, height = 2, numFrames = 3;
+  for (const Case& c : cases) {
+    SyntheticFile cfg;
+    cfg.sequenceDuration = numFrames;
+    cfg.width = width;
+    cfg.height = height;
+    cfg.videoTrackNumber = kTrackNumber;
+    cfg.frameLayout = c.frameLayout;
+    cfg.fieldDominance = c.fieldDominance;
+    std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+    AppendPartitionPack(bytes, PartitionKind::kBody);
+    for (int i = 0; i < numFrames; ++i) {
+      AppendEssenceElement(bytes, kTrackNumber, MakeFramePayload(width, height, static_cast<uint8_t>(0x10 + i)));
+    }
+    auto path = WriteTempFile(bytes, "mxfsrc_test_engine_field_order.mxf");
+    {
+      SourceEngine engine;
+      OpenResult res = engine.Open(path.string(), NonStrictOptions());
+      CHECK(res.status == OpenStatus::kOk);
+      if (res.status == OpenStatus::kOk) {
+        CHECK(engine.StreamInfo().frameLayout == c.frameLayout);
+        CHECK(engine.StreamInfo().fieldDominance == c.fieldDominance);
+        CHECK(engine.ClipFieldOrder() == c.expected);
+        std::shared_ptr<NormalizedFrame> frame;
+        std::string err;
+        CHECK(engine.GetVideoFrame(1, frame, &err) == FetchStatus::kOk);
+        if (frame) {
+          CHECK(frame->fieldOrder == FieldOrder::kUnknown);  // raw UYVY: the decoder doesn't report
+          CHECK(engine.FieldOrderOf(*frame) == c.expected);
+          NormalizedFrame reported = *frame;  // a decoder that does report always wins
+          reported.fieldOrder = FieldOrder::kBff;
+          CHECK(engine.FieldOrderOf(reported) == FieldOrder::kBff);
+        }
+      }
+    }
+    std::filesystem::remove(path);
+  }
+}
+
 void TestOpenSucceedsWithMinimalBufferOrEagerdecode() {
   const int width = 4, height = 2, numFrames = 5;
   auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_minimal_margin.mxf");
@@ -2403,6 +2459,7 @@ int main() {
   TestOpenPeekDoesNotEvictFrameZero();
   TestRepeatedRequestForSameFrameSucceeds();
   TestOpenSucceedsWithMinimalBufferOrEagerdecode();
+  TestFieldOrderFromDecoderElseDescriptor();
   TestOriginHandlingSkipsPreRollByDefault();
   TestHandleOriginFalseDisablesSkip();
   TestOriginHandlingAppliesToSeekAndDecodeFallback();

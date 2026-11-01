@@ -59,6 +59,12 @@ struct AvcodecDecoder::Impl {
   AVCodecContext* ctx = nullptr;
   AVFrame* frame = nullptr;
   AVPacket* packet = nullptr;
+  // True for codecs whose bitstream carries the frame's interlacing (and
+  // whose avcodec decoder reports it), so a frame without
+  // AV_FRAME_FLAG_INTERLACED really is progressive. Other decoders (e.g.
+  // JPEG 2000) leave the flags unset either way: their frames report
+  // FieldOrder::kUnknown and callers fall back to the MXF descriptor.
+  bool reportsInterlacing = false;
   // Frames drained from avcodec but not yet claimed by a caller -- see
   // SendAndReceive's retry loop: avcodec_send_packet can transiently return
   // AVERROR(EAGAIN) when its internal queue is full (more likely with
@@ -86,6 +92,12 @@ bool AvcodecDecoder::ReceiveOneFrame(NormalizedFrame& out) {
   out.format = FromAvPixFmt(impl_->frame->format);
   out.width = impl_->frame->width;
   out.height = impl_->frame->height;
+  const int flags = impl_->frame->flags;
+  if (flags & AV_FRAME_FLAG_INTERLACED) {
+    out.fieldOrder = (flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? FieldOrder::kTff : FieldOrder::kBff;
+  } else {
+    out.fieldOrder = impl_->reportsInterlacing ? FieldOrder::kProgressive : FieldOrder::kUnknown;
+  }
   const int numPlanes = NumPlanes(out.format);
   for (int p = 0; p < numPlanes; ++p) {
     const int planeHeight = p == 0 ? out.height : ChromaHeight(out.format, out.height);
@@ -104,6 +116,9 @@ AvcodecDecoder::AvcodecDecoder(CodecFamily family, int width, int height, uint32
     : impl_(std::make_unique<Impl>()) {
   const AVCodecID id = ToAvCodecId(family);
   if (id == AV_CODEC_ID_NONE) return;
+  impl_->reportsInterlacing = family == CodecFamily::kMpeg2Video || family == CodecFamily::kH264 ||
+                               family == CodecFamily::kH264LongGop || family == CodecFamily::kDvVideo ||
+                               family == CodecFamily::kProres || family == CodecFamily::kDnxhd;
   const AVCodec* codec = avcodec_find_decoder(id);
   if (!codec) return;
 

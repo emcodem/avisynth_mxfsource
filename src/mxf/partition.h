@@ -67,6 +67,41 @@ inline constexpr Ul kKlvFillKey = {0x06, 0x0E, 0x2B, 0x34, 0x01, 0x01, 0x01, 0x0
 inline constexpr uint8_t kLocalSetKeyPrefix[6] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53};
 bool IsLocalSetKey(const Ul& key);
 
+// Generic Container element keys -- picture/sound/data items and the
+// system item's local sets alike -- all carry 0d 01 03 01 in bytes 8-11
+// (SMPTE 379), whatever their other bytes.
+bool IsEssenceContainerElementKey(const Ul& key);
+
+// Where a partition's HeaderByteCount and IndexByteCount start counting:
+// the first KLV after the KLV Fill items that pad the Partition Pack to the
+// KAG, i.e. normally the Primer Pack. Measured on every real writer checked
+// (D-10/IMX, K2 Summit, ffmpeg, Telestream; Fill of 340-388 bytes): counting
+// from the end of the Partition Pack instead put the declared end of the
+// Header Metadata and the start of the Index Table that many bytes too
+// early. Skips at most a handful of consecutive Fill items and never reads
+// past `limit`; returns `partitionEnd` when no Fill follows (or nothing
+// parses there, e.g. raw zero padding).
+uint64_t PartitionContentStart(MxfReader& reader, uint64_t partitionEnd, uint64_t limit);
+
+// Hard bounds for every walk that looks for the end of the Header Metadata,
+// so finding it never turns into a KLV walk through the file: at most
+// kMaxHeaderMetadataOverrun past the declared end, and never more than
+// kMaxHeaderMetadataSize from the start of the metadata, whatever the
+// declared end says (metadata beyond it is not read). The stop rules
+// (EndsHeaderMetadata) normally end a walk long before either bound.
+inline constexpr uint64_t kMaxHeaderMetadataOverrun = 1024 * 1024;
+inline constexpr uint64_t kMaxHeaderMetadataSize = 16 * 1024 * 1024;
+
+// True for a KLV that can't be Header Metadata: an Index Table Segment, a
+// Partition Pack, the RIP, an essence container element, or bytes that
+// aren't a KLV key at all.
+bool EndsHeaderMetadata(const Ul& key);
+
+// Offset of the first KLV at or after `start` for which EndsHeaderMetadata
+// is true, never past min(`limit`, start + kMaxHeaderMetadataSize). Only
+// reads KLV headers, so it costs one small read per metadata set.
+uint64_t ScanHeaderMetadataEnd(MxfReader& reader, uint64_t start, uint64_t limit);
+
 struct PartitionPack {
   PartitionKind kind = PartitionKind::kHeader;
   uint16_t majorVersion = 0;

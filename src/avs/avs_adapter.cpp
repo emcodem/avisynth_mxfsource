@@ -15,6 +15,7 @@
 using mxfsrc::ExtractAndPublishIndex;
 using mxfsrc::ExtractIndexResult;
 using mxfsrc::FetchStatus;
+using mxfsrc::FieldOrder;
 using mxfsrc::NormalizedFrame;
 using mxfsrc::OpenOptions;
 using mxfsrc::OpenResult;
@@ -137,6 +138,21 @@ class MxfSource final : public IClip {
     vi_.fps_denominator = info.editRate.den > 0 ? static_cast<unsigned>(info.editRate.den) : 1;
     vi_.num_frames = static_cast<int>(info.numFrames);
     vi_.pixel_type = pixelType;
+    // Field order: one value per clip in VideoInfo/GetParity, from the first
+    // decoded frame (see SourceEngine::ClipFieldOrder). Progressive and
+    // unknown set neither flag, as before.
+    const FieldOrder clipFieldOrder = engine_->ClipFieldOrder();
+    if (clipFieldOrder == FieldOrder::kTff) vi_.Set(VideoInfo::IT_TFF);
+    if (clipFieldOrder == FieldOrder::kBff) vi_.Set(VideoInfo::IT_BFF);
+    clipTff_ = clipFieldOrder == FieldOrder::kTff;
+    // Frame properties (_FieldBased per frame) need AviSynth+ interface 8;
+    // classic AviSynth has no such API.
+    try {
+      env->CheckVersion(8);
+      hasFrameProps_ = true;
+    } catch (const AvisynthError&) {
+      hasFrameProps_ = false;
+    }
 
     if (engine_->ExposesAudio()) {
       int sampleType = 0;
@@ -171,6 +187,14 @@ class MxfSource final : public IClip {
       CopyPlane(*frame, 1, out, PLANAR_U);
       CopyPlane(*frame, 2, out, PLANAR_V);
     }
+    if (hasFrameProps_) {
+      // _FieldBased: 0 progressive, 1 BFF, 2 TFF; left unset when unknown.
+      const FieldOrder fieldOrder = engine_->FieldOrderOf(*frame);
+      if (fieldOrder != FieldOrder::kUnknown) {
+        const int64_t fieldBased = fieldOrder == FieldOrder::kTff ? 2 : fieldOrder == FieldOrder::kBff ? 1 : 0;
+        env->propSetInt(env->getFramePropsRW(out), "_FieldBased", fieldBased, PROPAPPENDMODE_REPLACE);
+      }
+    }
     return out;
   }
 
@@ -181,7 +205,7 @@ class MxfSource final : public IClip {
     }
   }
 
-  bool __stdcall GetParity(int /*n*/) override { return false; }
+  bool __stdcall GetParity(int /*n*/) override { return clipTff_; }
 
   int __stdcall SetCacheHints(int cachehints, int /*frame_range*/) override {
     // The engine's own mutex/condvar is the single source of thread-safety
@@ -209,6 +233,8 @@ class MxfSource final : public IClip {
   std::unique_ptr<SourceEngine> engine_;
   VideoInfo vi_;
   bool isPackedUyvy_ = false;
+  bool clipTff_ = false;
+  bool hasFrameProps_ = false;
 };
 
 AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvironment* env) {

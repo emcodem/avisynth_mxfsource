@@ -1,5 +1,9 @@
 #include "mxf/partition.h"
 
+#include <algorithm>
+
+#include "mxf/index_table.h"
+
 namespace mxfsrc {
 
 bool IsPartitionPackKey(const Ul& key, PartitionKind* kindOut) {
@@ -28,6 +32,43 @@ PartitionStatus ClassifyPartitionStatus(const Ul& key) {
 
 bool IsLocalSetKey(const Ul& key) {
   return UlPrefixEquals(key, kLocalSetKeyPrefix, sizeof(kLocalSetKeyPrefix));
+}
+
+bool IsEssenceContainerElementKey(const Ul& key) {
+  return key[8] == 0x0d && key[9] == 0x01 && key[10] == 0x03 && key[11] == 0x01;
+}
+
+uint64_t PartitionContentStart(MxfReader& reader, uint64_t partitionEnd, uint64_t limit) {
+  limit = std::min(limit, reader.Size());
+  uint64_t pos = partitionEnd;
+  for (int guard = 0; guard < 8 && pos + 17 <= limit; ++guard) {  // a handful of Fill items at most
+    if (!reader.Seek(pos)) return partitionEnd;
+    KlvHeader klv{};
+    if (!ReadKlvHeader(reader, klv) || !LooksLikeKlvKey(klv.key)) return partitionEnd;
+    if (!UlEquals(klv.key, kKlvFillKey)) return pos;
+    const uint64_t valueEnd = klv.valueOffset + klv.length;
+    if (valueEnd > limit) return partitionEnd;
+    pos = valueEnd;
+  }
+  return partitionEnd;
+}
+
+bool EndsHeaderMetadata(const Ul& key) {
+  return !LooksLikeKlvKey(key) || UlEquals(key, kIndexTableSegmentKey) || IsPartitionPackKey(key, nullptr) ||
+         UlEquals(key, kRandomIndexPackKey) || IsEssenceContainerElementKey(key);
+}
+
+uint64_t ScanHeaderMetadataEnd(MxfReader& reader, uint64_t start, uint64_t limit) {
+  limit = std::min({limit, reader.Size(), start + kMaxHeaderMetadataSize});
+  uint64_t pos = start;
+  while (pos + 17 <= limit && reader.Seek(pos)) {
+    KlvHeader klv{};
+    if (!ReadKlvHeader(reader, klv) || EndsHeaderMetadata(klv.key)) break;
+    const uint64_t next = klv.valueOffset + klv.length;
+    if (next > limit) break;
+    pos = next;
+  }
+  return pos;
 }
 
 std::optional<PartitionPack> ReadPartitionPackValue(MxfReader& reader, const KlvHeader& klv) {

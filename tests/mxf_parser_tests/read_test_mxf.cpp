@@ -64,7 +64,7 @@ int main(int argc, char** argv) {
       }
       if (!LooksLikeKlvKey(klv.key)) {
         std::cout << "[" << i << "] offset=" << klvStart << " NOT-A-KLV-KEY, resyncing..." << std::endl;
-        if (!reader.Seek(klvStart + 1) || !ResyncToUlDesignator(reader)) {
+        if (!reader.Seek(klvStart + 1) || !ResyncToUlDesignator(reader, klvStart + 1 + kMaxResyncBytes)) {
           std::cout << "  resync failed" << std::endl;
           break;
         }

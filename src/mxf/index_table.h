@@ -126,6 +126,10 @@ struct IndexScanPartition {
   // essence start" would misresolve them once more than one partition
   // shares a BodySID.
   uint64_t scanHardEndBound = 0;
+  // The declared end of this partition's metadata/index was not on a KLV
+  // boundary, so finding essenceStartOffset needed a resync -- reported,
+  // see EssenceIndex::EssenceStartResyncs.
+  bool essenceStartResynced = false;
   // This partition's Partition Pack BodyOffset (SMPTE 377-1): this
   // partition's position within the *logical*, cross-partition essence
   // container for bodySid, i.e. the StreamOffset an Index Table Segment
@@ -272,8 +276,15 @@ class EssenceIndex {
   // build audio indices directly from the video index without essence walking.
   const std::vector<FlatIndexEntry>& GetEntries() const { return entries_; }
 
+  // Offsets of the partitions whose essence start was only found by a
+  // resync -- none in an intact file. Diagnostic only, for the plugin log;
+  // not part of the serialized index.
+  const std::vector<uint64_t>& EssenceStartResyncs() const { return essenceStartResyncs_; }
+  void SetEssenceStartResyncs(std::vector<uint64_t> offsets) { essenceStartResyncs_ = std::move(offsets); }
+
  private:
   std::vector<FlatIndexEntry> entries_;  // sorted ascending & unique by editUnit
+  std::vector<uint64_t> essenceStartResyncs_;
 };
 
 // Full pipeline: enumerate partitions -> scan each for Index Table

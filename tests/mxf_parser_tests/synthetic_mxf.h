@@ -148,6 +148,10 @@ struct SyntheticFile {
   uint32_t width = 320;
   uint32_t height = 240;
   Ul pictureEssenceCoding = kRawVideoCoding;
+  // Picture descriptor FrameLayout (0x320C) / FieldDominance (0x3212); -1
+  // (the default) leaves the tag out.
+  int frameLayout = -1;
+  int fieldDominance = -1;
 
   // Adds a second Package -- a SourcePackage -- alongside the MaterialPackage
   // built unconditionally below, so tests can exercise Origin handling (see
@@ -301,6 +305,8 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagU32(entries, 0x3203, cfg.width);
     AppendTagU32(entries, 0x3202, cfg.height);
     AppendTagUl(entries, 0x3201, cfg.pictureEssenceCoding);
+    if (cfg.frameLayout >= 0) AppendTagBytes(entries, 0x320C, {static_cast<uint8_t>(cfg.frameLayout)});
+    if (cfg.fieldDominance >= 0) AppendTagBytes(entries, 0x3212, {static_cast<uint8_t>(cfg.fieldDominance)});
     AppendLocalSet(metadata, 0x28, 0x00, entries);
   }
 

@@ -19,10 +19,16 @@ enum class PixelFormat {
 
 // A decoded video frame in a host-agnostic layout. Plane 0 only is used for
 // packed formats (kUyvy422); planes 0/1/2 = Y/U/V for planar formats.
+// How a decoded frame's two fields are ordered in time. kUnknown when the
+// decoder doesn't say (e.g. uncompressed UYVY): callers then fall back to the
+// MXF descriptor (see MxfStreamInfo::DescriptorFieldOrder).
+enum class FieldOrder { kUnknown, kProgressive, kTff, kBff };
+
 struct NormalizedFrame {
   PixelFormat format = PixelFormat::kUnknown;
   int width = 0;
   int height = 0;
+  FieldOrder fieldOrder = FieldOrder::kUnknown;
   std::vector<uint8_t> planeData[3];
   int stride[3] = {0, 0, 0};
   int planeHeight[3] = {0, 0, 0};

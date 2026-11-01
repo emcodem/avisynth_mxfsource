@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "mxf/klv.h"
@@ -34,6 +35,30 @@ struct EssenceElement {
   std::vector<uint8_t> data;  // raw KLV Value bytes -- handed to a decoder/interleaver as-is
 };
 
+// A spot where no valid KLV starts right after the previous value -- never
+// payload (values are skipped by their length, never looked into), so in an
+// intact file this doesn't happen: the file is damaged at `offset`.
+struct WalkDamage {
+  uint64_t offset = 0;
+  // A key was there but its length field is invalid; never resynced.
+  bool badLength = false;
+  // True if the walk went on: a resync found the next key at `resumedAt`.
+  // False if the walk ended at `offset`.
+  bool resumed = false;
+  uint64_t resumedAt = 0;
+};
+
+struct EssenceWalkerOptions {
+  // How far past a damaged spot the walk may search for the next key (see
+  // ResyncToUlDesignator). 0: never -- the walk ends at the damage, so the
+  // frames after it are unreachable and fail (strict mode: no guessing past
+  // damage). A damaged length field (a BER length of more than 8 bytes)
+  // always ends the walk.
+  uint64_t maxResyncBytes = kMaxResyncBytes;
+  // Called for every damaged spot met, whether the walk went on or not.
+  std::function<void(const WalkDamage&)> onDamage;
+};
+
 // Walks forward through Body Partition(s) starting at `startOffset` (Phase
 // 1's MxfStreamInfo::headerMetadataEnd), returning one EssenceElement per
 // call to Next() for whichever tracked Track (video or one of the audio
@@ -47,7 +72,8 @@ struct EssenceElement {
 class EssenceWalker {
  public:
   EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array<uint8_t, 4> videoTrackNumber,
-                bool hasVideo, std::vector<std::array<uint8_t, 4>> audioTrackNumbers);
+                bool hasVideo, std::vector<std::array<uint8_t, 4>> audioTrackNumbers,
+                EssenceWalkerOptions options = {});
 
   // Advances to and returns the next matching essence element. Returns
   // false at EOF or on a malformed KLV (out.data is left empty in that case).
@@ -81,10 +107,15 @@ class EssenceWalker {
   uint64_t Position() const { return reader_.Tell(); }
 
  private:
+  // Handles a damaged spot at `offset` per options_: reports it, and returns
+  // true with the reader on the next key if a resync found one in range.
+  bool HandleDamage(uint64_t offset);
+
   MxfReader& reader_;
   std::array<uint8_t, 4> videoTrackNumber_;
   bool hasVideo_;
   std::vector<std::array<uint8_t, 4>> audioTrackNumbers_;
+  EssenceWalkerOptions options_;
 };
 
 }  // namespace mxfsrc

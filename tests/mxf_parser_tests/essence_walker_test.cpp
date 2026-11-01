@@ -129,50 +129,75 @@ void TestNoBodyPartitionEssenceFollowsHeaderDirectly() {
   std::filesystem::remove(path);
 }
 
-// Regression test for the same real Atomos Shogun files: they pad a
-// partition out to a KAG boundary using raw zero bytes instead of a
-// spec-compliant KLV Fill Item. A run length that isn't a multiple of 17
-// (a zero-length KLV's header size) would desync a naive walk so it lands
-// misaligned inside the real essence element and fails outright --
-// EssenceWalker must resync past it instead (see essence_walker.cpp's
-// ResyncToUlDesignator).
-void TestSkipsNonCompliantZeroBytePadding() {
-  SyntheticFile cfg;
-  cfg.sequenceDuration = 2;
-  cfg.videoTrackNumber = kVideoTrackNumber;
-  std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+// Damage between two essence elements (real case: a Cambria-transcoded
+// MPEG-2 file with 364-5780 byte runs of garbage where the next KLV should
+// start). In an intact file this never happens -- every byte belongs to a
+// KLV -- so it is damage, reported via onDamage. Strict (maxResyncBytes 0):
+// the walk ends there. Otherwise: a resync finds the next key, but only
+// within maxResyncBytes. A damaged length field (BER length of more than 8
+// bytes) always ends the walk. (This test used to cover "raw zero padding"
+// on Atomos Shogun files; that was the walk starting at a wrong offset
+// inside a KLV Fill's zero value, see LooksLikeKlvKey in mxf/klv.h.)
+void TestDamageBetweenElementsStrictVsBoundedResync() {
+  struct Case {
+    const char* name;
+    uint8_t lengthByte;  // the 17th garbage byte, read as the BER length
+    uint64_t maxResyncBytes;
+    int64_t expectedElements;
+    bool expectedResumed;
+  };
+  const Case cases[] = {
+      {"strict", 0x5A, 0, 1, false},
+      {"bounded resync, in range", 0x5A, kMaxResyncBytes, 3, true},
+      {"bounded resync, out of range", 0x5A, 20, 1, false},
+      {"bad length field", 0xE2, kMaxResyncBytes, 1, false},
+  };
+  for (const Case& c : cases) {
+    SyntheticFile cfg;
+    cfg.sequenceDuration = 3;
+    cfg.videoTrackNumber = kVideoTrackNumber;
+    std::vector<uint8_t> bytes = BuildSyntheticHeader(cfg);
+    AppendPartitionPack(bytes, PartitionKind::kBody);
+    AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 0});
+    const uint64_t damageOffset = bytes.size();
+    std::vector<uint8_t> garbage(37, 0x5A);  // no UL designator in it
+    garbage[16] = c.lengthByte;
+    bytes.insert(bytes.end(), garbage.begin(), garbage.end());
+    const uint64_t nextKey = bytes.size();
+    AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 1});
+    AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 2});
 
-  AppendPartitionPack(bytes, PartitionKind::kBody);
-  bytes.insert(bytes.end(), 37, 0);  // 37 raw zero bytes, not a multiple of 17
-  AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 0});
-  AppendEssenceElement(bytes, kVideoTrackNumber, {0xDD, 1});
-
-  auto path = WriteTempFile(bytes, "mxfsrc_test_zero_padding.mxf");
-  {
-    MxfReader reader(path.string());
-    CHECK(reader.IsOpen());
-
-    auto info = ParseMxfHeader(reader);
-    CHECK(info.has_value());
-    if (!info) {
-      std::filesystem::remove(path);
-      return;
+    auto path = WriteTempFile(bytes, "mxfsrc_test_walk_damage.mxf");
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      CHECK(info.has_value());
+      if (info) {
+        std::vector<WalkDamage> damages;
+        EssenceWalkerOptions options;
+        options.maxResyncBytes = c.maxResyncBytes;
+        options.onDamage = [&](const WalkDamage& d) { damages.push_back(d); };
+        EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {}, options);
+        int64_t count = 0;
+        EssenceElement element;
+        while (walker.Next(element)) {
+          CHECK(element.isVideo);
+          CHECK(element.data.size() == 2 && element.data[1] == static_cast<uint8_t>(count));
+          ++count;
+        }
+        CHECK(count == c.expectedElements);
+        CHECK(damages.size() == 1);
+        if (damages.size() == 1) {
+          CHECK(damages[0].offset == damageOffset);
+          CHECK(damages[0].resumed == c.expectedResumed);
+          CHECK(damages[0].badLength == (c.lengthByte == 0xE2));
+          if (c.expectedResumed) CHECK(damages[0].resumedAt == nextKey);
+        }
+        if (count != c.expectedElements) std::cerr << "  case: " << c.name << std::endl;
+      }
     }
-
-    EssenceWalker walker(reader, info->headerMetadataEnd, info->videoTrackNumber, info->hasVideo, {});
-    int64_t count = 0;
-    EssenceElement element;
-    while (walker.Next(element)) {
-      CHECK(element.isVideo);
-      CHECK(element.data.size() == 2);
-      CHECK(element.data[0] == 0xDD);
-      CHECK(element.data[1] == static_cast<uint8_t>(count));
-      ++count;
-    }
-    CHECK(count == 2);
+    std::filesystem::remove(path);
   }
-
-  std::filesystem::remove(path);
 }
 
 void TestEmptyBodyPartitionYieldsNoElements() {
@@ -429,7 +454,7 @@ int main() {
   TestResyncOverLongZeroRunUsesFewReads();
   TestWalksVideoElementsInOrderSkippingOthers();
   TestNoBodyPartitionEssenceFollowsHeaderDirectly();
-  TestSkipsNonCompliantZeroBytePadding();
+  TestDamageBetweenElementsStrictVsBoundedResync();
   TestEmptyBodyPartitionYieldsNoElements();
   TestMultiTrackAudioFiltering();
   TestBoundedPrefixReadSkipsRemainder();

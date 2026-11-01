@@ -10,22 +10,43 @@ bool IsEssenceElementKey(const Ul& key) {
 }
 
 EssenceWalker::EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array<uint8_t, 4> videoTrackNumber,
-                              bool hasVideo, std::vector<std::array<uint8_t, 4>> audioTrackNumbers)
+                              bool hasVideo, std::vector<std::array<uint8_t, 4>> audioTrackNumbers,
+                              EssenceWalkerOptions options)
     : reader_(reader),
       videoTrackNumber_(videoTrackNumber),
       hasVideo_(hasVideo),
-      audioTrackNumbers_(std::move(audioTrackNumbers)) {
+      audioTrackNumbers_(std::move(audioTrackNumbers)),
+      options_(std::move(options)) {
   reader_.Seek(startOffset);
+}
+
+bool EssenceWalker::HandleDamage(uint64_t offset) {
+  WalkDamage damage;
+  damage.offset = offset;
+  if (options_.maxResyncBytes > 0 && reader_.Seek(offset + 1) &&
+      ResyncToUlDesignator(reader_, offset + 1 + options_.maxResyncBytes)) {
+    damage.resumed = true;
+    damage.resumedAt = reader_.Tell();
+  }
+  if (options_.onDamage) options_.onDamage(damage);
+  return damage.resumed;
 }
 
 bool EssenceWalker::Next(EssenceElement& out, bool wantData, size_t maxBytes) {
   while (reader_.Tell() + 17 <= reader_.Size()) {
     const uint64_t klvStart = reader_.Tell();
     KlvHeader klv{};
-    if (!ReadKlvHeader(reader_, klv)) return false;
+    if (!ReadKlvHeader(reader_, klv)) {
+      // A damaged length field: nothing to resync on reliably, the walk ends.
+      if (options_.onDamage) options_.onDamage(WalkDamage{klvStart, /*badLength=*/true, false, 0});
+      return false;
+    }
 
+    // No key where the previous value ended: the file is damaged here (see
+    // LooksLikeKlvKey). Resync only as far as options_ allow -- not at all
+    // in strict mode.
     if (!LooksLikeKlvKey(klv.key)) {
-      if (!reader_.Seek(klvStart + 1) || !ResyncToUlDesignator(reader_)) return false;
+      if (!HandleDamage(klvStart)) return false;
       continue;
     }
 
