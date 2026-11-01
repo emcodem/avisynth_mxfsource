@@ -70,7 +70,7 @@ struct OpenOptions {
   // document from -- see mxf/index_transport.h -- instead of building the
   // index locally via mxf/index_table.h's BuildEssenceIndex. Published by
   // the separate MxfExtractIndex host function; for distributed setups (one
-  // instance scans the file, e.g. AWS slave instances working off a
+  // instance scans the file, e.g. remote worker instances working off a
   // byte-identical copy of the same source) where repeating that scan on
   // every instance is pure redundant I/O. Any failure -- network error,
   // malformed JSON, version/bodySid mismatch, or the byte-offset-vs-file-

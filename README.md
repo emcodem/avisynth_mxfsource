@@ -333,6 +333,32 @@ byte-identical copy of the file and skip the scan.
 - When indexing an HTTP source, the index sections are fetched with
   parallel ranged requests.
 
+### Chunked distributed processing
+
+The published index is meant for splitting one file across many workers
+(serverless functions, batch jobs, render nodes). A typical layout:
+
+1. A **dispatcher** runs `MxfExtractIndex(source, <presigned PUT url>)`
+   once. It scans the file and stores the index at a presigned URL.
+2. The dispatcher starts one **worker** per chunk (for example per 100 frames)
+   and hands each one the source URL, the index URL and its frame range.
+3. Each worker opens the source with `indexurl` and `start_frame`, filters and
+   encodes only its frames, and writes the result to a presigned URL.
+
+```
+src = MxfSource("<presigned GET url of the mxf>", indexurl="<presigned GET url of the index>", start_frame=1200)
+src.Trim(1200, 1299)    # worker for the chunk 1200..1299
+```
+
+- Without `indexurl`, every worker would repeat the full index scan.
+  With it, a worker reads the index (a few MB at most) and goes straight to
+  the keyframe before `start_frame`.
+- `start_frame` only places the decode thread. Earlier frames still work, just
+  without that optimization.
+- All workers must read a byte-identical copy of the file, or the index check
+  fails the open.
+- Presigned URLs must outlive the slowest worker, including queue time.
+
 ### Video output formats
 
 | Decoded format | AviSynth+ | VapourSynth | Typical source |
