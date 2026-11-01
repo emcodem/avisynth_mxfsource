@@ -2,20 +2,37 @@
 
 Forward-only MXF (SMPTE 377M) source plugin for AviSynth+ and VapourSynth.
 
-Unlike ffms2 / L-SMASH Works, this plugin never builds a full random-access
-seek index. It's designed for the ffmpeg-processing use case: frames are
-always decoded forward, frame 0, 1, 2, ... to EOF. A background thread walks
-the MXF file and decodes ahead into a configurable ring buffer (default 300
-frames) so the host's own prefetch/read-ahead requests are served from cache.
+## Why this plugin exists
+
+Source plugins like ffms2 and L-SMASH Works build a full frame index before
+the first frame can be served. For a large MXF that means reading and
+parsing the whole file first, which can take minutes and has to be repeated in
+every process that opens the file. In a chunked or distributed pipeline,
+where many workers each need only a small range of one big file, that
+indexing dwarfs the actual work.
+
+This plugin exists to avoid that long-running index creation. An MXF file
+already carries its own Index Table, so the plugin uses it and never scans
+the video frames:
+
+- **Opening is fast.** The file is opened from its header, footer and Index
+  Table. Multi-GB and UHD files open in about a second.
+- **`MxfExtractIndex` is a short action.** It reads only the MXF index and
+  metadata, decodes nothing, and publishes the index once (to a path or a
+  presigned URL). Every other machine opens the same file with `indexurl=`
+  and starts without any scan. See
+  [Chunked distributed processing](#chunked-distributed-processing).
+- **Frames are decoded forward only**, frame 0, 1, 2, ... to EOF, which is
+  what an ffmpeg-style processing run does. A background thread walks the
+  file and decodes ahead into a configurable ring buffer (default 300
+  frames), so the host's own read-ahead requests are served from cache. The
+  Index Table is used only for jumps outside the buffer and for
+  `start_frame`.
 
 ## Features
 
 - **Both hosts, one engine.** AviSynth+ and VapourSynth plugins share one
   core and take the same parameters.
-- **Forward-only, fast open.** No full-file scan: the file is opened from
-  its header, footer/RIP and Index Table, so multi-GB and UHD files open in
-  about a second. Seeking is served from a ring buffer, with Index Table
-  lookups for jumps outside it.
 - **Wide codec coverage** through libavcodec: MPEG-2 (XDCAM HD/HD422, D-10/
   IMX), H.264 (AVC-Intra, XAVC, XAVC-L), DV, ProRes (incl. 4444, 12 bit),
   DNxHD/DNxHR and uncompressed video. See [Video output formats](#video-output-formats).
@@ -27,8 +44,8 @@ frames) so the host's own prefetch/read-ahead requests are served from cache.
   fail fast with a precise message instead of silently producing wrong output.
 - **[HTTP, HTTPS and S3 presigned URLs](#http-https-and-s3-presigned-urls)**
   as a source, with range requests, retries and no download to disk.
-- **Published index for distributed processing.** `MxfExtractIndex` scans a
-  file once and publishes the index (to a path or a presigned PUT URL);
+- **Published index for distributed processing.** `MxfExtractIndex` reads the
+  index of a file once and publishes it (to a path or a presigned PUT URL);
   other machines open the same file with `indexurl=` and skip the scan.
 - **Long and non-ASCII paths** on Windows.
 - **Windows (MSVC) and Linux (gcc/clang)** builds; see [Build](#build).
