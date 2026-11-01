@@ -111,7 +111,14 @@ Current status:
   run of bogus zero-length KLVs, desyncing before it reached the real
   essence; fixed with a resync helper that scans forward for the next
   legitimate KLV key (SMPTE UL designator `06.0E.2B.34`) instead of
-  trusting a length field derived from noise. Both are regression-tested
+  trusting a length field derived from noise. **Correction (2026-10-21):**
+  (2) was a misdiagnosis. A KLV walk from byte 0 shows these files are
+  intact KLV for KLV; their padding is regular KLV Fill. The walk started
+  at a wrong offset, inside a KLV Fill's zero value, because
+  HeaderByteCount was counted from the end of the Partition Pack instead
+  of from after its KAG Fill (see `PartitionContentStart`). With the
+  corrected base, no resync is needed on these files, and strict mode no
+  longer resyncs at all (see [Strict mode](#strict-mode)). Both are regression-tested
   with hand-crafted synthetic files reproducing each layout
   (`essence_walker_test.cpp`). Separately, XAVC-L's PictureEssenceCoding UL
   (registered under a different family than AVC-Intra) is now classified as
@@ -144,7 +151,8 @@ Current status:
   index's own covered range when Header Metadata's Duration is absent.
   Real-file verification (`read_test_mxf`, extended to report index
   coverage) against the Phase 9 XAVC-L file found and fixed a second
-  instance of that phase's zero-byte-KAG-padding bug -- this time in the
+  instance of that phase's zero-byte-KAG-padding bug (since found to be the
+  same wrong-offset error, see the correction under Phase 9) -- this time in the
   new Index Table scanner, not `EssenceWalker` -- fixed by promoting the
   resync helpers to shared utilities in `mxf/klv.h/.cpp`. Confirmed against
   the real file: index built, covers all 3115 frames, a genuine
@@ -239,6 +247,29 @@ Anything else (e.g. ProRes 4444 with alpha, `yuva444p`) fails at open with
 FFmpeg's codec tag (`apco` ... `ap4x`) from the PictureEssenceCoding UL, as
 FFmpeg's own MXF demuxer does; without it, 4444 profiles would decode at 10
 instead of 12 bit.
+
+### Field order
+
+Output frames are always whole frames (frame-based, never fields). Their
+field order comes from the decoder, which reads it from the bitstream for
+MPEG-2, H.264, DV, ProRes and DNxHD. If the decoder doesn't report one
+(e.g. uncompressed video), the MXF picture descriptor is used:
+FrameLayout FullFrame or SegmentedFrame means progressive, and
+SeparateFields or MixedFields with FieldDominance 1 means TFF. Any other
+combination stays unknown; there's no verified real file for a BFF
+descriptor.
+
+| | AviSynth+ | VapourSynth |
+|---|---|---|
+| Per clip | `IsTFF()`/`IsBFF()` and `GetParity()`, from the first frame; progressive or unknown sets neither | -- |
+| Per frame | `_FieldBased` frame property (AviSynth+ interface 8 or later) | `_FieldBased` frame property |
+
+`_FieldBased` is 0 for progressive, 1 for BFF, 2 for TFF, and is not set
+when the field order is unknown. On the sample share, interlaced XDCAM HD422,
+XAVC, D-10 and K2 SD material is TFF, and ProRes, DNxHR, XAVC-L UHD and 720p
+material is progressive. The plugin matches ffprobe frame for frame on these.
+(Before 2026-10-21, `GetParity` always returned false, i.e. BFF, and no
+`_FieldBased` was set.)
 
 ### Audio
 
@@ -339,9 +370,9 @@ Every message ends with `(disable strict to open it anyway)`.
 Notes on the individual checks:
 
 1. **Zero tail.** A valid MXF file ends with a RIP or a Footer Partition,
-   never with zeros. Raw-zero KAG padding seen on real recorders stays
-   below 1 KiB, so 64 KiB (`kMaxExpectedTrailingZeroBytes`) leaves a wide
-   margin. This also fails growing files: a recorder that preallocated the
+   never with zeros. Real recorders pad with KLV Fill items, so 64 KiB
+   (`kMaxExpectedTrailingZeroBytes`) leaves a wide margin against a
+   coincidentally zero-valued tail. This also fails growing files: a recorder that preallocated the
    file with zeros is still incomplete. The check is one 64 KiB read at the
    end of the file. The message reports only what was read: the offset where
    that block starts (file size - 64 KiB) and that it is zero up to the end.
@@ -384,9 +415,16 @@ Notes on the individual checks:
   partition whose index would have been in the missing footer.
 - It does not verify essence content (codec bitstream errors, frames cut
   off in the middle are only found when decoding).
-- It does not affect the essence walk during playback. Skipping and
-  resyncing over KLV Fill and raw-zero padding between elements still
-  happens there as usual.
+- It does not verify the essence before playback. During playback the
+  essence walk reads key and length of each KLV and skips every value by its
+  length, never looking into it. In an intact file every byte belongs to a
+  KLV, so the next key always starts where the previous value ends. If it
+  doesn't, the file is damaged there. Strict mode never guesses past that
+  spot: the walk ends there, the frames after it fail with an error, and the
+  plugin log names the offset (`no valid KLV at byte X (the file is damaged
+  there)`). Without strict, the walk searches for the next key, but only
+  within 10 MiB (`kMaxResyncBytes`), and logs what it skipped. A damaged
+  length field ends the walk in both modes.
 - With `indexurl`, the fetched index replaces the local index build, so
   check 3 does not apply; checks 1, 2 and 4 do.
 

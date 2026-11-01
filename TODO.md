@@ -448,9 +448,11 @@ covers a forward jump but apparently not this access pattern).
 Not investigated yet: whether the cause is the jump distance, the
 end-of-stream position, or the access pattern of AviSynth's `Trim`.
 
-### Corpus re-run against the 2026-10-16 baseline
+### Corpus re-run against the 2026-10-16 baseline -- done 2026-10-19
 
-Not run yet (on request only). Compare against
+Ran as part of the 2026-10-19 scan: no regressions (all 64 baseline-OK files
+that now fail do so with a `strict:` message), see the triage report below.
+Original plan: compare against
 `tools/corpus_scan/results_2026-10-16/`: every file that was SUPPORTED must
 stay SUPPORTED, except the expected strict-mode failures below; re-time any
 decode timeouts serially (10 parallel UHD decodes caused false timeouts).
@@ -473,14 +475,253 @@ The scan logs keep only the last 600 characters of the plugin log; keep the
 full log (or at least the first lines) in the re-run, they were needed to
 classify the audio failures.
 
-### Open-header file whose declared index isn't found
+### Open-header file whose declared index isn't found -- resolved, not a bug
 
 `SERVER/SHARE/...`
-(0.29 GB, Header Open Incomplete, `IndexByteCount=512`, `IndexSID=1`,
-`BodySID=2`, no Duration). Strict mode reports "no Index Table Segment";
-it opened in the baseline only via the full-file scan. Probably a lookup
-bug (BodySID/IndexSID matching or the segment's position), not damage.
-Not investigated.
+Checked 2026-10-20: the declared index region (bytes 112284-112796) is all
+zeros, there is no segment key in the first 1 MB, and the file has no
+footer or RIP (exactly 272 MiB). It is an aborted recording whose index was
+never written, so the strict refusal is correct.
+
+## Open items from the 2026-10-19 scan
+
+Scan: 12,040 files, build `650208c`. Full triage, with all categories and
+example paths: `D:\mxfscan_2026-10-19\triage\triage_report.md`. Ranked by
+priority (user decision 2026-10-20).
+
+Order of the remaining work (user decision 2026-10-21): 5 (full
+clip-wrapped support), 9, then 8. 6 and 7 only need to end with the
+correct error message. 2 is not going to be supported.
+
+### 1. Header Metadata truncated at the declared HeaderByteCount end (plugin bug) -- implemented, rescan pending
+
+`ParseMxfHeader` reads metadata only up to `partitionEnd + HeaderByteCount`.
+Fixup 1 widens that only when RIP[1] is a Body Partition, and
+`ReadMetadataSets` silently stops at the first set that crosses the end.
+On the measured files the writers aren't wrong: they count HeaderByteCount
+from the first KLV after the Partition Pack's KAG Fill (normally the Primer
+Pack), not from the end of the pack. The plugin's end is therefore too
+early by the size of that Fill (D-10 IBM/MXFTK/K2 2011, ffmpeg's own mxf
+muxer, SARNOFF ffmpeg experiments), so the last sets are dropped:
+
+- 265 files with video fail with "no video track found" (the picture
+  descriptor is cut off), e.g.
+  `SERVER/SHARE/...`.
+- 52 strict-OK files silently have no audio (the sound track's
+  Sequence/SourceClip or the AES3 descriptor is cut off), e.g.
+  `SERVER/SHARE/...`
+  (declared end 5244, metadata really ends at 5403) and
+  `SERVER/SHARE/...` (5788 vs 5945).
+- 1 file with `HeaderByteCount = 0xFFFFFFFFFFFFFFFF` (the end wraps to 155):
+  `SERVER/SHARE/...`.
+
+Fix (2026-10-20, uncommitted):
+- HeaderByteCount now counts from `PartitionContentStart` (partition.h).
+- `ReadMetadataSets` also reads on past the declared end through further
+  metadata. It stops at the first non-metadata KLV, at the next known
+  partition, and at hard bounds (1 MiB past the declared end, 16 MiB in
+  total), so it never walks the file.
+- A HeaderByteCount that doesn't fit in the file counts as unknown.
+- Verified bit-exact against ffmpeg (video framemd5 + audio md5) on the
+  D-10, ffmpeg_play, IBM and R103 examples.
+- Still to do: full rescan and the Linux tests.
+
+### 2. OP1b with several BodySIDs merges every index into the video index -- won't fix (OP1b not supported)
+
+Deferred by user decision 2026-10-20. P2 AVC-LongG OP1b (video BodySID 1,
+audio BodySIDs 2-6): the video index gets 475,552 entries for 255 frames,
+which leads to audio fetch failures (3 decode_failed, 6 decode_timeout) and
+3-7 s opens. Strict passes these files because the inflated index looks
+complete. Example:
+`SERVER/SHARE/...`.
+
+### 3. Partition index scan starts at the wrong offset -- implemented, rescan pending
+
+`ReadOnePartitionForIndex` starts at `partitionEnd + HeaderByteCount`.
+Writers that put a KLV Fill right after the Partition Pack count
+HeaderByteCount from after it (same cause as item 1), so the scan starts
+inside the Fill.
+`ScanPartitionForIndexSegments` then `break`s on the BER failure
+(`index_table.cpp:237`) instead of resyncing. As a result, 8 intact K2
+Summit `*_stream.mxf` files lose the Footer's last index segment and are
+wrongly refused by strict check 4 (with strict=false their audio is
+dropped), e.g.
+`SERVER/SHARE/...`
+(segment really at 917669888, scan starts at 917669548).
+
+Fix (2026-10-20, uncommitted):
+- `IndexRangeStart` (index_table.cpp) counts from `PartitionContentStart`.
+  The old base is kept where the segment is only found there.
+- A HeaderByteCount that doesn't fit in the file is replaced by the
+  bounded `ScanHeaderMetadataEnd`.
+- A failed KLV header read now resyncs (bounded) instead of ending the scan.
+- A CBR segment whose EditUnitByteCount doesn't fit in the file even once
+  (a placeholder, 0xFFFFFFFF) is no index. Without this, the WildeKaribik
+  file, an unfinished recording, opened in strict mode as 1 frame.
+- Verified:
+  - both K2 example files open in strict mode with 3000 and 750 frames;
+    video (first 50 and last 10 frames) and 8 ch audio are bit-identical
+    with ffmpeg;
+  - GAUDI (336 partitions) is unchanged and identical.
+- Still to do: full rescan and the Linux tests.
+
+### 4. Essence walk past damage -- implemented, rescan pending
+
+Decisions (2026-10-21):
+- Strict mode never resyncs. If no valid KLV starts right after a value,
+  the file is damaged there: the walk ends, later frames fail with an
+  error, and the log names the offset.
+- strict=false resyncs, but only within 10 MiB (`kMaxResyncBytes`).
+- A damaged length field ends the walk in both modes; no new recovery.
+- The open-time resync in `ResyncToActualEssenceStart` is bounded to
+  10 MiB too.
+- Every damaged spot and every open-time resync is logged.
+- Not fixed, by decision: when the walk ends early, the frame flushed from
+  the decoder is served under the wrong number. On the Cambria file below,
+  ffmpeg's frame 17 comes out as frame 15 without an error, and frame 16
+  then fails. Strict mode does report an error (at frame 16), which is
+  enough.
+
+Findings:
+- The resync existed only for the Atomos "raw zero padding", which was a
+  misdiagnosis: the walk started at a wrong offset inside a KLV Fill's
+  zero value (same counting base as items 1/3). A KLV walk from byte 0
+  finds no non-KLV byte in BeepFlash XAVC-L/-Intra. With the item 1/3 fix
+  and strict (no resync), the XAVC-L file decodes all 3115 frames
+  bit-identical to ffmpeg; XAVC-Intra matches on its first 50 and last 10
+  frames.
+- The 2 `TimecodeFiles\TC_*_Origin4.mxf` failures were the same base
+  error. Their KLV structure is intact from byte 0, and with items 1/3,
+  646 frames match ffmpeg's frames 4-649 (Origin 4).
+- Cambria (example below) is really damaged: 3 non-KLV runs in the essence
+  (5780 bytes at 5933056 where a sound element's key and length should be;
+  364 bytes at 13379732 and at 24531604). The log now says `no valid KLV at
+  byte 5933056 (the file is damaged there)`, in both modes.
+
+Remaining: the full rescan must show which intact files (if any) still log
+a damaged spot or an open-time resync. Any such file must be explained.
+
+Example:
+`SERVER/SHARE/...`.
+
+### 5. Clip-wrapped essence (Phase 7 item 5) -- now with real files
+
+312 files, all OP-Atom: 227 P2 DV
+(`SERVER/SHARE/...`),
+84 P2 AVC-Intra (`P2 12 PK Le Livre\CONTENTS\VIDEO`), and `avid-xavc.mxf`.
+
+- Strict refuses them with a misleading "no Index Table Segment". The
+  index segments are in the Header Partition, but the file has no RIP, so
+  the Body Partition isn't enumerated and `LiesInPartitionEssence` drops
+  every entry.
+- strict=false exposes 1 frame instead of ~46 (263 files) or times out
+  (48 files).
+- No file that strict opens is clip-wrapped.
+
+Survey of all 312 (2026-10-21, `D:\mxfscan_2026-10-19\triage\item5\`):
+
+| Files | Codec | Partitions / RIP | Index | Clip value vs index |
+|---|---|---|---|---|
+| 227 | DV (P2) | Header, Body, Footer / no RIP | 1 CBR segment, EUBC 576000, IndexDuration 0 | exact multiple of EUBC |
+| 84 | AVC-Intra (P2) | Header, Body, Footer / no RIP | 2 CBR segments: EU 0 568832, EU 1.. 568320 | running sum == clip length |
+| 1 | AVC-Intra (`avid-xavc.mxf`) | Header, Body, Footer / RIP | 1 CBR segment 568320 | last EU 5120 bytes longer |
+
+- The partitions are found without a RIP through
+  `Header.FooterPartition -> Footer.PreviousPartition -> Body`.
+- Offsets count from the start of the clip KLV's value. In P2 AVC-Intra
+  the access unit delimiters sit exactly at the running sums.
+- P2 AVC-Intra carries SPS/PPS only in EU 0; `avid-xavc.mxf` carries none
+  at all (ffmpeg generates AVC-Intra SPS/PPS internally).
+- No corpus file has clip-wrapped audio next to video. The 2220
+  clip-wrapped audio files are audio-only OP-Atom.
+
+Plan for full support (video; clip-wrapped audio out of scope):
+1. Partition discovery without a RIP: follow `FooterPartition` and then
+   `PreviousPartition` back to the header, accepting only valid partitions
+   (ThisPartition == offset, strictly decreasing, bounded count). Used by
+   the local and the HTTP index build alike (MxfExtractIndex parity). This
+   changes strict mode's definition of a "reachable index" (README).
+2. Detect clip wrapping from the picture essence container label (header
+   pack / descriptor), and locate the video clip KLV (offset and length of
+   its value) through the partition of the video BodySID.
+3. Clip index: entry offsets are the clip value start plus the running sum
+   of EditUnitByteCount over the segments (also correct for frame-wrapped
+   multi-segment CBR, where `editUnit*EUBC` is wrong as well). A segment
+   with IndexDuration 0 runs to the clip end. The last EU extends to the
+   clip end. Every entry must lie inside the clip, and each entry's size is
+   the next offset minus its own. VBR clip indexes use their StreamOffsets
+   the same way.
+4. A clip element source next to `EssenceWalker`, with the same `Next()`
+   contract: it yields one video element per index entry by reading
+   [offset, size). It is used by the decode thread, the seek fallback and
+   the intra-only fast path when the video is clip-wrapped. Random access
+   is direct.
+5. AVC-Intra: read SPS/PPS from EU 0 at open and give them to every
+   decoder (extradata), so decoding can start at any frame. With no SPS/PPS
+   in the file (`avid-xavc.mxf`): an explicit error, not supported. Skipped
+   for now (user decision 2026-10-21); supporting it would need ffmpeg's
+   AVC-Intra SPS/PPS tables in the plugin.
+6. Strict: the index must cover Duration (check 4, unchanged), and the
+   index must account for the whole clip value: the last EU may only absorb
+   the remainder (not more than one EU's worth). Otherwise "damaged".
+7. MxfExtractIndex / `indexurl`: the serialized index carries the clip
+   value end (index blob version 2). Old version-1 blobs stay readable for
+   frame-wrapped files.
+8. Tests: synthetic OP-Atom clip-wrapped files without a RIP (single CBR
+   with IndexDuration 0, two CBR segments, VBR), random access, strict
+   checks, MxfSource/MxfExtractIndex agreement. Real files: all 311 P2
+   files bit-exact against ffmpeg (framemd5) on Windows and Linux, then the
+   full rescan.
+
+### 6. Duration 0 gives 0 frames and an empty error -- only the error message to fix
+
+Aborted or open recordings write Duration 0. `header_parser` sets
+`numFrames = 0`, and the index fallback runs only for `numFrames < 0`
+(`source_engine.cpp:203`). `Peek(0)` then returns kEndOfStream with no
+message, so the error reads "failed to decode first frame:".
+
+- Affected: 12 files (strict refuses all of them for other reasons), e.g.
+  `SERVER/SHARE/...`
+  (ffmpeg decodes 751 frames).
+- Fix: treat 0 as unknown, at least when the file is not finished, and give
+  the end-of-stream case at open a message.
+
+### 7. MPEG-2 coding UL gaps -- only the error message to fix
+
+- 13 files use `06 0e 2b 34 04 01 01 03 04 01 02 02 01 03 03 00`
+  (MP@HL long GOP), on 1080, 1440 and 720x608 4:2:0, e.g.
+  `SERVER/SHARE/...`.
+- 1 file uses `...01 05 03` (MP@H-14).
+- ffmpeg matches the 13-byte prefix `04 01 02 02 01` as MPEG-2.
+- 4 Pinnacle Liquid D-10 files have no PictureEssenceCoding at all; ffmpeg
+  falls back to the container UL (`...0d 01 03 01 02 04 60 01`), e.g.
+  `SERVER/SHARE/...`.
+
+### 8. Cold open with many partitions over SMB
+
+`SERVER/SHARE/...`
+(23.8 GB, RIP with 336 partitions, 334 of them with an index) takes 13.5 s
+to open serially on a cold cache and 0.3 s warm. `BuildEssenceIndex` reads
+the partitions one after another. The 10 s rule is violated.
+
+### 9. Linux-only open timeouts on very large files (unverified)
+
+6 files of 42-86 GB open in < 1 s on Windows but take > 10 s under
+VapourSynth/Linux, also when re-timed serially, e.g.
+`SERVER/SHARE/...`.
+There is no plugin log line, and ffprobe also timed out on that file in the
+Linux run, which points at the CIFS mount. Re-time one file serially on
+Linux with `logfile` before changing anything.
+
+### Later (from the same triage, lower priority)
+
+Clearer error messages (empty file, audio-only file, "no valid RIP" when an
+invalid one exists, OP1b external essence); the clamp is skipped when it
+would leave 0 frames (`PQ_short.mxf`); run-in before the Header Partition
+Pack plus the MPEG-4 Visual UL (265 Sony `*S01.MXF` proxies); big-endian/AIFF
+PCM (4 files); an optional strict check for a CBR EditUnitByteCount that
+doesn't match the essence (K2 SD exports, `SGI_BSO_Cristal_Gala`); 2
+`K2Sum92_D10_*_stream.mxf` files lose audio for an unknown reason.
 
 ### Best-effort recovery of damaged files (postponed)
 
