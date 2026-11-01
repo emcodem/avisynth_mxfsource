@@ -35,7 +35,9 @@ the video frames:
   core and take the same parameters.
 - **Wide codec coverage** through libavcodec: MPEG-2 (XDCAM HD/HD422, D-10/
   IMX), H.264 (AVC-Intra, XAVC, XAVC-L), ProRes (incl. 4444, 12 bit),
-  DNxHD/DNxHR and uncompressed video. See [Supported MXF files](#supported-mxf-files).
+  DNxHD/DNxHR and uncompressed video, all checked on real files. DV,
+  JPEG 2000, MPEG-4 and FFV1 are also recognized but not yet verified against
+  real MXF files. See [Supported MXF files](#supported-mxf-files).
 - **Audio.** All audio tracks are mixed into one interleaved PCM stream,
   including D-10/IMX 8-channel AES3 and AES3-wrapped PCM; see [Audio](#audio).
 - **Correct frame counts and field order**, with the MXF SourcePackage
