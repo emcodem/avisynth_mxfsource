@@ -1,6 +1,6 @@
 # avs_mxf_plugin
 
-Forward-only MXF (SMPTE 377M) source plugin for AviSynth+ and VapourSynth.
+MXF (SMPTE 377M) source plugin for AviSynth+ and VapourSynth.
 
 ## Why this plugin exists
 
