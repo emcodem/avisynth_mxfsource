@@ -15,7 +15,7 @@ the video frames:
 
 - **Opening is fast.** The file is opened from its header, footer and Index
   Table. Multi-GB and UHD files open in about a second.
-- **`MxfExtractIndex` is a short action.** It reads only the MXF index and
+- **`MxfExtractIndex` (optional) is a short action.** It reads only the MXF index and
   metadata, decodes nothing, and publishes the index once (to a path or a
   presigned URL). Every other machine opens the same file with `indexurl=`
   and starts without any scan. See
