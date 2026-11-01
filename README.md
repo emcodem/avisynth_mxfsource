@@ -350,6 +350,12 @@ src = MxfSource("<presigned GET url of the mxf>", indexurl="<presigned GET url o
 src.Trim(1200, 1299)    # worker for the chunk 1200..1299
 ```
 
+- `MxfExtractIndex` is a short action, unlike building an index with ffms2: it
+  never decodes video and never reads the essence frames. It reads the
+  file's MXF Index Table and its metadata, sets up no decoder, and publishes
+  the result. With strict mode on (the default) it never scans the whole
+  file; a file without a usable index is refused instead. Without strict, a
+  file with no Index Table can still make it read through the essence.
 - Without `indexurl`, every worker would repeat the full index scan.
   With it, a worker reads the index (a few MB at most) and goes straight to
   the keyframe before `start_frame`.
