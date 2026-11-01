@@ -6,10 +6,8 @@ MXF (SMPTE 377M) source plugin for AviSynth+ and VapourSynth.
 
 Source plugins like ffms2 and L-SMASH Works build a full frame index before
 the first frame can be served. For a large MXF that means reading and
-parsing the whole file first, which can take minutes and has to be repeated in
-every process that opens the file. In a chunked or distributed pipeline,
-where many workers each need only a small range of one big file, that
-indexing dwarfs the actual work.
+parsing the whole file first, which can take tens of minutes and has to be repeated in
+every process that opens the file. 
 
 This plugin exists to avoid that long-running index creation. An MXF file
 already carries its own Index Table, so the plugin uses it and never scans
