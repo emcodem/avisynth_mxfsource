@@ -1,0 +1,4 @@
+The bundled libavcodec/libavutil/libswresample are an unmodified LGPL build of FFmpeg
+(https://github.com/BtbN/FFmpeg-Builds). See FFmpeg-LICENSE.txt.
+Requires glibc >= 2.38 (Ubuntu 24.04+, Debian 13+, Fedora 39+) and OpenSSL 3 (libssl.so.3).
+Source and docs: https://github.com/emcodem/avisynth_mxfsource

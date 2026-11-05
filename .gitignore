@@ -8,3 +8,5 @@ out/
 *.lib
 *.exp
 *.pdb
+dist/
+stage/

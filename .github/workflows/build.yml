@@ -1,0 +1,85 @@
+# Builds, tests and packages all four plugin builds (AviSynth and VapourSynth,
+# Windows and Linux) on every push to master and every pull request; the
+# packages are attached to the run as artifacts. Pushing a tag v* also
+# publishes them as a GitHub release -- as a pre-release when the tag has a
+# suffix (v0.2.0-beta.1), as the latest release otherwise (v0.2.0).
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: win64
+          # Ubuntu 24.04 (glibc 2.39): the Linux builds need glibc >= 2.38,
+          # as stated in NOTICE-linux.txt.
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs the tags for the version stamp
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev ninja-build
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          else
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package
+        shell: bash
+        run: packaging/package.sh build ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mxfsource-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=(--verify-tag --generate-notes --title "$TAG")
+          if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" "${flags[@]}"

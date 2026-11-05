@@ -1,0 +1,3 @@
+The bundled avcodec/avutil/swresample DLLs are an unmodified LGPL build of FFmpeg
+(https://github.com/BtbN/FFmpeg-Builds). See FFmpeg-LICENSE.txt.
+Source and docs: https://github.com/emcodem/avisynth_mxfsource
