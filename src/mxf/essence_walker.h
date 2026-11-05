@@ -59,16 +59,15 @@ struct EssenceWalkerOptions {
   std::function<void(const WalkDamage&)> onDamage;
 };
 
-// Walks forward through Body Partition(s) starting at `startOffset` (Phase
-// 1's MxfStreamInfo::headerMetadataEnd), returning one EssenceElement per
-// call to Next() for whichever tracked Track (video or one of the audio
-// TrackNumbers) is encountered next, skipping over partition packs, index
-// tables, system items, KLV fill, and any other unrelated KLVs in between.
-// Never seeks backward -- matches the plan's forward-only decode design; a
-// GOP-based codec's dependency on an earlier frame is automatically
-// satisfied because the walk always starts from file position 0 (via Phase
-// 1) and only moves forward. MVP scope: frame-wrapped OP1a only (see plan
-// Phase 7 for clip-wrapped / OP-Atom).
+// Walks forward from `startOffset`, any KLV boundary: the start of the
+// essence, or an index offset for a seek. Returns one EssenceElement per
+// Next() call for the video track or one of the audio tracks, and skips
+// everything else (partition packs, index tables, system items, KLV fill,
+// other tracks) by its length. A walker only ever moves forward; seeking is
+// done by creating a new walker at another offset. It knows nothing about
+// codecs or GOPs: where to start so that a GOP-based codec decodes correctly
+// is decided by the caller (SourceEngine::ResolveSeekStart). Frame-wrapped
+// essence only (clip-wrapped and OP-Atom: TODO Phase 7).
 class EssenceWalker {
  public:
   EssenceWalker(MxfReader& reader, uint64_t startOffset, std::array<uint8_t, 4> videoTrackNumber,
