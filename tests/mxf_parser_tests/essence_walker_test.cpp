@@ -1,8 +1,9 @@
-// Phase 2 unit tests for the sequential essence KLV walker (src/mxf/essence_walker.*).
-// Builds on the synthetic OP1a Header Partition from synthetic_mxf.h and
-// appends a Body Partition containing video essence elements interspersed
-// with KLV Fill and an essence element from an untracked track, to verify
-// EssenceWalker's forward-only skip logic.
+// Unit tests for EssenceWalker (src/mxf/essence_walker.*) and the resync
+// helper (ResyncToUlDesignator, src/mxf/klv.*), on synthetic files built with
+// synthetic_mxf.h: element order and skipping of KLV Fill and untracked
+// tracks, essence right after the Header Partition, empty Body Partitions,
+// several audio tracks, partial reads of a frame's leading bytes, and damaged
+// essence (strict: the walk ends; non-strict: bounded resync).
 #include <cstring>
 #include <filesystem>
 #include <iostream>
