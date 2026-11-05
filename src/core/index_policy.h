@@ -75,4 +75,18 @@ EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
                             const std::array<uint8_t, 4>& videoTrackNumber,
                             const std::vector<std::array<uint8_t, 4>>& audioTrackNumbers);
 
+// verify=true: checks every entry of `index` against the essence
+// (core/index_verify.h). All entries fine: nothing changes. Bad entries:
+// with `strict`, `error` is set (refuse the file / don't publish); without,
+// the entries are repaired in `index` where the essence allows, and
+// `warnings` says what was wrong and what could not be repaired. `summary`
+// is an informational one-liner either way.
+struct IndexVerification {
+  std::optional<std::string> error;
+  std::vector<std::string> warnings;
+  std::string summary;
+};
+IndexVerification ApplyIndexVerification(const std::string& path, const std::string& httpHeaders,
+                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index);
+
 }  // namespace mxfsrc

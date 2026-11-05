@@ -139,6 +139,14 @@ struct OpenOptions {
   // regardless of this setting. Exposed to scripts as
   // MxfSource(..., debug=true).
   bool debug = false;
+
+  // Check every entry of the video index (built locally or fetched via
+  // index_url) against the essence before opening -- see core/
+  // index_verify.h. With `strict`, a wrong index fails Open(); without, the
+  // wrong entries are repaired from the essence where possible and logged
+  // as warnings. Costs one or a few small reads per frame. Off by default.
+  // Exposed to scripts as MxfSource(..., verify=true).
+  bool verify = false;
 };
 
 } // namespace mxfsrc

@@ -254,6 +254,22 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     }
   }
 
+  // OpenOptions::verify: same check/repair as MxfExtractIndex(verify=true)
+  // (core/index_policy.h), for a locally built and a fetched index alike.
+  if (options.verify) {
+    if (videoIndex_ && !videoIndex_->Empty()) {
+      const IndexVerification verification =
+          ApplyIndexVerification(path_, httpHeaders_, streamInfo_, options.strict, *videoIndex_);
+      if (verification.error) return {OpenStatus::kDamagedFile, *verification.error};
+      for (const std::string& warning : verification.warnings) {
+        AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": " + warning);
+      }
+      AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": " + verification.summary);
+    } else {
+      AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": verify: this file has no index to verify");
+    }
+  }
+
   if (streamInfo_.numFrames < 0) {
     if (videoIndex_ && !videoIndex_->Empty()) {
       // Natural fallback win: an Index Table Segment's own covered range

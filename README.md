@@ -292,6 +292,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `indexurl` | string | *(none)* | Fetch a previously published essence index (JSON, see `MxfExtractIndex` below) from this URL or local path instead of building it locally. Any problem (network error, BodySID/version mismatch, byte offsets implausible for this file) fails the open; there is no silent fallback to a local build. |
 | `start_frame` | int | `0` | Performance hint: the first frame the caller will request. The decode thread starts at the nearest keyframe before it (via the Index Table) instead of at frame 0, so a pipeline that processes a chunk far into the file is served from the ring buffer. Earlier frames still work, just without this optimization. Values `<= 0` or past the end are ignored. |
 | `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
+| `verify` | bool (VapourSynth: int) | `false` | Check every index entry against the essence before opening, see [Verifying an index](#verifying-an-index). With `strict`, a wrong index or damaged essence fails the open; without, wrong entries are repaired from the essence. |
 | `debug` | bool (VapourSynth: int) | `false` | Also print informational messages to stderr, such as the serve-stats summary when the clip closes (frames served from the ring buffer vs. via fallback re-decode). By default only warnings are printed (damaged essence, missing index, audio dropped, ...). |
 
 In VapourSynth, `MxfSource` returns a single video clip for files without
@@ -302,8 +303,9 @@ r = core.mxfsource.MxfSource("file.mxf")
 clip = r if isinstance(r, vs.VideoNode) else r["clip"]
 ```
 
-`MxfExtractIndex(file, targeturl, httpheaders="", strict=true)` (both hosts;
-`strict` is an int in VapourSynth) builds the essence index of `file` and
+`MxfExtractIndex(file, targeturl, httpheaders="", strict=true, verify=false)`
+(both hosts; `strict` and `verify` are ints in VapourSynth) builds the essence
+index of `file` and
 publishes it as JSON to `targeturl` (local path or `http(s)://` URL, written
 with PUT), for `MxfSource(..., indexurl=...)` on other machines that read a
 byte-identical copy of the same file. It checks the file and builds the
@@ -387,6 +389,43 @@ byte-identical copy of the file and skip the scan.
   it never falls back to a local scan.
 - When indexing an HTTP source, the index sections are fetched with
   parallel ranged requests.
+
+### Verifying an index
+
+The Index Table is written by the recording application and is normally
+trusted as is. If one of its byte offsets is wrong, or the essence is damaged,
+this only shows up later, as a seek that fails ("the fallback re-decode
+failed to reach it") or, without strict, as a wrong frame. `verify=true`
+(on `MxfSource` and `MxfExtractIndex`) checks this up front:
+
+- **Every index entry** must point at a KLV, and walking on from there the
+  next picture element of the video track must come before the next entry.
+- **Between two entries** the KLV headers must chain without damage from
+  one picture element exactly to the next entry.
+
+Only KLV headers are read, never frame data: a few small reads per frame,
+spread over several threads. For a local file that is seconds for a feature
+length file; over `http(s)://` every read is a range request, so it takes
+much longer.
+
+| | `strict=true` (default) | `strict=false` |
+|---|---|---|
+| All good | opens / publishes | opens / publishes |
+| Wrong index entries | fails, listing the first 10 (edit unit, byte offset, what is there) | warns, **repairs** them from the essence, opens / publishes the repaired index |
+| Damaged essence | fails, naming where | warns; the frames there stay undecodable |
+
+The repair walks the essence from the nearest good entry before a bad one
+(headers only, never guessing past damage), so it repairs wrong offsets in an
+intact file exactly; entries behind damaged essence are left as they are and
+listed. A fetched index (`indexurl=`) is verified against the file as well.
+
+To diagnose a file that fails to seek, run once and send the message:
+
+```
+LoadPlugin("mxfsource.dll")
+MxfExtractIndex("file.mxf", "file.index.json", verify=true)
+BlankClip()
+```
 
 ### Chunked distributed processing
 

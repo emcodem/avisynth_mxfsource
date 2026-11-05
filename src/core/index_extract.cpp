@@ -1,5 +1,7 @@
 #include "core/index_extract.h"
 
+#include <cstdio>
+
 #include "core/index_policy.h"
 #include "mxf/header_parser.h"
 #include "mxf/index_table.h"
@@ -9,7 +11,7 @@
 namespace mxfsrc {
 
 ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const std::string& targetUrl,
-                                           const std::string& httpHeaders, bool strict) {
+                                           const std::string& httpHeaders, bool strict, bool verify) {
   MxfReader reader(sourcePath, httpHeaders);
   if (!reader.IsOpen()) {
     std::string error = "failed to open file: " + sourcePath;
@@ -40,9 +42,17 @@ ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const s
                    "file's video BodySID " +
                        std::to_string(info->bodySid)};
   }
-  const EssenceIndex& index = *built.index;
+  EssenceIndex& index = *built.index;
   if (std::optional<std::string> error = CheckIndexCoverage(index, *info, integrity.finished)) {
     return {false, *error};
+  }
+  if (verify) {
+    const IndexVerification verification = ApplyIndexVerification(sourcePath, httpHeaders, *info, strict, index);
+    if (verification.error) return {false, *verification.error};
+    for (const std::string& warning : verification.warnings) {
+      std::fprintf(stderr, "[MxfExtractIndex] %s: %s\n", sourcePath.c_str(), warning.c_str());
+    }
+    std::fflush(stderr);
   }
 
   std::string publishError;

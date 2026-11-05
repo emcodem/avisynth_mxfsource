@@ -94,6 +94,8 @@ add_library(mxf_core STATIC
   src/core/index_extract.cpp
   src/core/index_policy.cpp
   src/core/index_policy.h
+  src/core/index_verify.cpp
+  src/core/index_verify.h
   src/core/index_extract.h
   src/core/source_engine.cpp
   src/core/source_engine.h

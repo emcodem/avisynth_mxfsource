@@ -25,7 +25,13 @@ struct ExtractIndexResult {
 // there): the file is checked and its index built by the same functions
 // SourceEngine::Open uses (core/index_policy.h), so a file MxfSource would
 // refuse never gets an index published.
+//
+// `verify` has exactly the meaning of OpenOptions::verify: every index entry
+// is checked against the essence first (core/index_policy.h's
+// ApplyIndexVerification); with `strict` a wrong index is refused, without
+// it the repaired index is published and the warnings go to stderr.
 ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const std::string& targetUrl,
-                                           const std::string& httpHeaders = {}, bool strict = true);
+                                           const std::string& httpHeaders = {}, bool strict = true,
+                                           bool verify = false);
 
 }  // namespace mxfsrc

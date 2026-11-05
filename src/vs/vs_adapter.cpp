@@ -306,6 +306,9 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   int debugErr = 0;
   const int64_t debugArg = vsapi->mapGetInt(in, "debug", 0, &debugErr);
   const bool debug = debugErr ? false : (debugArg != 0);
+  int verifyErr = 0;
+  const int64_t verifyArg = vsapi->mapGetInt(in, "verify", 0, &verifyErr);
+  const bool verify = verifyErr ? false : (verifyArg != 0);
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
@@ -319,6 +322,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   options.start_frame_hint = startFrame;
   options.strict = strict;
   options.debug = debug;
+  options.verify = verify;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -429,8 +433,11 @@ void VS_CC CreateMxfExtractIndex(const VSMap* in, VSMap* out, void* /*userData*/
   int strictErr = 0;
   const int64_t strictArg = vsapi->mapGetInt(in, "strict", 0, &strictErr);
   const bool strict = strictErr ? true : (strictArg != 0);
+  int verifyErr = 0;
+  const int64_t verifyArg = vsapi->mapGetInt(in, "verify", 0, &verifyErr);
+  const bool verify = verifyErr ? false : (verifyArg != 0);
   const ExtractIndexResult result =
-      ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders, strict);
+      ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders, strict, verify);
   if (!result.ok) {
     vsapi->mapSetError(out, ("MxfExtractIndex: " + result.error).c_str());
     return;
@@ -446,13 +453,13 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the
       // return type spec is fixed for the plugin's whole lifetime, not
       // per-invocation.
       "clip:vnode;audio:anode;", CreateMxfSource, nullptr, plugin);
-  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;strict:int:opt;", "result:int;",
+  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;strict:int:opt;verify:int:opt;", "result:int;",
                             CreateMxfExtractIndex, nullptr, plugin);
 }

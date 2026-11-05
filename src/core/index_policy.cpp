@@ -4,6 +4,7 @@
 #include <cstring>
 #include <vector>
 
+#include "core/index_verify.h"
 #include "mxf/bitstream_index.h"
 #include "mxf/essence_walker.h"
 #include "mxf/integrity.h"
@@ -130,6 +131,61 @@ EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
     pos = valueEnd;
   }
   return {};
+}
+
+}  // namespace mxfsrc
+
+namespace mxfsrc {
+
+IndexVerification ApplyIndexVerification(const std::string& path, const std::string& httpHeaders,
+                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index) {
+  IndexVerification out;
+  const IndexVerifyResult verified = VerifyEssenceIndex(path, httpHeaders, index, info);
+  if (verified.error) {
+    out.error = *verified.error;
+    return out;
+  }
+  const std::string total = std::to_string(verified.checked);
+  if (verified.issues.empty() && verified.essenceDamage.empty()) {
+    out.summary = "verify: all " + total + " index entries point at their edit unit, essence intact";
+    return out;
+  }
+
+  const std::string bad = std::to_string(verified.issues.size()) + " of " + total +
+                          " index entries do not point at their edit unit: " + FormatVerifyIssues(verified.issues);
+  const std::string damaged = "the essence is damaged at " + std::to_string(verified.essenceDamage.size()) +
+                              " place(s) (frames there can't be decoded): " +
+                              FormatVerifyIssues(verified.essenceDamage);
+  if (strict) {
+    std::string error = "verify: ";
+    if (!verified.issues.empty()) error += bad + " (the index of this file is wrong there; disable strict to repair it)";
+    if (!verified.issues.empty() && !verified.essenceDamage.empty()) error += "; ";
+    if (!verified.essenceDamage.empty()) error += damaged;
+    out.error = error;
+    return out;
+  }
+
+  int64_t repairedCount = 0;
+  size_t unrepairedCount = 0;
+  if (!verified.issues.empty()) {
+    IndexRepairResult repaired = RepairEssenceIndex(path, httpHeaders, index, info, verified);
+    index = std::move(repaired.index);
+    repairedCount = repaired.repaired;
+    unrepairedCount = repaired.unrepaired.size();
+    out.warnings.push_back("verify: " + bad);
+    out.warnings.push_back("verify: repaired " + std::to_string(repaired.repaired) + " of " +
+                           std::to_string(verified.issues.size()) + " index entries from the essence");
+    if (!repaired.unrepaired.empty()) {
+      out.warnings.push_back("verify: " + std::to_string(repaired.unrepaired.size()) +
+                             " index entries could not be repaired and stay as they are: " +
+                             FormatVerifyIssues(repaired.unrepaired));
+    }
+  }
+  if (!verified.essenceDamage.empty()) out.warnings.push_back("verify: " + damaged);
+  out.summary = "verify: checked " + total + " index entries, repaired " + std::to_string(repairedCount) + ", " +
+                std::to_string(unrepairedCount) + " not repairable, essence damaged at " +
+                std::to_string(verified.essenceDamage.size()) + " place(s)";
+  return out;
 }
 
 }  // namespace mxfsrc

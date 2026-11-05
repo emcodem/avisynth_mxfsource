@@ -254,6 +254,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const int startFrame = args[8].AsInt(0);
   const bool strict = args[9].AsBool(true);
   const bool debug = args[10].AsBool(false);
+  const bool verify = args[11].AsBool(false);
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
@@ -267,6 +268,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   options.start_frame_hint = startFrame;
   options.strict = strict;
   options.debug = debug;
+  options.verify = verify;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -282,8 +284,9 @@ AVSValue __cdecl CreateMxfExtractIndex(AVSValue args, void* /*user_data*/, IScri
   if (!targetUrl || !*targetUrl) env->ThrowError("MxfExtractIndex: a target URL/path is required");
   const char* httpHeaders = args[2].AsString("");
   const bool strict = args[3].AsBool(true);
+  const bool verify = args[4].AsBool(false);
 
-  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders, strict);
+  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders, strict, verify);
   if (!result.ok) env->ThrowError("MxfExtractIndex: %s", result.error.c_str());
 
   return AVSValue(true);
@@ -305,8 +308,9 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
   env->AddFunction(
       "MxfSource",
       "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
-      "[indexurl]s[start_frame]i[strict]b[debug]b",
+      "[indexurl]s[start_frame]i[strict]b[debug]b[verify]b",
       CreateMxfSource, nullptr);
-  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b", CreateMxfExtractIndex, nullptr);
+  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b[verify]b", CreateMxfExtractIndex,
+                   nullptr);
   return "MXF forward-only source plugin";
 }
