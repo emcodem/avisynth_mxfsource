@@ -64,6 +64,14 @@ set_target_properties(FFmpeg_avcodec PROPERTIES INTERFACE_LINK_LIBRARIES FFmpeg_
 # mounts drop them); copying costs a little extra disk in the build tree but
 # works everywhere.
 function(mxfsrc_deploy_ffmpeg_runtime target)
+  # Linux: libavcodec needs libswresample, which it finds only through a run
+  # path that applies to dependencies of dependencies -- old-style DT_RPATH,
+  # not the DT_RUNPATH current linkers write by default (the test
+  # executables otherwise fail with "libswresample.so.7: cannot open shared
+  # object file"). The plugins set the same for their $ORIGIN run path.
+  if(NOT WIN32)
+    target_link_options(${target} PRIVATE -Wl,--disable-new-dtags)
+  endif()
   foreach(_file ${FFMPEG_RUNTIME_FILES})
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_file}" "$<TARGET_FILE_DIR:${target}>/")
