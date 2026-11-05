@@ -124,12 +124,14 @@ void SourceEngine::LogWalkDamage(const WalkDamage& damage) {
     line += "no key found within " + std::to_string(kMaxResyncBytes / (1024 * 1024)) +
             " MiB, the essence after it is not reachable";
   }
-  AppendLogLine(line);
+  AppendLogLine(LogLevel::kWarning, line);
 }
 
-void SourceEngine::AppendLogLine(const std::string& line) const {
-  fprintf(stderr, "%s\n", line.c_str());
-  fflush(stderr);
+void SourceEngine::AppendLogLine(LogLevel level, const std::string& line) const {
+  if (level == LogLevel::kWarning || debug_) {
+    fprintf(stderr, "%s\n", line.c_str());
+    fflush(stderr);
+  }
 
   // Also append to a user-specified log file (MxfSource(..., logfile=...))
   // if one was given -- stderr alone is invisible for GUI hosts (e.g.
@@ -172,13 +174,14 @@ SourceEngine::~SourceEngine() {
         }
       }
     }
-    AppendLogLine(summary);
+    AppendLogLine(LogLevel::kInfo, summary);
   }
 }
 
 OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& options) {
   path_ = path;
   logFile_ = options.logfile;
+  debug_ = options.debug;
   httpHeaders_ = options.http_headers;
   reader_ = std::make_unique<MxfReader>(path, httpHeaders_);
   if (!reader_->IsOpen()) {
@@ -240,11 +243,11 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     if (built.error) return {OpenStatus::kDamagedFile, *built.error};
     if (built.index && !built.index->Empty()) {
       if (built.fromBitstreamScan) {
-        AppendLogLine("[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
+        AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": no Index Table Segment found; built a fallback index from raw "
                       "bitstream headers (" + std::to_string(built.index->GetEntries().size()) + " edit units)");
       }
       for (uint64_t partitionOffset : built.index->EssenceStartResyncs()) {
-        AppendLogLine("[MxfSource] " + path_ + ": the end of the metadata/index declared by the partition at byte " +
+        AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": the end of the metadata/index declared by the partition at byte " +
                       std::to_string(partitionOffset) + " is not on a KLV boundary; found the next KLV by a resync");
       }
       videoIndex_ = std::move(built.index);
@@ -286,7 +289,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
       if (end.ends && exposed > 0) {
         std::string why = " frames, but the essence ends after " + std::to_string(indexedFrames);
         if (!end.lastPackageComplete) why += ", the last one with sound elements missing";
-        AppendLogLine("[MxfSource] " + path_ + ": Header Metadata declares " + std::to_string(streamInfo_.numFrames) +
+        AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": Header Metadata declares " + std::to_string(streamInfo_.numFrames) +
                       why + "; exposing " + std::to_string(exposed) + " frames");
         streamInfo_.numFrames = exposed;
         streamInfo_.durationReliable = false;
@@ -308,7 +311,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   if (options.start_frame_hint > 0 && options.start_frame_hint < streamInfo_.numFrames) {
     firstHostFrame_ = options.start_frame_hint;
   } else if (options.start_frame_hint > 0) {
-    AppendLogLine("[MxfSource] " + path_ + ": start_frame hint " + std::to_string(options.start_frame_hint) +
+    AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": start_frame hint " + std::to_string(options.start_frame_hint) +
                   " is out of range for a " + std::to_string(streamInfo_.numFrames) +
                   "-frame file, ignoring (starting at frame 0 as usual)");
   }
@@ -328,7 +331,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
       if (options.use_audio == UseAudioMode::kAlways) {
         return {OpenStatus::kUnsupportedCodec, "audio configuration not supported: " + streamInfo_.audioUnsupportedReason};
       }
-      AppendLogLine("[MxfSource] " + path_ + ": audio configuration not supported (" +
+      AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": audio configuration not supported (" +
                     streamInfo_.audioUnsupportedReason + "), continuing video-only");
     } else {
       audioSampleIndex_ = videoIndex_ ? BuildAudioSampleIndexFromIndexTable(*videoIndex_, streamInfo_, rawFrameCount)
@@ -338,11 +341,11 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
           return {OpenStatus::kUnsupportedCodec,
                   "audio not fully covered by the video Index Table (or invalid edit-rate/sample-rate metadata)"};
         }
-        AppendLogLine("[MxfSource] " + path_ + ": failed to build audio sample index, continuing video-only");
+        AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": failed to build audio sample index, continuing video-only");
       } else {
         exposeAudio_ = true;
         audioSampleOriginSkip_ = audioSampleIndex_->CumulativeSamplesBefore(originSkip_);
-        AppendLogLine("[MxfSource] " + path_ + ": audio sample index built from video Index Table (" +
+        AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": audio sample index built from video Index Table (" +
                       std::to_string(rawFrameCount) + " edit units, no essence scan)");
       }
     }
@@ -869,7 +872,7 @@ void SourceEngine::DecodeThreadMain() {
             // byte-for-byte identical. Logged once (not via SignalError,
             // which would mark the whole buffer permanently errored) so
             // this remains visible rather than fully silent.
-            AppendLogLine("[MxfSource] " + path_ + ": leading audio edit unit near the start_frame hint's own "
+            AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": leading audio edit unit near the start_frame hint's own "
                           "seek-start point is unreachable (" + audioErr + ") -- skipping it, no effect on served "
                           "audio (absorbed by the reorder-delay warm-up window), production continues normally");
           } else {

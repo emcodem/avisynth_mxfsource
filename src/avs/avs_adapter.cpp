@@ -253,6 +253,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const char* indexUrl = args[7].AsString("");
   const int startFrame = args[8].AsInt(0);
   const bool strict = args[9].AsBool(true);
+  const bool debug = args[10].AsBool(false);
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
@@ -265,6 +266,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   options.index_url = indexUrl;
   options.start_frame_hint = startFrame;
   options.strict = strict;
+  options.debug = debug;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -303,7 +305,7 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
   env->AddFunction(
       "MxfSource",
       "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
-      "[indexurl]s[start_frame]i[strict]b",
+      "[indexurl]s[start_frame]i[strict]b[debug]b",
       CreateMxfSource, nullptr);
   env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b", CreateMxfExtractIndex, nullptr);
   return "MXF forward-only source plugin";

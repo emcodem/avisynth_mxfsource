@@ -242,13 +242,16 @@ class SourceEngine {
                               std::string* errorOut);
   std::shared_ptr<AudioBlock> FreshReadAudioBlock(uint64_t byteOffset);
 
-  // Appends `line` to stderr, and to OpenOptions::logfile (if set) prefixed
-  // with a timestamp -- factored out of what was originally ~SourceEngine's
-  // own ServeStats-summary-only logging so an audio-degraded note (see
-  // Open()'s UseAudioMode handling) can share the same "stderr alone is
-  // invisible to GUI hosts" rationale without duplicating the timestamp
-  // formatting.
-  void AppendLogLine(const std::string& line) const;
+  // kWarning: something the user should know about (damaged essence, no
+  // index, audio dropped, ...) -- always printed to stderr.
+  // kInfo: normal operation (serve stats, ...) -- printed to stderr only
+  // with OpenOptions::debug.
+  enum class LogLevel { kInfo, kWarning };
+
+  // Appends `line` to stderr (kInfo lines only with OpenOptions::debug), and
+  // to OpenOptions::logfile (if set, every level) prefixed with a timestamp
+  // -- stderr alone is invisible to GUI hosts.
+  void AppendLogLine(LogLevel level, const std::string& line) const;
 
   // Options for every EssenceWalker this engine creates: no resync past
   // damage in strict mode, a bounded one otherwise, each damaged spot
@@ -258,6 +261,7 @@ class SourceEngine {
 
   std::string path_;
   bool strict_ = true;
+  bool debug_ = false;
   std::mutex damageLogMutex_;
   std::vector<uint64_t> loggedDamageOffsets_;
   std::string logFile_;

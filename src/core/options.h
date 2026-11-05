@@ -131,6 +131,14 @@ struct OpenOptions {
   // Full user-facing description: README.md, "Strict mode" -- keep it in
   // sync with any change here or in mxf/integrity.h.
   bool strict = true;
+
+  // Print informational messages (the serve-stats summary when the clip
+  // closes, "audio sample index built ...", ...) to stderr as well. Off by
+  // default, so a normal run only prints real warnings (damaged essence,
+  // missing index, audio dropped, ...). `logfile` receives every message
+  // regardless of this setting. Exposed to scripts as
+  // MxfSource(..., debug=true).
+  bool debug = false;
 };
 
 } // namespace mxfsrc

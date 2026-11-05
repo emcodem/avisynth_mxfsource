@@ -285,13 +285,14 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `file` | string | *(required)* | Path (or `http(s)://` URL) to the `.mxf` file. |
 | `buffer_frames` | int | `300` | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. |
 | `eagerdecode` | int | `32` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
-| `logfile` | string | *(none)* | Path to append a one-line serve-stats summary to when the clip closes (and any audio-degradation note, see below) -- stderr alone is invisible to GUI hosts. |
+| `logfile` | string | *(none)* | Path to append every plugin message to, warnings and informational ones (including the serve-stats summary when the clip closes), timestamped, regardless of `debug` -- stderr alone is invisible to GUI hosts. |
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
 | `use_audio` | string | `"supported"` | Audio fallback policy -- see below. |
 | `indexurl` | string | *(none)* | Fetch a previously published essence index (JSON, see `MxfExtractIndex` below) from this URL or local path instead of building it locally. Any problem (network error, BodySID/version mismatch, byte offsets implausible for this file) fails the open; there is no silent fallback to a local build. |
 | `start_frame` | int | `0` | Performance hint: the first frame the caller will request. The decode thread starts at the nearest keyframe before it (via the Index Table) instead of at frame 0, so a pipeline that processes a chunk far into the file is served from the ring buffer. Earlier frames still work, just without this optimization. Values `<= 0` or past the end are ignored. |
 | `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
+| `debug` | bool (VapourSynth: int) | `false` | Also print informational messages to stderr, such as the serve-stats summary when the clip closes (frames served from the ring buffer vs. via fallback re-decode). By default only warnings are printed (damaged essence, missing index, audio dropped, ...). |
 
 In VapourSynth, `MxfSource` returns a single video clip for files without
 exposed audio, and `clip` plus `audio` otherwise:
