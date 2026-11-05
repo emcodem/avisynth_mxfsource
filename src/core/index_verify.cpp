@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <thread>
 
 #include "mxf/essence_walker.h"
+#include "mxf/h264_bitstream.h"
 #include "mxf/klv.h"
+#include "mxf/mpeg2_bitstream.h"
 
 namespace mxfsrc {
 
@@ -20,6 +23,10 @@ constexpr uint64_t kNoBound = std::numeric_limits<uint64_t>::max();
 constexpr size_t kEntriesPerChunk = 256;
 constexpr size_t kLocalWorkers = 4;
 constexpr size_t kHttpWorkers = 16;
+// The repair walk ends this many consecutive agreeing entries after the last
+// wrong one -- more than a long GOP, so a region shifted by whole edit units
+// is not ended early by entries that pass by coincidence.
+constexpr int kAgreeingEntriesToEndRepair = 32;
 
 std::string HexBytes(const uint8_t* p, size_t n) {
   static const char kHex[] = "0123456789abcdef";
@@ -31,10 +38,50 @@ std::string HexBytes(const uint8_t* p, size_t n) {
   return s;
 }
 
+// Picture type from IndexTableEntry-style flags (SMPTE 377-1 bit4 backward,
+// bit5 forward prediction; the same convention ParseMpeg2FrameHeader and
+// ParseH264FrameHeader synthesize): I, P or B.
+char PictureClass(uint8_t flags) {
+  if ((flags & 0x30) == 0) return 'I';
+  return (flags & 0x10) ? 'B' : 'P';
+}
+
+// Codecs whose picture type can be read from the first bytes of a frame.
+bool HasPictureTypeParser(CodecFamily codec) {
+  return codec == CodecFamily::kMpeg2Video || codec == CodecFamily::kH264LongGop;
+}
+
+// The picture type of the picture element at `elementOffset`, from its
+// leading bytes (1 KiB, then 8 KiB if no picture header was found in that).
+// nullopt: not recognized -- nothing to compare, never reported.
+std::optional<char> StreamPictureClass(MxfReader& reader, uint64_t elementOffset, CodecFamily codec) {
+  if (!reader.Seek(elementOffset)) return std::nullopt;
+  KlvHeader klv{};
+  if (!ReadKlvHeader(reader, klv)) return std::nullopt;
+  std::vector<uint8_t> prefix;
+  for (const uint64_t want : {uint64_t{1024}, uint64_t{8192}}) {
+    const size_t n = static_cast<size_t>(std::min(want, klv.length));
+    prefix.resize(n);
+    if (!reader.Seek(klv.valueOffset) || (n > 0 && !reader.ReadBytes(prefix.data(), n))) return std::nullopt;
+    if (codec == CodecFamily::kMpeg2Video) {
+      const Mpeg2FrameInfo frame = ParseMpeg2FrameHeader(prefix.data(), prefix.size());
+      if (frame.recognized) return PictureClass(frame.flags);
+    } else {
+      const H264FrameInfo frame = ParseH264FrameHeader(prefix.data(), prefix.size());
+      if (frame.recognized) return PictureClass(frame.flags);
+    }
+    if (n >= klv.length) break;  // already read the whole frame
+  }
+  return std::nullopt;
+}
+
 // Checks one entry offset. On success returns nullopt and sets
-// `videoElementOffset`; otherwise returns what is wrong.
+// `videoElementOffset`; otherwise returns what is wrong. For codecs with a
+// picture type parser, the entry's I/P/B type (`flags`) must also match the
+// picture it leads to -- this catches an index shifted by whole edit units,
+// whose offsets all land on valid KLVs.
 std::optional<std::string> CheckEntryOffset(MxfReader& reader, uint64_t offset, uint64_t nextEntryOffset,
-                                            const MxfStreamInfo& info, uint64_t& videoElementOffset,
+                                            const MxfStreamInfo& info, uint8_t flags, uint64_t& videoElementOffset,
                                             uint64_t* videoElementEnd = nullptr) {
   const uint64_t size = reader.Size();
   if (offset + 17 > size) {
@@ -62,8 +109,19 @@ std::optional<std::string> CheckEntryOffset(MxfReader& reader, uint64_t offset, 
     return "the next picture element (byte " + std::to_string(element.filePosition) +
            ") lies beyond the next entry's offset " + std::to_string(nextEntryOffset);
   }
+  const uint64_t elementEnd = walker.Position();
+  if (HasPictureTypeParser(info.videoCodec)) {
+    if (const std::optional<char> found = StreamPictureClass(reader, element.filePosition, info.videoCodec)) {
+      const char announced = PictureClass(flags);
+      if (*found != announced) {
+        const auto frame = [](char c) { return std::string(c == 'I' ? "an " : "a ") + c + "-frame"; };
+        return "the index announces " + frame(announced) + ", the picture there (byte " +
+               std::to_string(element.filePosition) + ") is " + frame(*found);
+      }
+    }
+  }
   videoElementOffset = element.filePosition;
-  if (videoElementEnd) *videoElementEnd = walker.Position();
+  if (videoElementEnd) *videoElementEnd = elementEnd;
   return std::nullopt;
 }
 
@@ -99,24 +157,48 @@ std::optional<std::string> ParallelForEntries(const std::string& path, const std
   return error;
 }
 
+bool IsVideoPictureKey(const Ul& key, const MxfStreamInfo& info) {
+  return IsEssenceElementKey(key) && std::memcmp(&key[12], info.videoTrackNumber.data(), 4) == 0;
+}
+
+struct ChainProblem {
+  std::optional<std::string> damage;   // essence damaged between the entries
+  std::optional<std::string> skipped;  // the next entry skips edit unit(s): an index problem
+};
+
 // From the end of the picture element whose Value ends at `from`, the KLV
-// headers must chain to exactly `nextEntryOffset`. Returns what is wrong.
-std::optional<std::string> CheckChainTo(MxfReader& reader, uint64_t from, uint64_t nextEntryOffset) {
+// headers must chain to exactly `nextEntryOffset`, passing no other picture
+// element of the video track on the way (that would mean the next entry
+// skips an edit unit, e.g. an index shifted by whole edit units).
+ChainProblem CheckChainTo(MxfReader& reader, uint64_t from, uint64_t nextEntryOffset, const MxfStreamInfo& info) {
+  ChainProblem problem;
   uint64_t pos = from;
   while (pos < nextEntryOffset) {
-    if (!reader.Seek(pos)) return "cannot read at byte " + std::to_string(pos);
+    if (!reader.Seek(pos)) {
+      problem.damage = "cannot read at byte " + std::to_string(pos);
+      return problem;
+    }
     KlvHeader klv{};
-    if (!ReadKlvHeader(reader, klv)) return "invalid KLV length field at byte " + std::to_string(pos);
+    if (!ReadKlvHeader(reader, klv)) {
+      problem.damage = "invalid KLV length field at byte " + std::to_string(pos);
+      return problem;
+    }
     if (!LooksLikeKlvKey(klv.key)) {
-      return "no KLV key at byte " + std::to_string(pos) + " (found " + HexBytes(klv.key.data(), 8) + "...)";
+      problem.damage = "no KLV key at byte " + std::to_string(pos) + " (found " + HexBytes(klv.key.data(), 8) + "...)";
+      return problem;
+    }
+    if (IsVideoPictureKey(klv.key, info)) {
+      problem.skipped = "it skips an edit unit: the picture element at byte " + std::to_string(pos) +
+                        " lies between the previous entry's picture and this entry";
+      return problem;
     }
     pos = klv.valueOffset + klv.length;
   }
   if (pos != nextEntryOffset) {
-    return "a KLV ends at byte " + std::to_string(pos) + ", past the next entry's offset " +
-           std::to_string(nextEntryOffset);
+    problem.damage = "a KLV ends at byte " + std::to_string(pos) + ", past the next entry's offset " +
+                     std::to_string(nextEntryOffset);
   }
-  return std::nullopt;
+  return problem;
 }
 
 }  // namespace
@@ -140,19 +222,26 @@ IndexVerifyResult VerifyEssenceIndex(const std::string& path, const std::string&
       return;
     }
     const uint64_t next = i + 1 < n ? entries[i + 1].byteOffset : kNoBound;
-    problems[i] =
-        CheckEntryOffset(reader, entries[i].byteOffset, next, info, result.videoElementOffsets[i], &videoEnds[i]);
+    problems[i] = CheckEntryOffset(reader, entries[i].byteOffset, next, info, entries[i].flags,
+                                   result.videoElementOffsets[i], &videoEnds[i]);
   });
   if (result.error) return result;
 
-  // Pass 2: between two good entries the essence chains without damage.
+  // Pass 2: between two good entries the essence chains without damage, and
+  // the next entry doesn't skip an edit unit. Iteration i writes only
+  // damage[i] and skipped[i + 1].
   std::vector<std::optional<std::string>> damage(n);
+  std::vector<std::optional<std::string>> skipped(n);
   result.error = ParallelForEntries(path, httpHeaders, n - 1, [&](MxfReader& reader, size_t i) {
-    if (!problems[i] && !problems[i + 1]) damage[i] = CheckChainTo(reader, videoEnds[i], entries[i + 1].byteOffset);
+    if (problems[i] || problems[i + 1]) return;
+    ChainProblem chain = CheckChainTo(reader, videoEnds[i], entries[i + 1].byteOffset, info);
+    damage[i] = std::move(chain.damage);
+    skipped[i + 1] = std::move(chain.skipped);
   });
   if (result.error) return result;
 
   for (size_t i = 0; i < n; ++i) {
+    if (!problems[i] && skipped[i]) problems[i] = std::move(skipped[i]);
     if (problems[i]) {
       result.videoElementOffsets[i] = 0;
       result.issues.push_back({entries[i].editUnit, entries[i].byteOffset, *problems[i], i});
@@ -186,36 +275,37 @@ IndexRepairResult RepairEssenceIndex(const std::string& path, const std::string&
     return finish();
   }
 
-  std::vector<bool> bad(entries.size(), false);
-  for (const IndexVerifyIssue& issue : verified.issues) bad[issue.entryIndex] = true;
+  const size_t n = entries.size();
+  std::vector<const IndexVerifyIssue*> issueOf(n, nullptr);
+  for (const IndexVerifyIssue& issue : verified.issues) issueOf[issue.entryIndex] = &issue;
+  // Picture element each entry leads to, once known to be right: from the
+  // check for good entries, from the walk for repaired ones (0: not trusted).
+  std::vector<uint64_t> trustedVideo = verified.videoElementOffsets;
 
-  size_t issuePos = 0;
-  while (issuePos < verified.issues.size()) {
-    // One run of consecutive bad entries: [first, last].
-    const size_t first = verified.issues[issuePos].entryIndex;
-    size_t last = first;
-    size_t runEnd = issuePos + 1;
-    while (runEnd < verified.issues.size() && verified.issues[runEnd].entryIndex == last + 1) {
-      last = verified.issues[runEnd].entryIndex;
-      ++runEnd;
-    }
-    const auto giveUp = [&](size_t from, const std::string& why) {
-      for (size_t k = issuePos; k < runEnd; ++k) {
-        if (verified.issues[k].entryIndex >= from) {
-          const IndexVerifyIssue& issue = verified.issues[k];
-          out.unrepaired.push_back({issue.editUnit, issue.byteOffset, issue.what + "; not repaired: " + why,
-                                    issue.entryIndex});
-        }
-      }
-    };
+  const auto unrepaired = [&](size_t k, const std::string& why) {
+    const std::string what = issueOf[k] ? issueOf[k]->what : "passed the checks but leads to another edit unit";
+    out.unrepaired.push_back({entries[k].editUnit, index.GetEntries()[k].byteOffset, what + "; not repaired: " + why, k});
+    trustedVideo[k] = 0;
+  };
 
-    if (first == 0) {
-      giveUp(first, "no valid entry before it to walk from");
-      issuePos = runEnd;
+  size_t i = 0;
+  while (i < n) {
+    if (!issueOf[i]) {
+      ++i;
       continue;
     }
-    const size_t anchor = first - 1;  // good: the run starts right after it
-    const uint64_t anchorVideo = verified.videoElementOffsets[anchor];
+    // A problem region starts at i. Walk the essence from the trusted entry
+    // before it and compare every entry with the walk -- also the ones that
+    // passed the checks: inside an index shifted by whole edit units some
+    // entries pass by coincidence (a B-frame where a B-frame was announced).
+    // The region ends after kAgreeingEntriesToEndRepair entries in a row agree.
+    if (i == 0 || trustedVideo[i - 1] == 0) {
+      unrepaired(i, i == 0 ? "no valid entry before it to walk from" : "the entry before it is not valid either");
+      ++i;
+      continue;
+    }
+    const size_t anchor = i - 1;
+    const uint64_t anchorVideo = trustedVideo[anchor];
     const uint64_t layoutDelta = anchorVideo - entries[anchor].byteOffset;
 
     std::string damage;
@@ -228,12 +318,14 @@ IndexRepairResult RepairEssenceIndex(const std::string& path, const std::string&
     EssenceWalker walker(reader, anchorVideo, info.videoTrackNumber, /*hasVideo=*/true, {}, std::move(options));
     EssenceElement element;
     if (!walker.Next(element, false) || element.filePosition != anchorVideo) {
-      giveUp(first, "could not walk from edit unit " + std::to_string(entries[anchor].editUnit));
-      issuePos = runEnd;
+      unrepaired(i, "could not walk from edit unit " + std::to_string(entries[anchor].editUnit));
+      ++i;
       continue;
     }
 
-    for (size_t k = first; k <= last; ++k) {
+    int agreeing = 0;
+    size_t k = i;
+    for (; k < n && agreeing < kAgreeingEntriesToEndRepair; ++k) {
       bool walked = true;
       for (int64_t step = entries[k - 1].editUnit; step < entries[k].editUnit; ++step) {
         if (!walker.Next(element, false)) {
@@ -242,33 +334,42 @@ IndexRepairResult RepairEssenceIndex(const std::string& path, const std::string&
         }
       }
       if (!walked) {
-        giveUp(k, damage.empty() ? "essence ends before this edit unit" : damage + " before this edit unit");
+        // Everything from here to the end of this region stays as it is.
+        const std::string why =
+            damage.empty() ? "essence ends before this edit unit" : damage + " before this edit unit";
+        for (; k < n && issueOf[k]; ++k) unrepaired(k, why);
         break;
       }
       const uint64_t video = element.filePosition;
-      const uint64_t walkerResume = walker.Position();
-      const uint64_t next = k + 1 < entries.size() && !bad[k + 1] ? entries[k + 1].byteOffset : kNoBound;
+      if (!issueOf[k] && trustedVideo[k] == video) {
+        ++agreeing;
+        continue;
+      }
+      agreeing = 0;
 
       // Same layout as the anchor entry first, else straight at the picture
       // element (always a valid start for a walk to this edit unit).
+      const uint64_t walkerResume = walker.Position();
       bool fixed = false;
       for (uint64_t candidate : {video >= layoutDelta ? video - layoutDelta : video, video}) {
         if (candidate <= entries[k - 1].byteOffset) continue;
         uint64_t found = 0;
-        if (!CheckEntryOffset(reader, candidate, next, info, found) && found == video) {
+        if (!CheckEntryOffset(reader, candidate, kNoBound, info, entries[k].flags, found) && found == video) {
           entries[k].byteOffset = candidate;
           fixed = true;
           break;
         }
       }
       reader.Seek(walkerResume);  // CheckEntryOffset moved the shared reader
-      if (!fixed) {
-        giveUp(k, "no offset before the picture element at byte " + std::to_string(video) + " checks out");
-        break;
+      if (fixed) {
+        trustedVideo[k] = video;
+        ++out.repaired;
+        if (!issueOf[k]) ++out.repairedUndetected;
+      } else {
+        unrepaired(k, "no offset before the picture element at byte " + std::to_string(video) + " checks out");
       }
-      ++out.repaired;
     }
-    issuePos = runEnd;
+    i = k;
   }
   return finish();
 }

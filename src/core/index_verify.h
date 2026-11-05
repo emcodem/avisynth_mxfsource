@@ -58,16 +58,20 @@ IndexVerifyResult VerifyEssenceIndex(const std::string& path, const std::string&
 struct IndexRepairResult {
   EssenceIndex index;  // all entries, wrong ones replaced where possible
   int64_t repaired = 0;
+  // Of `repaired`: entries that passed the checks but led to another edit
+  // unit (inside an index shifted by whole edit units, by coincidence).
+  int64_t repairedUndetected = 0;
   std::vector<IndexVerifyIssue> unrepaired;  // left unchanged, with the reason
 };
 
-// Repairs each run of bad entries from the nearest preceding good entry:
-// walks the essence from there (headers only, no resync -- a guess past
-// damage could miscount edit units and produce a wrong offset), takes the
-// picture element of each bad edit unit, and derives the entry offset with
-// the same layout as that good entry. Each repaired offset is checked again
-// like VerifyEssenceIndex does. Entries behind damaged essence, or with no
-// good entry before them, stay unchanged and are listed in `unrepaired`.
+// Repairs each problem region from the trusted entry before it: walks the
+// essence from there (headers only, no resync -- a guess past damage could
+// miscount edit units and produce a wrong offset) and compares every entry
+// with the walked picture element of its edit unit -- also entries that
+// passed the checks -- until 32 entries in a row agree. A wrong entry gets
+// the offset with the same layout as the anchor entry, checked again like
+// VerifyEssenceIndex does. Entries behind damaged essence, or with no valid
+// entry before them, stay unchanged and are listed in `unrepaired`.
 IndexRepairResult RepairEssenceIndex(const std::string& path, const std::string& httpHeaders,
                                      const EssenceIndex& index, const MxfStreamInfo& info,
                                      const IndexVerifyResult& verified);

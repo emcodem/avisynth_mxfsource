@@ -400,11 +400,18 @@ failed to reach it") or, without strict, as a wrong frame. `verify=true`
 
 - **Every index entry** must point at a KLV, and walking on from there the
   next picture element of the video track must come before the next entry.
+- **Picture type** (MPEG-2 and long-GOP H.264): the I/P/B type the entry
+  announces must match the picture header of the frame it leads to.
 - **Between two entries** the KLV headers must chain without damage from
-  one picture element exactly to the next entry.
+  one picture element exactly to the next entry, passing no other picture
+  element (else the entry skips a frame).
 
-Only KLV headers are read, never frame data: a few small reads per frame,
-spread over several threads. For a local file that is seconds for a feature
+The last two catch an index shifted by whole frames, whose offsets all land
+on valid KLVs: without `verify`, such an index makes seeks return the wrong
+frame without any error.
+
+Only KLV headers and the first 1 KiB of each frame are read: a few small
+reads per frame, spread over several threads. For a local file that is seconds for a feature
 length file; over `http(s)://` every read is a range request, so it takes
 much longer.
 
@@ -414,10 +421,12 @@ much longer.
 | Wrong index entries | fails, listing the first 10 (edit unit, byte offset, what is there) | warns, **repairs** them from the essence, opens / publishes the repaired index |
 | Damaged essence | fails, naming where | warns; the frames there stay undecodable |
 
-The repair walks the essence from the nearest good entry before a bad one
-(headers only, never guessing past damage), so it repairs wrong offsets in an
-intact file exactly; entries behind damaged essence are left as they are and
-listed. A fetched index (`indexurl=`) is verified against the file as well.
+The repair walks the essence from the last good entry before a problem
+(headers only, never guessing past damage) and compares every following entry
+with the walk until 32 in a row agree, so it also fixes entries inside a
+shifted region that passed the checks by coincidence. It repairs wrong
+offsets in an intact file exactly; entries behind damaged essence are left as
+they are and listed. A fetched index (`indexurl=`) is verified against the file as well.
 
 To diagnose a file that fails to seek, run once and send the message:
 

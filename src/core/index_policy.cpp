@@ -173,8 +173,12 @@ IndexVerification ApplyIndexVerification(const std::string& path, const std::str
     repairedCount = repaired.repaired;
     unrepairedCount = repaired.unrepaired.size();
     out.warnings.push_back("verify: " + bad);
-    out.warnings.push_back("verify: repaired " + std::to_string(repaired.repaired) + " of " +
-                           std::to_string(verified.issues.size()) + " index entries from the essence");
+    std::string fixedLine = "verify: repaired " + std::to_string(repaired.repaired) + " index entries from the essence";
+    if (repaired.repairedUndetected > 0) {
+      fixedLine += " (" + std::to_string(repaired.repairedUndetected) +
+                   " of them had passed the checks but led to another edit unit)";
+    }
+    out.warnings.push_back(fixedLine);
     if (!repaired.unrepaired.empty()) {
       out.warnings.push_back("verify: " + std::to_string(repaired.unrepaired.size()) +
                              " index entries could not be repaired and stay as they are: " +

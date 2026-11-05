@@ -39,9 +39,17 @@ struct Stream {
   std::vector<uint64_t> picture;     // per edit unit: offset of its picture element
 };
 
+// Coded-order picture type of edit unit i: a 12-frame GOP, I B B P B B P ...
+char PictureTypeOf(int i) {
+  if (i % 12 == 0) return 'I';
+  return i % 3 == 0 ? 'P' : 'B';
+}
+
 // kEditUnits content packages, after a 64-byte KLV Fill so offset 0 is not an
-// edit unit. Payload bytes never contain the UL designator.
-Stream BuildStream() {
+// edit unit. Payload bytes never contain the UL designator. With
+// `mpeg2Headers`, each picture starts with an MPEG-2 picture_header
+// (00 00 01 00, temporal_reference, picture_coding_type I=1 P=2 B=3).
+Stream BuildStream(bool mpeg2Headers = false) {
   Stream s;
   AppendKlvHeader(s.bytes, {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x01, 0x01, 0x02, 0x03, 0x01, 0x02, 0x10, 0x01, 0, 0, 0},
                   64);
@@ -51,23 +59,48 @@ Stream BuildStream() {
     AppendKlvHeader(s.bytes, kSystemItemKey, 28);
     s.bytes.resize(s.bytes.size() + 28, 0x22);
     s.picture.push_back(s.bytes.size());
-    AppendEssenceElement(s.bytes, kVideoTrack, std::vector<uint8_t>(1000 + 37 * (i % 5), 0x11));
+    std::vector<uint8_t> payload(1000 + 37 * (i % 5), 0x11);
+    if (mpeg2Headers) {
+      const char t = PictureTypeOf(i);
+      const uint8_t codingType = t == 'I' ? 1 : t == 'P' ? 2 : 3;
+      const uint8_t header[] = {0x00, 0x00, 0x01, 0x00, 0x00, static_cast<uint8_t>(codingType << 3), 0xff, 0xf8};
+      std::copy(std::begin(header), std::end(header), payload.begin());
+    }
+    AppendEssenceElement(s.bytes, kVideoTrack, payload);
     AppendEssenceElement(s.bytes, kAudioTrack, std::vector<uint8_t>(192, 0x33));
   }
   return s;
 }
 
+// Index flags as a real long-GOP Index Table carries them (I 0xc0, P 0x22,
+// B 0x33) -- matching the GOP of BuildStream(true).
 EssenceIndex IndexFrom(const std::vector<uint64_t>& offsets) {
   std::vector<FlatIndexEntry> entries;
   for (size_t i = 0; i < offsets.size(); ++i) {
     FlatIndexEntry e;
     e.editUnit = static_cast<int64_t>(i);
     e.byteOffset = offsets[i];
-    e.isKeyframe = i % 10 == 0;
-    e.flags = e.isKeyframe ? 0xc0 : 0x33;
+    const char t = PictureTypeOf(static_cast<int>(i));
+    e.isKeyframe = t == 'I';
+    e.flags = t == 'I' ? 0xc0 : t == 'P' ? 0x22 : 0x33;
     entries.push_back(e);
   }
   return EssenceIndex(std::move(entries));
+}
+
+MxfStreamInfo Mpeg2Info() {
+  MxfStreamInfo info;
+  info.hasVideo = true;
+  info.videoTrackNumber = {0x15, 0x01, 0x05, 0x01};
+  info.videoCodec = CodecFamily::kMpeg2Video;
+  return info;
+}
+
+// Entries first..last point one edit unit late (like the 3d mock).
+std::vector<uint64_t> ShiftedByOneEditUnit(const std::vector<uint64_t>& original, int first, int last) {
+  std::vector<uint64_t> wrong = original;
+  for (int i = first; i <= last; ++i) wrong[i] = original[i + 1];
+  return wrong;
 }
 
 MxfStreamInfo Info() {
@@ -190,6 +223,55 @@ void TestApplyIndexVerificationPolicy() {
   std::filesystem::remove(path);
 }
 
+// MPEG-2: the announced picture types match the stream -- no false alarms --
+// and an index shifted by one edit unit is caught by the type check and
+// repaired completely, including entries that pass by coincidence (B for B).
+void TestPictureTypeCheckAndShiftRepair() {
+  const Stream s = BuildStream(/*mpeg2Headers=*/true);
+  const auto path = WriteTempFile(s.bytes, "mxfsrc_test_verify_types.mxf");
+
+  const IndexVerifyResult clean = VerifyEssenceIndex(path.string(), "", IndexFrom(s.picture), Mpeg2Info());
+  CHECK(clean.issues.empty());
+  CHECK(clean.essenceDamage.empty());
+
+  const std::vector<uint64_t> wrong = ShiftedByOneEditUnit(s.picture, 12, 26);
+  const EssenceIndex index = IndexFrom(wrong);
+  const IndexVerifyResult r = VerifyEssenceIndex(path.string(), "", index, Mpeg2Info());
+  CHECK(!r.issues.empty());
+  bool typeMessage = false;
+  for (const IndexVerifyIssue& issue : r.issues) typeMessage |= issue.what.find("the index announces") == 0;
+  CHECK(typeMessage);
+  CHECK(r.issues.size() < 16);  // some shifted entries pass by coincidence
+
+  const IndexRepairResult repaired = RepairEssenceIndex(path.string(), "", index, Mpeg2Info(), r);
+  CHECK(repaired.unrepaired.empty());
+  CHECK(repaired.repairedUndetected > 0);
+  CHECK(Offsets(repaired.index) == s.picture);
+  std::filesystem::remove(path);
+}
+
+// Without a picture type parser (intra-only codec, unknown codec), a shift by
+// whole edit units is still found at its start (the entry skips an edit unit)
+// and end (offset does not increase), and repaired in between.
+void TestShiftWithoutTypeParser() {
+  const Stream s = BuildStream();
+  const auto path = WriteTempFile(s.bytes, "mxfsrc_test_verify_shift_units.mxf");
+  const std::vector<uint64_t> wrong = ShiftedByOneEditUnit(s.picture, 12, 26);
+  const EssenceIndex index = IndexFrom(wrong);
+  const IndexVerifyResult r = VerifyEssenceIndex(path.string(), "", index, Info());
+  bool skipAt12 = false;
+  for (const IndexVerifyIssue& issue : r.issues) {
+    skipAt12 |= issue.editUnit == 12 && issue.what.find("skips an edit unit") != std::string::npos;
+  }
+  CHECK(skipAt12);
+  CHECK(r.essenceDamage.empty());
+
+  const IndexRepairResult repaired = RepairEssenceIndex(path.string(), "", index, Info(), r);
+  CHECK(repaired.unrepaired.empty());
+  CHECK(Offsets(repaired.index) == s.picture);
+  std::filesystem::remove(path);
+}
+
 void TestFormatListsFirstTen() {
   std::vector<IndexVerifyIssue> issues;
   for (int i = 0; i < 13; ++i) issues.push_back({i, 1000u + i, "x", static_cast<size_t>(i)});
@@ -208,6 +290,8 @@ int main() {
   TestUnrepairable();
   TestNonIncreasingOffset();
   TestApplyIndexVerificationPolicy();
+  TestPictureTypeCheckAndShiftRepair();
+  TestShiftWithoutTypeParser();
   TestFormatListsFirstTen();
   if (g_failures == 0) std::cout << "index_verify_test: all passed" << std::endl;
   return g_failures == 0 ? 0 : 1;
