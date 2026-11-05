@@ -740,3 +740,33 @@ only runs with `strict=false`.
   whose index is only in the Footer would get no index. No such file in the
   corpus (checked 2026-10-19: none of the 105 RIP-less files has a valid
   Footer carrying an index).
+
+## Open items from the 2026-11-05 mock tests
+
+Found with mock files made from a 30 min XDCAM HD422 RDD9 file (ffmpeg MPEG-2
+422P@HL long GOP, rewrapped with bmxtranswrap `-t rdd9`): 3b = the System
+Item key of edit unit 662 overwritten with 0xFF, essence otherwise intact.
+
+### 1. A wrong frame is served before the error when the essence ends mid-GOP
+
+On 3b, a sequential decode (strict) serves frames 0..661 and then fails at
+662 -- but frame 661 carries the picture of frame 663. The background walk
+ends at the damaged KLV, `DecodeNextFrame` drains the decoder, and the
+held-back anchor picture (stored before the B pictures, displayed as 663)
+comes out next and is served as 661. No error for that frame. Probably the
+same wherever the essence ends before the declared frame count inside a GOP
+(truncated file with strict=false). Fix direction: once the essence ended
+early, don't trust drained outputs past the last decodable display position
+(or check this case explicitly against the index's reorder information).
+
+### 2. The seek error doesn't say why the re-decode failed
+
+"requested frame is far ahead of the current decode position, and the
+fallback re-decode failed to reach it" (and the "fell outside the ring
+buffer window" variant) is all the user sees; `SeekAndDecode` only returns
+nullptr. The causes are distinct and each needs a different answer: second
+reader can't open the file; essence ends before the target (truncated);
+the walk stops at damaged essence (log line "no valid KLV at byte X");
+the index offset doesn't point at a KLV (wrong index, `verify=true` finds
+it). Return the reason from `SeekAndDecode` and include it (with the byte
+offset) in the error message.
