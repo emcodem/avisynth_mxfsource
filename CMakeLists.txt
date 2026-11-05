@@ -40,6 +40,22 @@ endif()
 
 include(cmake/FetchFFmpeg.cmake)
 include(cmake/FetchCurl.cmake)
+
+# --- build version (mxfsrc_version.h), regenerated on every build ---
+# From `git describe`; MXFSRC_FALLBACK_VERSION when building without git
+# (e.g. from a source archive). See cmake/GenerateVersion.cmake.
+set(MXFSRC_FALLBACK_VERSION "0.1.0")
+find_package(Git QUIET)
+set(MXFSRC_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+add_custom_target(mxfsrc_version ALL
+  COMMAND "${CMAKE_COMMAND}"
+    "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
+    "-DOUT=${MXFSRC_GENERATED_DIR}/mxfsrc_version.h"
+    "-DFALLBACK=${MXFSRC_FALLBACK_VERSION}"
+    "-DGIT=${GIT_EXECUTABLE}"
+    -P "${CMAKE_SOURCE_DIR}/cmake/GenerateVersion.cmake"
+  BYPRODUCTS "${MXFSRC_GENERATED_DIR}/mxfsrc_version.h"
+  COMMENT "Stamping build version")
 find_package(Threads REQUIRED)
 
 # --- shared host-agnostic core (mxf parser, codec decode, ring buffer engine) ---
@@ -100,7 +116,8 @@ add_library(mxf_core STATIC
   src/core/source_engine.cpp
   src/core/source_engine.h
 )
-target_include_directories(mxf_core PUBLIC src)
+target_include_directories(mxf_core PUBLIC src "${MXFSRC_GENERATED_DIR}")
+add_dependencies(mxf_core mxfsrc_version)
 target_link_libraries(mxf_core PUBLIC FFmpeg_avcodec Threads::Threads CURL::libcurl)
 
 if(BUILD_AVS_PLUGIN)

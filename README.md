@@ -20,12 +20,11 @@ the video frames:
   presigned URL). Every other machine opens the same file with `indexurl=`
   and starts without any scan. See
   [Chunked distributed processing](#chunked-distributed-processing).
-- **Frames are decoded forward only**, frame 0, 1, 2, ... to EOF, which is
-  what an ffmpeg-style processing run does. A background thread walks the
-  file and decodes ahead into a configurable ring buffer (default 300
-  frames), so the host's own read-ahead requests are served from cache. The
-  Index Table is used only for jumps outside the buffer and for
-  `start_frame`.
+- **Optimized for sequential processing, with random access.** A
+  background thread decodes ahead into a configurable ring buffer (default
+  300 frames), so a sequential run such as an ffmpeg encode is served from
+  cache. Jumps outside the buffer use the Index Table to restart at the
+  nearest keyframe, so scrubbing in an editor like AvsPmod works too.
 
 ## Features
 

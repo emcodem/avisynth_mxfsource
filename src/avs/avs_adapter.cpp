@@ -11,6 +11,7 @@
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
+#include "mxfsrc_version.h"
 
 using mxfsrc::ExtractAndPublishIndex;
 using mxfsrc::ExtractIndexResult;
@@ -292,6 +293,11 @@ AVSValue __cdecl CreateMxfExtractIndex(AVSValue args, void* /*user_data*/, IScri
   return AVSValue(true);
 }
 
+// MxfSourceVersion(): the build's version string (see cmake/GenerateVersion.cmake).
+AVSValue __cdecl CreateMxfSourceVersion(AVSValue /*args*/, void* /*user_data*/, IScriptEnvironment* /*env*/) {
+  return AVSValue(MXFSRC_VERSION);
+}
+
 }  // namespace
 
 const AVS_Linkage* AVS_linkage = nullptr;
@@ -312,5 +318,6 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
       CreateMxfSource, nullptr);
   env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b[verify]b", CreateMxfExtractIndex,
                    nullptr);
-  return "MXF forward-only source plugin";
+  env->AddFunction("MxfSourceVersion", "", CreateMxfSourceVersion, nullptr);
+  return "MXF source plugin " MXFSRC_VERSION;
 }

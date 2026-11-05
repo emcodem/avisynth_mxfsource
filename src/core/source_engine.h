@@ -108,10 +108,9 @@ class SourceEngine {
 
   // Blocks until frame `n` is decoded or the stream ends/errors. If `n` has
   // fallen behind the ring buffer's window (evicted, e.g. a genuine
-  // backward seek -- forward waits are always satisfied normally and never
-  // hit this), falls back to SeekAndDecode() rather than failing: this
-  // plugin is designed for forward-only playback, but the user asked for
-  // random-seek support wherever reasonably easy to add. See
+  // backward seek), or lies far ahead of what the background thread has
+  // produced, it is decoded by SeekAndDecode() instead: a fresh decoder
+  // restarted at the nearest keyframe via the Index Table. See
   // FrameBuffer::Get for the ring-buffer status semantics this wraps.
   // `out` receives a shared_ptr rather than a copied NormalizedFrame: the
   // ring buffer keeps its own shared_ptr to the same frame (a repeat

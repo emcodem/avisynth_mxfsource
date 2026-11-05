@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "codec/decoder_factory.h"
+#include "mxfsrc_version.h"
 #include "core/index_policy.h"
 #include "mxf/file_open.h"
 #include "mxf/index_transport.h"
@@ -183,6 +184,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   logFile_ = options.logfile;
   debug_ = options.debug;
   httpHeaders_ = options.http_headers;
+  AppendLogLine(LogLevel::kInfo, "[MxfSource] mxfsource " MXFSRC_VERSION ", opening " + path_);
   reader_ = std::make_unique<MxfReader>(path, httpHeaders_);
   if (!reader_->IsOpen()) {
     std::string error = "failed to open file: " + path;

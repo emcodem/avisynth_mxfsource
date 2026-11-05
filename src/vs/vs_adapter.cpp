@@ -16,6 +16,7 @@
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
+#include "mxfsrc_version.h"
 
 using mxfsrc::ExtractAndPublishIndex;
 using mxfsrc::ExtractIndexResult;
@@ -445,11 +446,18 @@ void VS_CC CreateMxfExtractIndex(const VSMap* in, VSMap* out, void* /*userData*/
   vsapi->mapSetInt(out, "result", 1, maAppend);
 }
 
+// core.mxfsource.Version(): {"version": the build's version string} (see
+// cmake/GenerateVersion.cmake).
+void VS_CC CreateVersion(const VSMap* /*in*/, VSMap* out, void* /*userData*/, VSCore* /*core*/, const VSAPI* vsapi) {
+  vsapi->mapSetData(out, "version", MXFSRC_VERSION, -1, dtUtf8, maAppend);
+}
+
 }  // namespace
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-  vspapi->configPlugin("com.ffastrans.mxfsource", "mxfsource", "Forward-only MXF source",
-                        VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+  vspapi->configPlugin("com.ffastrans.mxfsource", "mxfsource", "MXF source plugin " MXFSRC_VERSION,
+                        VS_MAKE_VERSION(MXFSRC_VERSION_MAJOR, MXFSRC_VERSION_MINOR), VAPOURSYNTH_API_VERSION, 0, plugin);
+  vspapi->registerFunction("Version", "", "version:data;", CreateVersion, nullptr, plugin);
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
