@@ -1,8 +1,10 @@
 # Builds, tests and packages all four plugin builds (AviSynth and VapourSynth,
 # Windows and Linux) on every push to master and every pull request; the
-# packages are attached to the run as artifacts. Pushing a tag v* also
-# publishes them as a GitHub release -- as a pre-release when the tag has a
-# suffix (v0.2.0-beta.1), as the latest release otherwise (v0.2.0).
+# packages are attached to the run as artifacts.
+# - Every push to master replaces the "nightly" pre-release with the new
+#   packages (newest master build, not a tested release).
+# - Pushing a tag v* publishes a GitHub release -- as a pre-release when the
+#   tag has a suffix (v0.2.0-beta.1), as the latest release otherwise (v0.2.0).
 name: build
 
 on:
@@ -83,3 +85,29 @@ jobs:
           flags=(--verify-tag --generate-notes --title "$TAG")
           if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+
+  nightly:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: nightly
+      cancel-in-progress: true
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Replace the nightly pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          notes="Newest build of master, commit ${SHA::7}: not a tested release, may contain unfinished work.
+          Replaced on every push to master. For a tested build use the latest release."
+          gh release create nightly dist/* --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --prerelease --latest=false --title "Nightly (master ${SHA::7})" --notes "$notes"

@@ -770,3 +770,43 @@ the walk stops at damaged essence (log line "no valid KLV at byte X");
 the index offset doesn't point at a KLV (wrong index, `verify=true` finds
 it). Return the reason from `SeekAndDecode` and include it (with the byte
 offset) in the error message.
+
+### 3. Default buffer_frames / eagerdecode -- parked 2026-11-06
+
+`buffer_frames` (default 300) is a fixed memory cost that scales with the
+frame size: the ring buffer always fills to it. Measured (file in OS cache,
+sequential ffmpeg -f null unless noted):
+
+| buffer/eager | HD seq | HD TemporalSoften+Prefetch(8) | HD slow filter, 8 thr | UHD 10-bit seq | HD 301 steps back | mem HD / UHD |
+|---|---|---|---|---|---|---|
+| 300 / 32 | 621 fps | 638 | 39.6 | 73 | 4.6 ms/step | 1.27 GB / 10.6 GB |
+| 150 / 32 | 725 | 784 | 39.2 | 87 | 17.3 | 0.66 / 5.8 |
+| 100 / 16 | 739 | 801 | 38.7 | 88 | 22.3 | 0.47 / 4.2 |
+| 60 / 8 | 745 | 807 | 37.7 | 88 | 23.9 | 0.31 / 3.0 |
+| 30 / 4 | 760 | 848 | 36.0 | 88 | 25.0 | 0.18 / 2.0 |
+| 16 / 2 | 678 | 846 | 35.0 | 88 | 30.7 | 0.13 / 1.6 |
+
+No fallbacks in any forward scenario. A large buffer only helps stepping
+backwards (history = buffer_frames - eagerdecode); eagerdecode helps slow
+multi-threaded chains a little. AvsPmod and automated forward-only chains
+want different settings, and Prefetch(N) is not known when the source opens.
+Options discussed: (A) start small and grow the history on the first
+backward request; (B) an explicit mode parameter (interactive/production).
+Before deciding: measure more Prefetch levels (2/8/16/32) and wider temporal
+radii. Test files and bench script: a 30 min XDCAM HD422 RDD9 and a 2 min UHD
+10-bit 4:2:2 long-GOP H.264 MXF, both generated with ffmpeg.
+
+Note: after a far jump (beyond highestProduced + buffer_frames) every
+following frame goes through SeekAndDecode and the buffer settings have no
+effect -- see "Jump to the end of a long-GOP file re-decodes every frame
+separately" above. That, not the buffer size, is what makes AvsPmod slow
+after a jump.
+
+### 4. Review of "forward-only" wording in comments -- parked 2026-11-06
+
+The plugin is no longer forward-only (random access via the Index Table).
+Done: plugin descriptions, README, source_engine.h, essence_walker.h,
+essence_walker_test.cpp. Still to go through one by one: http_byte_source.h:35
+(reads mostly sequential), decoder.h:40 (decode order), index_table.h:51 and
+source_engine_test.cpp:809 ("forward" = MPEG forward prediction, likely
+fine), TODO.md:249.

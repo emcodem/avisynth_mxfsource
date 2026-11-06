@@ -8,13 +8,13 @@
 #
 #   packaging/package.sh <build dir> <platform: win64 | linux-x86_64>
 #
-# <version> is `git describe --tags --always --dirty`: the tag itself on a
+# <version> is `git describe --tags --match "v[0-9]*" --always --dirty`: the tag itself on a
 # release tag (e.g. v0.2.0-beta.1).
 set -euo pipefail
 
 build=$1
 platform=$2
-version=$(git describe --tags --always --dirty)
+version=$(git describe --tags --match "v[0-9]*" --always --dirty)
 root=$(pwd)
 license="$build/_deps/ffmpeg_prebuilt-src/LICENSE.txt"
 rm -rf "$root/dist" "$root/stage"

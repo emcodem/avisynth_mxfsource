@@ -4,7 +4,8 @@
 #
 #   -DSOURCE_DIR=<repo>  -DOUT=<header>  -DFALLBACK=<x.y.z>  [-DGIT=<git exe>]
 #
-# Version: `git describe --tags --always --dirty` without a leading "v"
+# Version: `git describe --tags --match "v[0-9]*" --always --dirty` (release
+# tags only, so e.g. the rolling "nightly" tag is never used) without a leading "v"
 # (a release tag gives "0.2.0" or "0.2.0-beta.1"; between tags
 # "0.1.0-7-gef5b1af"; with uncommitted changes "-dirty" is appended).
 # Without git or tags: FALLBACK. The file is only rewritten when the version
@@ -13,7 +14,7 @@
 set(version "")
 if(GIT)
   execute_process(
-    COMMAND "${GIT}" describe --tags --always --dirty
+    COMMAND "${GIT}" describe --tags --match "v[0-9]*" --always --dirty
     WORKING_DIRECTORY "${SOURCE_DIR}"
     OUTPUT_VARIABLE version
     OUTPUT_STRIP_TRAILING_WHITESPACE
