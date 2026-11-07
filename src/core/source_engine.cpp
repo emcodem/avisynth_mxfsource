@@ -198,6 +198,10 @@ SourceEngine::~SourceEngine() {
       summary = "[MxfSource] " + path_ + ": served " + std::to_string(stats_.bufferedCount) +
                 " frame(s) from buffer, " + std::to_string(stats_.nonBufferedFrames.size()) +
                 " frame(s) via fallback re-decode (not buffered)";
+      if (stats_.growths > 0) {
+        summary += ", buffer grown " + std::to_string(stats_.growths) + " time(s) to " +
+                   std::to_string(videoBuffer_->Capacity()) + " frames";
+      }
       if (stats_.repositions > 0) {
         summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump ahead";
       }
@@ -422,8 +426,11 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
                                              streamInfo_.hasVideo, audioTrackNumbersForWalker, WalkerOptions());
   walkerAudioTracks_ = audioTrackNumbersForWalker;
 
-  const int capacity = options.buffer_frames > 0 ? options.buffer_frames : 300;
-  const int margin = options.eagerdecode > 0 ? options.eagerdecode : 32;
+  // buffer_frames=auto starts at the minimum and grows to its memory budget
+  // right after the first frame (below), once the frame size is known.
+  autoBuffer_ = options.buffer_frames <= 0;
+  const int capacity = autoBuffer_ ? kAutoBufferMinFrames : options.buffer_frames;
+  const int margin = options.eagerdecode > 0 ? options.eagerdecode : kAutoEagerFrames;
   // firstHostFrame_ (0 unless a start_frame hint is in effect) re-anchors
   // both ring buffers so their very first produced index is the hint's
   // target, not 0 -- see FrameBuffer's startIndex constructor param and
@@ -443,6 +450,19 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   std::string peekError;
   if (videoBuffer_->Peek(firstHostFrame_, firstFrame_, &peekError) != FetchStatus::kOk) {
     return {OpenStatus::kDecodeError, "failed to decode first frame: " + peekError};
+  }
+  if (autoBuffer_) {
+    int64_t frameBytes = 0;
+    for (const auto& plane : firstFrame_->planeData) frameBytes += static_cast<int64_t>(plane.size());
+    frameBytes = std::max<int64_t>(frameBytes, 1);
+    const int64_t start = std::clamp<int64_t>(kAutoBufferBytes / frameBytes, kAutoBufferMinFrames,
+                                              kAutoBufferMaxFrames);
+    autoBufferMaxFrames_ = static_cast<int>(
+        std::clamp<int64_t>(kAutoBufferMaxBytes / frameBytes, start, kAutoBufferGrowMaxFrames));
+    GrowBuffers(static_cast<int>(start));
+    AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": buffer_frames=auto: " + std::to_string(start) +
+                  " frames (" + std::to_string(frameBytes / 1024) + " KiB each), may grow to " +
+                  std::to_string(autoBufferMaxFrames_));
   }
   return {OpenStatus::kOk, ""};
 }
@@ -502,6 +522,26 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   // frames that would otherwise be reported as unreachable even though
   // they're genuinely decodable.
   if (status != FetchStatus::kEvicted && status != FetchStatus::kError) return status;
+
+  // buffer_frames=auto: a request just below the window means the caller
+  // needs more history than the buffer holds (stepping backwards, or
+  // Prefetch spreading requests wider than the window) -- double it so the
+  // next ones are served from the buffer. A far backward jump doesn't count;
+  // more history wouldn't have caught it. Only while the window is full:
+  // right after growing, the frames below it are still gone, and stepping
+  // further back over them must not double the buffer again for each step.
+  if (status == FetchStatus::kEvicted && autoBuffer_) {
+    const int capacity = videoBuffer_->Capacity();
+    const int64_t lowest = videoBuffer_->LowestValid();
+    const bool full = videoBuffer_->HighestProduced() - lowest + 1 >= capacity;
+    if (full && capacity < autoBufferMaxFrames_ && n >= lowest - capacity) {
+      const int grown = std::min(capacity * 2, autoBufferMaxFrames_);
+      GrowBuffers(grown);
+      stats_.RecordGrowth();
+      AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(n) +
+                    " requested just below the buffer; buffer_frames=auto grows to " + std::to_string(grown));
+    }
+  }
 
   // Fell outside the ring buffer's window (or DecodeThreadMain failed) --
   // rather than failing outright, fall back to a one-shot re-decode from
@@ -754,23 +794,38 @@ void SourceEngine::DecodeThreadMain() {
   }
 }
 
+void SourceEngine::GrowBuffers(int newCapacity) {
+  videoBuffer_->Grow(newCapacity);
+  if (audioBuffer_) audioBuffer_->Grow(newCapacity);
+}
+
 bool SourceEngine::RepositionProducer(int64_t hostFrame) {
   if (hostFrame < 0 || hostFrame >= streamInfo_.numFrames) return false;
+  constexpr int kRestartLeadFrames = 8;
+  int64_t start = hostFrame;
   {
     std::lock_guard<std::mutex> lock(repositionMutex_);
     if (stopProducer_) return false;
     // Another consumer thread may have moved the producer in the meantime
     // (AviSynth's Prefetch asks for several neighbouring frames at once).
-    if (hostFrame <= videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) return true;
-    if (audioBuffer_) audioBuffer_->Reset(hostFrame);
-    videoBuffer_->Reset(hostFrame);
-    pendingRestart_ = hostFrame;
+    const int capacity = videoBuffer_->Capacity();
+    if (hostFrame <= videoBuffer_->HighestProduced() + capacity) return true;
+    // Restart a few frames early: a temporal filter after the jump (e.g.
+    // TemporalSoften radius 3 behind Trim) also asks for the frames just
+    // before it, and each of those would otherwise be a separate keyframe
+    // re-decode (measured: ~250 ms each on UHD long-GOP H.264). Usually
+    // free, since decoding starts from the GOP's keyframe anyway.
+    start = std::max<int64_t>(0, hostFrame - std::min(kRestartLeadFrames, capacity / 2));
+    if (audioBuffer_) audioBuffer_->Reset(start);
+    videoBuffer_->Reset(start);
+    pendingRestart_ = start;
     restartRequested_ = true;
   }
   repositionCv_.notify_all();
   stats_.RecordReposition();
   AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(hostFrame) +
-                " requested far ahead of the decode position; restarting the decoder there");
+                " requested far ahead of the decode position; restarting the decoder at frame " +
+                std::to_string(start));
   return true;
 }
 

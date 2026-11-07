@@ -271,14 +271,15 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
     return;
   }
   const int64_t bufferFramesArg = vsapi->mapGetInt(in, "buffer_frames", 0, &err);
-  const int bufferFrames = err ? 300 : static_cast<int>(bufferFramesArg);
-  if (bufferFrames <= 0) {
+  // Not given = 0 = auto (see OpenOptions); a given value must be positive.
+  const int bufferFrames = err ? 0 : static_cast<int>(bufferFramesArg);
+  if (!err && bufferFrames <= 0) {
     vsapi->mapSetError(out, "MxfSource: buffer_frames must be positive");
     return;
   }
   const int64_t marginArg = vsapi->mapGetInt(in, "eagerdecode", 0, &err);
-  const int eagerdecode = err ? 32 : static_cast<int>(marginArg);
-  if (eagerdecode <= 0) {
+  const int eagerdecode = err ? 0 : static_cast<int>(marginArg);
+  if (!err && eagerdecode <= 0) {
     vsapi->mapSetError(out, "MxfSource: eagerdecode must be positive");
     return;
   }

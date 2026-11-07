@@ -282,8 +282,8 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
 | `file` | string | *(required)* | Path (or `http(s)://` URL) to the `.mxf` file. |
-| `buffer_frames` | int | `300` | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. |
-| `eagerdecode` | int | `32` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
+| `buffer_frames` | int | auto | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. Not given: sized by memory, 1 GiB worth of frames (16-300; about 240 for HD, 30 for UHD 10-bit 4:2:2), doubled up to 4 GiB (at most 1024 frames) whenever a frame just below the window is requested, e.g. when stepping backwards in an editor. A given value is a fixed size and never grows. |
+| `eagerdecode` | int | `8` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
 | `logfile` | string | *(none)* | Path to append every plugin message to, warnings and informational ones (including the serve-stats summary when the clip closes), timestamped, regardless of `debug` -- stderr alone is invisible to GUI hosts. |
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |

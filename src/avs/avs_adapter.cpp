@@ -241,10 +241,11 @@ class MxfSource final : public IClip {
 AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvironment* env) {
   const char* path = args[0].AsString(nullptr);
   if (!path || !*path) env->ThrowError("MxfSource: a file path is required");
-  const int bufferFrames = args[1].AsInt(300);
-  if (bufferFrames <= 0) env->ThrowError("MxfSource: buffer_frames must be positive");
-  const int eagerdecode = args[2].AsInt(32);
-  if (eagerdecode <= 0) env->ThrowError("MxfSource: eagerdecode must be positive");
+  // Not given = 0 = auto (see OpenOptions); a given value must be positive.
+  const int bufferFrames = args[1].AsInt(0);
+  if (args[1].Defined() && bufferFrames <= 0) env->ThrowError("MxfSource: buffer_frames must be positive");
+  const int eagerdecode = args[2].AsInt(0);
+  if (args[2].Defined() && eagerdecode <= 0) env->ThrowError("MxfSource: eagerdecode must be positive");
   const char* logFile = args[3].AsString("");
   const char* httpHeaders = args[4].AsString("");
   const bool handleOrigin = args[5].AsBool(true);

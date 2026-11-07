@@ -9,12 +9,29 @@ namespace mxfsrc {
 // Open-time options shared by both host adapters. Wired into the real
 // decode engine starting in Phase 4; the AVS/VS Phase 0 scaffolds below
 // hardcode a subset of these as filter arguments in the meantime.
+// buffer_frames / eagerdecode auto sizing, see OpenOptions.
+inline constexpr int64_t kAutoBufferBytes = int64_t{1} << 30;     // 1 GiB at open
+inline constexpr int64_t kAutoBufferMaxBytes = int64_t{4} << 30;  // 4 GiB after growth
+inline constexpr int kAutoBufferMinFrames = 16;
+inline constexpr int kAutoBufferMaxFrames = 300;      // at open
+inline constexpr int kAutoBufferGrowMaxFrames = 1024;  // after growth
+inline constexpr int kAutoEagerFrames = 8;
+
 struct OpenOptions {
   // Sliding ring-buffer capacity (frames): how much decoded history the
   // engine is willing to retain before evicting the oldest frame. Must
   // exceed the host's prefetch lookahead so GetFrame() requests are almost
   // always already-decoded cache hits.
-  int buffer_frames = 300;
+  //
+  // 0 (the default) = auto: the capacity is sized by memory instead of a
+  // fixed frame count (a fixed 300 frames cost 1.3 GB for HD and 10.6 GB
+  // for UHD 10-bit 4:2:2, while forward processing never needed more than a
+  // few dozen). It starts at kAutoBufferBytes worth of frames (between
+  // kAutoBufferMinFrames and kAutoBufferMaxFrames) and doubles, up to
+  // kAutoBufferMaxBytes, whenever a request lands just below the window
+  // (stepping backwards in an editor, wide out-of-order Prefetch). A
+  // positive value is a fixed capacity, exactly as before, never grown.
+  int buffer_frames = 0;
 
   // How far ahead of the highest-ever-requested frame the decode thread is
   // allowed to eagerly race UNSOLICITED (i.e. before being asked), capped
@@ -30,8 +47,10 @@ struct OpenOptions {
   // older frames as documented) -- this only throttles the *automatic*
   // eager-ahead portion. Tune upward if a filter's genuine (not merely
   // eager-decode-outrunning-it) lookahead need exceeds this margin. Exposed
-  // to scripts as MxfSource(..., eagerdecode=N).
-  int eagerdecode = 32;
+  // to scripts as MxfSource(..., eagerdecode=N). 0 (the default) =
+  // kAutoEagerFrames; was 32 until 2026-11, measured no faster than 8 and
+  // it takes history away from a small auto-sized buffer.
+  int eagerdecode = 0;
 
   // Absolute path to a file the ServeStats summary (see SourceEngine) is
   // appended to when the engine is destroyed, in addition to the existing

@@ -4,5 +4,5 @@
 
 int main() {
   mxfsrc::OpenOptions opts;
-  return opts.buffer_frames == 300 ? 0 : 1;
+  return opts.buffer_frames == 0 ? 0 : 1;  // 0 = auto
 }

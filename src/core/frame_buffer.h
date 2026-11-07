@@ -59,6 +59,7 @@ class FrameBuffer {
   // back to a fresh one-shot re-decode for an evicted index, same as today.
   FrameBuffer(int capacity, int eagerReadaheadMargin, int64_t startIndex = 0)
       : capacity_(capacity),
+        requestedMargin_(eagerReadaheadMargin),
         margin_(std::min(capacity, eagerReadaheadMargin)),
         slots_(static_cast<size_t>(capacity)),
         lowestValid_(startIndex),
@@ -221,7 +222,36 @@ class FrameBuffer {
     std::lock_guard<std::mutex> lock(mutex_);
     return highestProduced_;
   }
-  int Capacity() const { return capacity_; }
+  int Capacity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return capacity_;
+  }
+
+  // Lowest index still held (everything below it was evicted or never
+  // produced). See SourceEngine::GetVideoFrame's auto-growth.
+  int64_t LowestValid() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return lowestValid_;
+  }
+
+  // Enlarges the window to `newCapacity` frames, keeping every frame it
+  // holds; a smaller or equal value does nothing. The eager-readahead
+  // margin becomes min(newCapacity, the margin asked for at construction).
+  // Used for buffer_frames=auto: the engine starts small and grows once it
+  // knows the frame size, and again when requests land just below the
+  // window (see SourceEngine::GrowBuffers).
+  void Grow(int newCapacity) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (newCapacity <= capacity_) return;
+    std::vector<std::optional<T>> slots(static_cast<size_t>(newCapacity));
+    for (int64_t i = lowestValid_; i <= highestProduced_; ++i) {
+      slots[static_cast<size_t>(i % newCapacity)] = std::move(slots_[SlotOf(i)]);
+    }
+    slots_ = std::move(slots);
+    capacity_ = newCapacity;
+    margin_ = std::min<int64_t>(newCapacity, requestedMargin_);
+    cv_.notify_all();  // a wider margin may let the producer continue
+  }
 
   // Like Get(), but does NOT advance the watermark. For inspecting a frame
   // that the eager initial fill already produced (e.g. SourceEngine::Open()
@@ -282,8 +312,9 @@ class FrameBuffer {
  private:
   size_t SlotOf(int64_t index) const { return static_cast<size_t>(index % capacity_); }
 
-  const int capacity_;
-  const int64_t margin_;
+  int capacity_;
+  const int64_t requestedMargin_;
+  int64_t margin_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::vector<std::optional<T>> slots_;

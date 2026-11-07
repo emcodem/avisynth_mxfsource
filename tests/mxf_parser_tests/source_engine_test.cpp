@@ -469,7 +469,7 @@ void TestEagerReadaheadMarginDoesNotEvictRecentlyDeliveredFrames() {
 
   {
     SourceEngine engine;
-    OpenResult res = engine.Open(path.string(), NonStrictOptions());  // default buffer_frames=300, eagerdecode=32
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());  // auto buffer: 300 frames for these tiny frames, eagerdecode 8
     CHECK(res.status == OpenStatus::kOk);
     if (res.status != OpenStatus::kOk) {
       std::filesystem::remove(path);
@@ -1312,6 +1312,64 @@ void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
   std::filesystem::remove(path);
 }
 
+// buffer_frames=auto: sized by memory (these frames are tiny, so the
+// 300-frame cap applies), a far backward jump doesn't grow it, a request just
+// below the full window doubles it once, and further steps back over frames
+// that are already gone don't double it again.
+void TestAutoBufferGrowsOnceOnStepBack() {
+  const int width = 4, height = 2, numFrames = 1000;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_auto_buffer.mxf");
+  {
+    SourceEngine engine;
+    OpenResult res = engine.Open(path.string(), NonStrictOptions());
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      CHECK(engine.BufferCapacity() == 300);
+      std::shared_ptr<NormalizedFrame> frame;
+      for (int i = 0; i < 900; ++i) CHECK(engine.GetVideoFrame(i, frame, nullptr) == FetchStatus::kOk);
+      CHECK(engine.NonBufferedServedFrames().empty());
+
+      auto check = [&](int n) {
+        CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+        CHECK(frame && !frame->planeData[0].empty() && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+      };
+      check(5);  // far below the window (~600..907): fallback, no growth
+      CHECK(engine.BufferGrowthCount() == 0);
+      CHECK(engine.BufferCapacity() == 300);
+
+      check(590);  // just below it: fallback once, buffer doubles
+      CHECK(engine.BufferGrowthCount() == 1);
+      CHECK(engine.BufferCapacity() == 600);
+      check(589);  // still gone, but the window isn't full any more
+      check(588);
+      CHECK(engine.BufferGrowthCount() == 1);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// An explicit buffer_frames keeps its fixed size.
+void TestExplicitBufferFramesNeverGrows() {
+  const int width = 4, height = 2, numFrames = 40;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_fixed_buffer.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 5;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      for (int i = 0; i < 30; ++i) CHECK(engine.GetVideoFrame(i, frame, nullptr) == FetchStatus::kOk);
+      CHECK(engine.GetVideoFrame(22, frame, nullptr) == FetchStatus::kOk);  // just below the window
+      CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + 22));
+      CHECK(engine.BufferCapacity() == 5);
+      CHECK(engine.BufferGrowthCount() == 0);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 // AviSynth's Prefetch: several threads ask for neighbouring frames at once,
 // right after a jump ahead (Trim at the start of a script). Exactly one of
 // them moves the producer; all of them get the right content.
@@ -1331,16 +1389,16 @@ void TestForwardJumpWithConcurrentRequestsRepositionsOnce() {
     SourceEngine engine;
     OpenOptions opts = NonStrictOptions();
     // Producer parked at frame 0 after Open (eagerdecode 1), so 7 is far
-    // ahead; once restarted at 7, every frame up to 7 + 6 - 1 is within the
-    // window, so a thread that runs ahead can't legitimately trigger a
-    // second restart.
+    // ahead. The restart begins 3 frames early (lead = capacity / 2) at 4,
+    // so frames up to 4 - 1 + 6 = 9 are within the window and a thread that
+    // runs ahead can't legitimately trigger a second restart.
     opts.buffer_frames = 6;
     opts.eagerdecode = 1;
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
     if (res.status == OpenStatus::kOk) {
       constexpr int kThreads = 3;
-      constexpr int64_t kStart = 7, kEnd = 13;
+      constexpr int64_t kStart = 7, kEnd = 10;
       std::atomic<int> failures{0};
       std::vector<std::thread> threads;
       for (int t = 0; t < kThreads; ++t) {
@@ -2577,6 +2635,8 @@ int main() {
   TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
   TestForwardJumpWithConcurrentRequestsRepositionsOnce();
+  TestAutoBufferGrowsOnceOnStepBack();
+  TestExplicitBufferFramesNeverGrows();
   TestForwardJumpRepositionsAudioToo();
   TestStartFrameHintGopServesFromBufferViaIndexAssistedJump();
   TestStartFrameHintIntraOnlyStartsProductionAtHint();

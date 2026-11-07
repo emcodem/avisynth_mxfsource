@@ -41,6 +41,8 @@ struct ServeStats {
   // How often the background producer was moved to a frame requested far
   // ahead of it (SourceEngine::RepositionProducer).
   int64_t repositions = 0;
+  // How often buffer_frames=auto doubled the buffer (SourceEngine::GetVideoFrame).
+  int64_t growths = 0;
 
   void RecordBufferedServe() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -49,6 +51,10 @@ struct ServeStats {
   void RecordNonBufferedServe(int64_t n) {
     std::lock_guard<std::mutex> lock(mutex);
     nonBufferedFrames.push_back(n);
+  }
+  void RecordGrowth() {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++growths;
   }
   void RecordReposition() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -161,6 +167,12 @@ class SourceEngine {
     std::lock_guard<std::mutex> lock(stats_.mutex);
     return stats_.repositions;
   }
+  // buffer_frames=auto: how often the buffer grew, and its current size.
+  int64_t BufferGrowthCount() const {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    return stats_.growths;
+  }
+  int BufferCapacity() const { return videoBuffer_ ? videoBuffer_->Capacity() : 0; }
 
   // Diagnostics for manual tools (see tests/mxf_parser_tests/read_test_mxf.cpp):
   // whether a usable Index Table Segment-derived lookup was built at all,
@@ -213,6 +225,9 @@ class SourceEngine {
   // shutting down or `hostFrame` is out of range; the caller then keeps its
   // old fallback.
   bool RepositionProducer(int64_t hostFrame);
+
+  // Grows both ring buffers to `newCapacity` (buffer_frames=auto).
+  void GrowBuffers(int newCapacity);
 
   // Opens a *fresh*, independent MxfReader/EssenceWalker/Decoder on the
   // same file (separate file handle -- doesn't disturb the primary
@@ -335,6 +350,10 @@ class SourceEngine {
   // DecodeThreadMain (producer): pendingRestart_ is the host frame to
   // restart at, -1 for none; stopProducer_ is set by the destructor.
   // restartRequested_ is checked by the running ProduceFrom without the lock.
+  // OpenOptions::buffer_frames <= 0: capacity sized by memory, grown on
+  // demand up to autoBufferMaxFrames_ (set in Open() from the frame size).
+  bool autoBuffer_ = false;
+  int autoBufferMaxFrames_ = 0;
   std::mutex repositionMutex_;
   std::condition_variable repositionCv_;
   int64_t pendingRestart_ = -1;

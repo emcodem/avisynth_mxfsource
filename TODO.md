@@ -800,7 +800,7 @@ the index offset doesn't point at a KLV (wrong index, `verify=true` finds
 it). Return the reason from `SeekAndDecode` and include it (with the byte
 offset) in the error message.
 
-### 3. Default buffer_frames / eagerdecode -- parked 2026-11-06
+### 3. Default buffer_frames / eagerdecode -- auto sizing implemented 2026-11-07 (branch adaptive-buffer)
 
 `buffer_frames` (default 300) is a fixed memory cost that scales with the
 frame size: the ring buffer always fills to it. Measured (file in OS cache,
@@ -828,8 +828,31 @@ radii. Test files and bench script: a 30 min XDCAM HD422 RDD9 and a 2 min UHD
 Note: before 2026-11-06, after a far jump (beyond highestProduced +
 buffer_frames) every following frame went through SeekAndDecode and the
 buffer settings had no effect -- see "Jump to the end of a long-GOP file
-re-decodes every frame separately" above (now fixed). Re-measure AvsPmod
-after a jump before drawing conclusions from the earlier numbers.
+re-decodes every frame separately" above (now fixed).
+
+Re-measured 2026-11-07 (after the jump fix), 3000 HD / 600 UHD frames after
+`Trim(1250, ...)`, ffmpeg -f null; chains: sequential, TemporalSoften radius
+1/3 with Prefetch 2/8/16/32, and 300 frames reversed. Smaller buffers are as
+fast or faster everywhere except UHD Prefetch(32) radius 3 (77 fps at 300,
+48-64 at 16-60 with 8-20 fallbacks). Peak memory UHD: 10.6-15 GB at 300,
+2-7 GB at 30.
+
+Decision (user, 2026-11-07): keep `buffer_frames` as a fixed override;
+default = auto. Implemented: 1 GiB worth of frames (16-300) once the first
+frame is decoded, doubled on a request just below a full window up to 4 GiB
+(max 1024 frames); eagerdecode default 8. A jump restart now begins 8 frames
+(at most capacity/2) before the target, because a temporal filter after
+Trim also asks for the frames just before it (each was a ~250 ms UHD
+fallback). Auto results: UHD sequential 83 fps at 2.1 GB (was 82 fps at
+10.6 GB), Prefetch(16) r3 84 fps / 0 fallbacks, Prefetch(32) r3 68-75 fps,
+grows to 64-128 frames; HD 700-800 fps at 1.1-1.8 GB.
+
+Still open: stepping backwards right after a jump (AvsPmod) is all fallback
+with any buffer size -- the buffer only fills forward from the restart
+point. ~30 ms/step HD, ~250 ms/step UHD. Idea: when a frame just below a
+fresh restart point is requested, restart further back (e.g. capacity/2
+before it) instead of re-decoding each frame. Bench script:
+`tools/bench_buffer.ps1`.
 
 ### 4. Review of "forward-only" wording in comments -- parked 2026-11-06
 

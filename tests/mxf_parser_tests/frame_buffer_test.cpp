@@ -69,12 +69,67 @@ void TestEvictedValueIsSameObjectForSharedPtr() {
   CHECK(evicted->use_count() == 2);
 }
 
+// Reset (SourceEngine::RepositionProducer): the window restarts at the new
+// index, old frames read as evicted, and producer calls still tagged with
+// the old generation are dropped -- including one for exactly the new start
+// index, which would otherwise put an old-position frame there.
+void TestResetRestartsWindowAndDropsStaleGeneration() {
+  FrameBuffer<int> buf(/*capacity=*/4, /*margin=*/4);
+  const uint64_t oldGen = buf.Generation();
+  buf.Put(0, 10, oldGen);
+  buf.Put(1, 11, oldGen);
+
+  buf.Reset(100);
+  const uint64_t newGen = buf.Generation();
+  CHECK(newGen != oldGen);
+  CHECK(buf.NextIndex() == 100);
+  CHECK(buf.LowestValid() == 100);
+  int out = 0;
+  CHECK(buf.Get(1, out) == FetchStatus::kEvicted);
+
+  buf.Put(100, 999, oldGen);  // stale producer write
+  CHECK(buf.NextIndex() == 100);
+  buf.SignalEndOfStream(oldGen);  // stale: must not end the new run
+  buf.SignalError("stale", oldGen);
+
+  buf.Put(100, 1000, newGen);
+  CHECK(buf.Get(100, out) == FetchStatus::kOk);
+  CHECK(out == 1000);
+  buf.SignalEndOfStream(newGen);
+  CHECK(buf.Get(101, out) == FetchStatus::kEndOfStream);
+}
+
+// Grow (buffer_frames=auto): every held frame survives the re-slotting,
+// eviction then follows the new capacity, and a smaller value is ignored.
+void TestGrowKeepsFramesAndRaisesCapacity() {
+  FrameBuffer<int> buf(/*capacity=*/3, /*margin=*/3);
+  for (int i = 0; i < 5; ++i) buf.Put(i, 10 + i);  // holds 2, 3, 4
+  buf.Grow(8);
+  CHECK(buf.Capacity() == 8);
+  int out = 0;
+  for (int i = 2; i < 5; ++i) {
+    CHECK(buf.Get(i, out) == FetchStatus::kOk);
+    CHECK(out == 10 + i);
+  }
+  CHECK(buf.Get(1, out) == FetchStatus::kEvicted);
+
+  for (int i = 5; i < 10; ++i) CHECK(!buf.Put(i, 10 + i).has_value());  // 2..9: 8 frames, no eviction
+  auto evicted = buf.Put(10, 20);
+  CHECK(evicted.has_value() && *evicted == 12);
+  CHECK(buf.Get(3, out) == FetchStatus::kOk && out == 13);
+
+  buf.Grow(4);
+  CHECK(buf.Capacity() == 8);
+}
+
 }  // namespace
 
 int main() {
   TestPutReturnsNulloptBeforeCapacity();
   TestPutReturnsEvictedValueOnceAtCapacity();
   TestEvictedValueIsSameObjectForSharedPtr();
+  TestResetRestartsWindowAndDropsStaleGeneration();
+  TestGrowKeepsFramesAndRaisesCapacity();
 
   if (g_failures == 0) {
     std::cout << "all frame_buffer tests passed" << std::endl;
