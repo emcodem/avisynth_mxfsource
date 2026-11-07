@@ -284,6 +284,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `file` | string | *(required)* | Path (or `http(s)://` URL) to the `.mxf` file. |
 | `buffer_frames` | int | auto | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. Not given: sized by memory, 1 GiB worth of frames (16-300; about 240 for HD, 30 for UHD 10-bit 4:2:2), doubled up to 4 GiB (at most 1024 frames) whenever a frame just below the window is requested, e.g. when stepping backwards in an editor. A given value is a fixed size and never grows. |
 | `eagerdecode` | int | `8` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
+| `back_seek_preroll` | int | `8` | When a jump far ahead or far back restarts the decoder, it starts this many frames before the requested frame (at most half the buffer), so a temporal filter after the jump and stepping back from there are served from the buffer. Usually free on long-GOP, where decoding starts at the preceding keyframe anyway; raise it for wide temporal filters or `Reverse()`. |
 | `logfile` | string | *(none)* | Path to append every plugin message to, warnings and informational ones (including the serve-stats summary when the clip closes), timestamped, regardless of `debug` -- stderr alone is invisible to GUI hosts. |
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
@@ -315,6 +316,49 @@ refuses, with the same message, and never publishes an index for a file
 `MxfSource` can still open a file for which no index can be built at all
 (it then decodes from the start), while `MxfExtractIndex` has nothing to
 publish and fails.
+
+### Seeking and access patterns
+
+The plugin is built for forward decoding: one background thread decodes the
+file in order into a ring buffer (`buffer_frames`), staying up to
+`eagerdecode` frames ahead of the highest frame requested so far. Every other
+access pattern works too and always returns the right frame, but how fast it
+is depends on whether the frame comes from that buffer or has to be decoded
+on its own.
+
+A frame that isn't in the buffer is decoded separately: a fresh decoder
+starts at the preceding keyframe (found through the Index Table) and decodes
+up to the frame. For intra-only codecs (IMX/D-10, AVC-Intra, DNxHD/DNxHR,
+ProRes, uncompressed, DV, JPEG 2000) that is one frame; for long-GOP
+(XDCAM HD, XAVC-L and other long-GOP H.264) it is up to a whole GOP per
+frame -- measured roughly 30 ms for HD and 250 ms for UHD. To keep this a
+one-off, a jump of more than the buffer moves the background decoder
+instead:
+
+| Access pattern | Example | What happens |
+|---|---|---|
+| Sequential | encoding a whole file | Everything from the buffer. |
+| Jump ahead | `Trim(1250, 7250)`, seeking forward in an editor | The decoder restarts at the target (from its keyframe), `back_seek_preroll` frames early; everything after it comes from the buffer. |
+| Jump back | `Trim(5000,6000) ++ Trim(100,200)`, `Loop()`, scrubbing back to the start and playing | The first 4 frames after the jump are decoded separately, then the decoder restarts there and the rest comes from the buffer. The wait keeps two positions read in turn (next row) from moving the decoder back and forth. |
+| Two positions far apart, read in turn | `Interleave(c, c.Trim(1000,0))`, `StackHorizontal` of a clip and a Trim of it | The decoder stays with one of them; the other is decoded frame by frame. |
+| Temporal filters, `Prefetch()` | `TemporalSoften(3, ...)`, `Prefetch(16)` | From the buffer: requests spread around the current position, within the buffer. With `buffer_frames` auto, a request just below the buffer doubles it (up to 4 GiB, at most 1024 frames). |
+| Stepping back | `Reverse()`, stepping backwards frame by frame in an editor | Frames still in the buffer come from it; earlier ones are decoded separately. After a jump only `back_seek_preroll` frames lie below the target, so stepping back past them is slow on long-GOP. |
+| Audio ahead of video by more than the buffer | large negative `DelayAudio`, a host that reads audio far ahead | Correct, but slow: audio and video move the decoder in turn, and most video frames are decoded separately. |
+
+What helps:
+
+- `debug=true` or `logfile=...` prints a summary when the clip closes:
+  `served N frame(s) from buffer, M frame(s) via fallback re-decode`, the
+  frame ranges that were decoded separately, how often the buffer grew and
+  how often the decoder restarted after a jump. Each restart is also logged.
+- `back_seek_preroll`: raise it for wide temporal filters behind a `Trim`,
+  or for `Reverse()` / stepping back after a jump. It is limited to half the
+  buffer, so raise `buffer_frames` along with it when needed.
+- `buffer_frames`: a fixed, larger buffer for patterns that reach further
+  back than the auto size allows; costs memory (one UHD 10-bit 4:2:2 frame
+  is about 33 MB).
+- `start_frame`: when a process only reads one range of the file (chunked
+  processing), the decoder starts there right away.
 
 ### File paths and URLs
 

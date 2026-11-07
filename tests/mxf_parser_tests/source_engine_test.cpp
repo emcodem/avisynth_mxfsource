@@ -1440,6 +1440,32 @@ void TestAlternatingFarPositionsDoNotThrash() {
   std::filesystem::remove(path);
 }
 
+// back_seek_preroll: how many frames before the jump target the restart
+// begins -- 0 restarts exactly at the target, so the frame just before it is
+// a fallback; 5 has it in the buffer.
+void TestBackSeekPrerollSetsRestartLead() {
+  const int width = 4, height = 2, numFrames = 60;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_preroll.mxf");
+  for (int preroll : {0, 5}) {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 20;
+    opts.eagerdecode = 1;
+    opts.back_seek_preroll = preroll;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) continue;
+    std::shared_ptr<NormalizedFrame> frame;
+    for (int n : {40, 39, 38}) {
+      CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+      CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+    }
+    CHECK(engine.RepositionCount() == 1);
+    CHECK(engine.NonBufferedServedFrames().size() == (preroll == 0 ? 2u : 0u));
+  }
+  std::filesystem::remove(path);
+}
+
 // AviSynth's Prefetch: several threads ask for neighbouring frames at once,
 // right after a jump ahead (Trim at the start of a script). Exactly one of
 // them moves the producer; all of them get the right content.
@@ -1459,9 +1485,10 @@ void TestForwardJumpWithConcurrentRequestsRepositionsOnce() {
     SourceEngine engine;
     OpenOptions opts = NonStrictOptions();
     // Producer parked at frame 0 after Open (eagerdecode 1), so 7 is far
-    // ahead. The restart begins 3 frames early (lead = capacity / 2) at 4,
-    // so frames up to 4 - 1 + 6 = 9 are within the window and a thread that
-    // runs ahead can't legitimately trigger a second restart.
+    // ahead. The restart begins 3 frames early (back_seek_preroll 8, capped
+    // at capacity / 2) at 4, so frames up to 4 - 1 + 6 = 9 are within the
+    // window and a thread that runs ahead can't legitimately trigger a second
+    // restart.
     opts.buffer_frames = 6;
     opts.eagerdecode = 1;
     OpenResult res = engine.Open(path.string(), opts);
@@ -2705,6 +2732,7 @@ int main() {
   TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
   TestBackwardJumpRepositionsOnceIdle();
+  TestBackSeekPrerollSetsRestartLead();
   TestAlternatingFarPositionsDoNotThrash();
   TestForwardJumpWithConcurrentRequestsRepositionsOnce();
   TestAutoBufferGrowsOnceOnStepBack();

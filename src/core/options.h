@@ -52,6 +52,15 @@ struct OpenOptions {
   // it takes history away from a small auto-sized buffer.
   int eagerdecode = 0;
 
+  // When a jump far ahead or far back restarts the decoder, it starts this
+  // many frames before the requested frame (at most half the buffer), so a
+  // temporal filter after the jump (e.g. TemporalSoften radius 3 behind a
+  // Trim) and stepping back from there find those frames in the buffer
+  // instead of re-decoding each one from its keyframe. Usually free on
+  // long-GOP, where decoding starts at the preceding keyframe anyway.
+  // Exposed to scripts as MxfSource(..., back_seek_preroll=N), 0 or more.
+  int back_seek_preroll = 8;
+
   // Absolute path to a file the ServeStats summary (see SourceEngine) is
   // appended to when the engine is destroyed, in addition to the existing
   // stderr line -- stderr alone is invisible for GUI hosts (e.g. AvsPmod)

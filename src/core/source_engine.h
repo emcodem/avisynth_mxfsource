@@ -367,6 +367,7 @@ class SourceEngine {
   // demand up to autoBufferMaxFrames_ (set in Open() from the frame size).
   bool autoBuffer_ = false;
   int autoBufferMaxFrames_ = 0;
+  int backSeekPreroll_ = 8;  // OpenOptions::back_seek_preroll
   std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;
   std::shared_ptr<NormalizedFrame> firstFrame_;
   std::thread decodeThread_;

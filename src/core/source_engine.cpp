@@ -431,6 +431,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   autoBuffer_ = options.buffer_frames <= 0;
   const int capacity = autoBuffer_ ? kAutoBufferMinFrames : options.buffer_frames;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : kAutoEagerFrames;
+  backSeekPreroll_ = std::max(0, options.back_seek_preroll);
   // firstHostFrame_ (0 unless a start_frame hint is in effect) re-anchors
   // both ring buffers so their very first produced index is the hint's
   // target, not 0 -- see FrameBuffer's startIndex constructor param and
@@ -829,7 +830,6 @@ void SourceEngine::GrowBuffers(int newCapacity) {
 
 bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
   if (hostFrame < 0 || hostFrame >= streamInfo_.numFrames) return false;
-  constexpr int kRestartLeadFrames = 8;
   int64_t start = hostFrame;
   {
     std::lock_guard<std::mutex> lock(repositionMutex_);
@@ -841,12 +841,13 @@ bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
                  : hostFrame <= videoBuffer_->HighestProduced() + capacity) {
       return true;
     }
-    // Restart a few frames early: a temporal filter after the jump (e.g.
-    // TemporalSoften radius 3 behind Trim) also asks for the frames just
-    // before it, and each of those would otherwise be a separate keyframe
-    // re-decode (measured: ~250 ms each on UHD long-GOP H.264). Usually
-    // free, since decoding starts from the GOP's keyframe anyway.
-    start = std::max<int64_t>(0, hostFrame - std::min(kRestartLeadFrames, capacity / 2));
+    // Restart a few frames early (OpenOptions::back_seek_preroll): a
+    // temporal filter after the jump (e.g. TemporalSoften radius 3 behind
+    // Trim) also asks for the frames just before it, and each of those would
+    // otherwise be a separate keyframe re-decode (measured: ~250 ms each on
+    // UHD long-GOP H.264). Usually free, since decoding starts from the
+    // GOP's keyframe anyway.
+    start = std::max<int64_t>(0, hostFrame - std::min(backSeekPreroll_, capacity / 2));
     if (audioBuffer_) audioBuffer_->Reset(start);
     videoBuffer_->Reset(start);
     pendingRestart_ = start;

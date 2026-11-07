@@ -496,6 +496,13 @@ goal:
 - Audio far below its buffer is still read block by block with a fresh
   reader (cheap for PCM, but an audio-only consumer that loops opens the file
   once per edit unit).
+- Audio read more than the buffer ahead of video (large negative DelayAudio,
+  a host reading audio far ahead): probe 2026-11-07, 96 of 120 video frames
+  via fallback, 48 restarts (audio and video move the producer in turn).
+  Output correct. User decision 2026-11-07: leave it -- a separate audio
+  reader risks audio/video getting out of sync, and it works today.
+- Alternating far positions: user decision 2026-11-07, works today, don't
+  optimize.
 
 ### Corpus re-run against the 2026-10-16 baseline -- done 2026-10-19
 

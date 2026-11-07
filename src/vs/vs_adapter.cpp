@@ -311,11 +311,19 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   int verifyErr = 0;
   const int64_t verifyArg = vsapi->mapGetInt(in, "verify", 0, &verifyErr);
   const bool verify = verifyErr ? false : (verifyArg != 0);
+  int prerollErr = 0;
+  const int64_t prerollArg = vsapi->mapGetInt(in, "back_seek_preroll", 0, &prerollErr);
+  const int backSeekPreroll = prerollErr ? OpenOptions().back_seek_preroll : static_cast<int>(prerollArg);
+  if (backSeekPreroll < 0) {
+    vsapi->mapSetError(out, "MxfSource: back_seek_preroll must not be negative");
+    return;
+  }
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
+  options.back_seek_preroll = backSeekPreroll;
   options.logfile = logFileErr ? "" : logFile;
   options.http_headers = httpHeadersErr ? "" : httpHeaders;
   options.handle_origin = handleOrigin;
@@ -462,7 +470,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;back_seek_preroll:int:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the
