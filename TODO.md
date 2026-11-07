@@ -709,7 +709,7 @@ message, so the error reads "failed to decode first frame:".
 - Fix: treat 0 as unknown, at least when the file is not finished, and give
   the end-of-stream case at open a message.
 
-### 7. MPEG-2 coding UL gaps -- only the error message to fix
+### 7. MPEG-2 coding UL gaps -- MP@HL / MP@H-14 added 2026-11-07, real-file check pending
 
 - 13 files use `06 0e 2b 34 04 01 01 03 04 01 02 02 01 03 03 00`
   (MP@HL long GOP), on 1080, 1440 and 720x608 4:2:0, e.g.
@@ -719,6 +719,12 @@ message, so the error reads "failed to decode first frame:".
 - 4 Pinnacle Liquid D-10 files have no PictureEssenceCoding at all; ffmpeg
   falls back to the container UL (`...0d 01 03 01 02 04 60 01`), e.g.
   `SERVER/SHARE/...`.
+
+2026-11-07: MP@HL (`01 03`) and MP@H-14 (`01 05`) added to `kCodecUls` as
+14-byte entries (not the 13-byte prefix, which MPEG-4 Visual `01 20` and
+H.264 `01 31`/`01 32` share). Still to do: check a few of the 14 files
+bit-exact against ffmpeg (framemd5); the 4 Pinnacle files without
+PictureEssenceCoding still need the container-UL fallback or a clear error.
 
 ### 8. Cold open with many partitions over SMB
 

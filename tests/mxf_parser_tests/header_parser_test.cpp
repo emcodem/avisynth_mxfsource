@@ -283,6 +283,23 @@ void TestUlVersionByteIgnored() {
                    0x03, 0x01, 0x02, 0x10, 0x02, 0x00, 0x00, 0x00}, kKlvFillKey));
 }
 
+// MPEG-2 coding ULs differ in byte 13 (profile/level). MP@HL and MP@H-14
+// were missing, so 14 files of the 2026-10-19 scan failed as an unknown
+// codec. The shared 13-byte prefix must not turn other codecs into MPEG-2.
+void TestMpeg2ProfileLevelUlsClassified() {
+  // MP@HL long GOP, as found in 13 scan files.
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x03,
+                         0x04, 0x01, 0x02, 0x02, 0x01, 0x03, 0x03, 0x00}) == CodecFamily::kMpeg2Video);
+  // MP@H-14, as found in 1 scan file.
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x03,
+                         0x04, 0x01, 0x02, 0x02, 0x01, 0x05, 0x03, 0x00}) == CodecFamily::kMpeg2Video);
+  // Same 13-byte prefix, not MPEG-2: MPEG-4 Visual stays unknown, AVC-Intra stays H.264.
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x03,
+                         0x04, 0x01, 0x02, 0x02, 0x01, 0x20, 0x02, 0x03}) == CodecFamily::kUnknown);
+  CHECK(ClassifyCodecUl({0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a,
+                         0x04, 0x01, 0x02, 0x02, 0x01, 0x32, 0x21, 0x01}) == CodecFamily::kH264);
+}
+
 // Header Partition Pack's HeaderByteCount field: 16-byte key + 1-byte BER
 // length, then MajorVersion(2) MinorVersion(2) KAGSize(4) ThisPartition(8)
 // PreviousPartition(8) FooterPartition(8).
@@ -675,6 +692,7 @@ int main() {
   TestNoFooterPartitionLeavesUnknownDurationUnresolved();
   TestXavcLongGopUlClassification();
   TestUlVersionByteIgnored();
+  TestMpeg2ProfileLevelUlsClassified();
   TestUndercountedHeaderByteCountRecovered();
   TestMetadataWalkPastDeclaredEndStopsAtEssence();
   TestEssenceInHeaderPartitionNotTreatedAsMetadata();
