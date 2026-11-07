@@ -188,6 +188,16 @@ class FrameBuffer {
     cv_.notify_all();
   }
 
+  // For SourceEngine's trace log: how the current window's production ended.
+  bool EndOfStreamReached() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return endOfStream_;
+  }
+  std::optional<std::string> ErrorMessage() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return error_;
+  }
+
   uint64_t Generation() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return generation_;

@@ -5,8 +5,7 @@
 #include <cstring>
 #include <vector>
 
-#include "mxf/file_byte_source.h"
-#include "net/http_byte_source.h"
+#include "mxf/byte_cache.h"
 
 namespace mxfsrc {
 
@@ -33,13 +32,8 @@ bool UlPrefixEquals(const Ul& key, const uint8_t* prefix, size_t prefixLen) {
 
 bool UlEquals(const Ul& a, const Ul& b) { return UlPrefixEquals(a, b.data(), b.size()); }
 
-MxfReader::MxfReader(const std::string& path, const std::string& httpHeaders) {
-  if (IsHttpUrl(path)) {
-    source_ = std::make_unique<HttpByteSource>(path, httpHeaders);
-  } else {
-    source_ = std::make_unique<FileByteSource>(path);
-  }
-}
+MxfReader::MxfReader(const std::string& path, const std::string& httpHeaders)
+    : source_(OpenByteSource(path, httpHeaders)) {}
 
 MxfReader::MxfReader(std::unique_ptr<IByteSource> source) : source_(std::move(source)) {}
 

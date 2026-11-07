@@ -63,6 +63,8 @@ add_library(mxf_core STATIC
   src/mxf/klv.cpp
   src/mxf/klv.h
   src/mxf/file_byte_source.cpp
+  src/mxf/byte_cache.cpp
+  src/mxf/byte_cache.h
   src/mxf/file_open.cpp
   src/mxf/integrity.cpp
   src/mxf/integrity.h

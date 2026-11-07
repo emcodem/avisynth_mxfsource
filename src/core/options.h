@@ -16,6 +16,9 @@ inline constexpr int kAutoBufferMinFrames = 16;
 inline constexpr int kAutoBufferMaxFrames = 300;      // at open
 inline constexpr int kAutoBufferGrowMaxFrames = 1024;  // after growth
 inline constexpr int kAutoEagerFrames = 8;
+// read_cache auto sizing, see OpenOptions.
+inline constexpr int kAutoReadCacheNetworkMb = 256;
+inline constexpr int kAutoReadCacheLocalMb = 64;
 
 struct OpenOptions {
   // Sliding ring-buffer capacity (frames): how much decoded history the
@@ -60,6 +63,14 @@ struct OpenOptions {
   // long-GOP, where decoding starts at the preceding keyframe anyway.
   // Exposed to scripts as MxfSource(..., back_seek_preroll=N), 0 or more.
   int back_seek_preroll = 8;
+
+  // Read cache in MB, shared by every reader of the file (see ByteCache):
+  // a decoder restart or a separately decoded frame reads bytes read before
+  // from memory instead of from the source again. -1 (the default) = auto:
+  // kAutoReadCacheNetworkMb for HTTP, UNC paths and mapped network drives,
+  // kAutoReadCacheLocalMb for local files (the OS caches those already).
+  // 0 turns it off. Exposed to scripts as MxfSource(..., read_cache=N).
+  int read_cache = -1;
 
   // Absolute path to a file the ServeStats summary (see SourceEngine) is
   // appended to when the engine is destroyed, in addition to the existing
@@ -167,6 +178,14 @@ struct OpenOptions {
   // regardless of this setting. Exposed to scripts as
   // MxfSource(..., debug=true).
   bool debug = false;
+
+  // Log one line per video frame request (frame, served from the buffer or
+  // decoded separately, after a decoder restart or not, time taken) and
+  // every decoder run (start position, keyframe, how it ended), to the log
+  // file and, with `debug`, stderr. For diagnosing seek and playback
+  // behaviour in an editor; slows a fast encode down. Exposed to scripts as
+  // MxfSource(..., trace=true).
+  bool trace = false;
 
   // Check every entry of the video index (built locally or fetched via
   // index_url) against the essence before opening -- see core/

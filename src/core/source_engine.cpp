@@ -195,31 +195,75 @@ SourceEngine::~SourceEngine() {
     std::string summary;
     {
       std::lock_guard<std::mutex> lock(stats_.mutex);
-      summary = "[MxfSource] " + path_ + ": served " + std::to_string(stats_.bufferedCount) +
-                " frame(s) from buffer, " + std::to_string(stats_.nonBufferedFrames.size()) +
-                " frame(s) via fallback re-decode (not buffered)";
-      if (stats_.growths > 0) {
-        summary += ", buffer grown " + std::to_string(stats_.growths) + " time(s) to " +
-                   std::to_string(videoBuffer_->Capacity()) + " frames";
-      }
-      if (stats_.repositions > 0) {
-        summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump";
-      }
-      if (!stats_.nonBufferedFrames.empty()) {
-        summary += ": " + FormatFrameRanges(stats_.nonBufferedFrames);
-      }
+      summary = ServeSummaryLocked(/*interim=*/false);
     }
     AppendLogLine(LogLevel::kInfo, summary);
   }
+}
+
+std::string SourceEngine::ServeSummaryLocked(bool interim) const {
+  std::string summary = "[MxfSource] " + path_ + (interim ? ": so far served " : ": served ") +
+                        std::to_string(stats_.bufferedCount) + " frame(s) from buffer, " +
+                        std::to_string(stats_.nonBufferedFrames.size()) +
+                        " frame(s) via fallback re-decode (not buffered)";
+  if (stats_.growths > 0) {
+    summary += ", buffer grown " + std::to_string(stats_.growths) + " time(s) to " +
+               std::to_string(videoBuffer_->Capacity()) + " frames";
+  }
+  if (stats_.repositions > 0) {
+    summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump";
+  }
+  if (byteCache_) {
+    auto mb = [](uint64_t bytes) { return std::to_string((bytes + (1u << 19)) >> 20); };
+    summary += ", read " + mb(byteCache_->FetchedBytes()) + " MB from the source for " +
+               mb(byteCache_->ServedBytes()) + " MB parsed (read cache " + mb(byteCache_->CapacityBytes()) + " MB)";
+  }
+  const size_t from = interim ? stats_.loggedNonBuffered : 0;
+  if (stats_.nonBufferedFrames.size() > from) {
+    const std::vector<int64_t> frames(stats_.nonBufferedFrames.begin() + static_cast<std::ptrdiff_t>(from),
+                                      stats_.nonBufferedFrames.end());
+    summary += (interim && from > 0 ? "; since the last summary: " : ": ") + FormatFrameRanges(frames);
+  }
+  return summary;
+}
+
+void SourceEngine::MaybeLogProgress() {
+  constexpr auto kProgressLogInterval = std::chrono::seconds(10);
+  const auto now = std::chrono::steady_clock::now();
+  std::string summary;
+  {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    if (now - stats_.lastProgressLog < kProgressLogInterval) return;
+    const int64_t requests = stats_.bufferedCount + static_cast<int64_t>(stats_.nonBufferedFrames.size());
+    stats_.lastProgressLog = now;
+    if (requests == stats_.loggedRequests) return;
+    summary = ServeSummaryLocked(/*interim=*/true);
+    stats_.loggedRequests = requests;
+    stats_.loggedNonBuffered = stats_.nonBufferedFrames.size();
+  }
+  AppendLogLine(LogLevel::kInfo, summary);
 }
 
 OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& options) {
   path_ = path;
   logFile_ = options.logfile;
   debug_ = options.debug;
+  trace_ = options.trace;
   httpHeaders_ = options.http_headers;
   AppendLogLine(LogLevel::kInfo, "[MxfSource] mxfsource " MXFSRC_VERSION ", opening " + path_);
-  reader_ = std::make_unique<MxfReader>(path, httpHeaders_);
+  {
+    auto source = OpenByteSource(path, httpHeaders_);
+    const int64_t cacheMb = options.read_cache >= 0 ? options.read_cache
+                                                     : (IsNetworkSource(path) ? kAutoReadCacheNetworkMb
+                                                                              : kAutoReadCacheLocalMb);
+    if (source->IsOpen() && cacheMb > 0) {
+      byteCache_ = std::make_shared<ByteCache>(path, httpHeaders_, source->Size(), source->SupportsRandomAccess(),
+                                               static_cast<uint64_t>(cacheMb) << 20);
+      reader_ = std::make_unique<MxfReader>(std::make_unique<CachingByteSource>(byteCache_, std::move(source)));
+    } else {
+      reader_ = std::make_unique<MxfReader>(std::move(source));
+    }
+  }
   if (!reader_->IsOpen()) {
     std::string error = "failed to open file: " + path;
     const std::string detail = reader_->LastError();
@@ -431,6 +475,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   autoBuffer_ = options.buffer_frames <= 0;
   const int capacity = autoBuffer_ ? kAutoBufferMinFrames : options.buffer_frames;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : kAutoEagerFrames;
+  eagerFrames_ = margin;
   backSeekPreroll_ = std::max(0, options.back_seek_preroll);
   // firstHostFrame_ (0 unless a start_frame hint is in effect) re-anchors
   // both ring buffers so their very first produced index is the hint's
@@ -468,7 +513,53 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   return {OpenStatus::kOk, ""};
 }
 
+namespace {
+// What served the current thread's last GetVideoFrameImpl call, for the
+// trace log (OpenOptions::trace).
+thread_local const char* tl_servedBy = "";
+thread_local bool tl_restarted = false;
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Nothing served from the buffer for this long: nobody is reading at the
+// producer's position (an editor after a seek), so a request away from it
+// may move the producer at once. Requests from Prefetch threads, temporal
+// filters or two positions read in turn come milliseconds apart.
+constexpr int64_t kIdleBeforeRestartNs = 500000000;
+}  // namespace
+
+void SourceEngine::NoteBufferedServe(uint64_t request) {
+  stats_.RecordBufferedServe();
+  lastBufferedRequest_ = request;
+  lastBufferedServeNs_ = SteadyNowNs();
+  tl_servedBy = "buffer";
+}
+
 FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFrame>& out, std::string* errorOut) {
+  if (!trace_) return GetVideoFrameImpl(n, out, errorOut);
+  tl_servedBy = "?";
+  tl_restarted = false;
+  const auto start = std::chrono::steady_clock::now();
+  const FetchStatus status = GetVideoFrameImpl(n, out, errorOut);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  char msBuf[32];
+  std::snprintf(msBuf, sizeof(msBuf), "%.1f", ms);
+  std::string line = "[MxfSource] trace: frame " + std::to_string(n) + " ";
+  if (status == FetchStatus::kOk) {
+    line += std::string("from ") + tl_servedBy + (tl_restarted ? " after a decoder restart" : "");
+  } else {
+    line += "failed (" + std::string(errorOut ? *errorOut : "") + ")";
+  }
+  line += ", " + std::string(msBuf) + " ms; buffer " + std::to_string(videoBuffer_->LowestValid()) + "-" +
+          std::to_string(videoBuffer_->HighestProduced());
+  AppendLogLine(LogLevel::kInfo, line);
+  return status;
+}
+
+FetchStatus SourceEngine::GetVideoFrameImpl(int64_t n, std::shared_ptr<NormalizedFrame>& out, std::string* errorOut) {
   // A forward request far enough beyond what's actually been produced so far
   // behaves exactly like a backward seek past the window: the ring buffer's
   // blocking Get() would just wait for the single background decode thread
@@ -489,6 +580,28 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   // restarted producer like any other, and the frames after it follow from
   // the buffer. SeekAndDecode remains for when that isn't possible.
   const uint64_t request = ++videoRequestSeq_;
+  MaybeLogProgress();
+
+  // A forward jump shorter than the buffer used to wait for the producer to
+  // decode every frame up to it (real report: AvsPmod over HTTP, seek to
+  // 3000 then play from 3200 waited 2.1 s; 250 frames ahead took 3.1 s vs
+  // 0.5 s for a restart). When nobody has read from the buffer for a while
+  // and the target's keyframe lies beyond the producer (FFMS2's rule:
+  // restarting there decodes fewer frames than continuing), restart there.
+  // Not while frames are being served (Prefetch, temporal filters, a
+  // single-threaded encode of two positions within the buffer): those keep
+  // the buffer they are reading from.
+  {
+    const int64_t hp = videoBuffer_->HighestProduced();
+    if (n > hp + eagerFrames_ && n <= hp + videoBuffer_->Capacity() &&
+        SteadyNowNs() - lastBufferedServeNs_.load() >= kIdleBeforeRestartNs) {
+      const int preroll = std::min(backSeekPreroll_, videoBuffer_->Capacity() / 2);
+      const int64_t restartAt = std::max<int64_t>(0, n - preroll);
+      const int64_t keyframe = ResolveSeekStart(originSkip_ + restartAt).editUnit - originSkip_;
+      if (keyframe > hp + 1) RepositionProducer(n, Jump::kNearAhead);
+    }
+  }
+
   if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) RepositionProducer(n);
   if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) {
     auto seeked = SeekAndDecode(n);
@@ -501,13 +614,13 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
     }
     out = seeked;
     stats_.RecordNonBufferedServe(n);
+    tl_servedBy = "separate decode (fallback)";
     return FetchStatus::kOk;
   }
 
   FetchStatus status = videoBuffer_->Get(n, out, errorOut);
   if (status == FetchStatus::kOk) {
-    stats_.RecordBufferedServe();
-    lastBufferedRequest_ = request;
+    NoteBufferedServe(request);
     return status;
   }
   // kEndOfStream: DecodeThreadMain legitimately reached streamInfo_.numFrames
@@ -546,26 +659,34 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
     }
   }
 
-  // A far backward jump (Trim segments spliced out of order, Loop, scrubbing
-  // back in an editor) is the Trim problem in reverse: the producer would
-  // stay where it was and every following frame would be evicted too and
-  // re-decoded from its keyframe. Move the producer back -- but only once
-  // nothing has read from the buffer for a few requests. Two far-apart
-  // positions read in turn (Interleave or StackHorizontal of a clip and a
-  // Trim of it) keep the producer busy at one of them; moving it would
-  // throw that position away each time, so the other one stays on the
-  // fallback. The first few frames after a real jump also take the
-  // fallback, a one-off cost.
+  // A jump back below the buffer (Trim segments spliced out of order, Loop,
+  // playing from a little before where an editor last seeked to) is the
+  // Trim problem in reverse: the producer would stay where it was and every
+  // following frame would be evicted too and re-decoded from its keyframe
+  // (real report: seek to 3265 in AvsPmod, play from 3212 -- frames
+  // 3212-3256 at ~0.4 s each over HTTP). Move the producer back -- but only
+  // once nothing has read from the buffer for a few requests, however near
+  // or far below it the request is. Requests still served from the buffer
+  // in between mean someone keeps reading at the producer's position: a
+  // temporal filter or Prefetch thread reaching just below it (auto growth
+  // above handles that), or two far-apart positions read in turn
+  // (Interleave or StackHorizontal of a clip and a Trim of it), where
+  // moving the producer would throw that position away each time; those
+  // stay on the fallback. The first few frames after a real jump also take
+  // the fallback, a one-off cost -- unless nothing has come from the buffer
+  // for kIdleBeforeRestartNs: then nobody is reading there (an
+  // editor seeked, paused, then played from a little before the seek), and
+  // the producer moves at once (real report: AvsPmod over HTTP stalled
+  // ~2 s on those 4 fallback frames, each ~0.4 s, every time play was
+  // pressed). Positions read in turn come milliseconds apart.
   if (status == FetchStatus::kEvicted) {
     constexpr uint64_t kIdleRequestsBeforeBackwardRestart = 4;
-    const int64_t lowest = videoBuffer_->LowestValid();
-    if (n < lowest - videoBuffer_->Capacity() &&
-        request - lastBufferedRequest_.load() > kIdleRequestsBeforeBackwardRestart &&
-        RepositionProducer(n, /*backward=*/true)) {
+    const bool idle = request - lastBufferedRequest_.load() > kIdleRequestsBeforeBackwardRestart ||
+                      SteadyNowNs() - lastBufferedServeNs_.load() >= kIdleBeforeRestartNs;
+    if (idle && RepositionProducer(n, Jump::kBelow)) {
       status = videoBuffer_->Get(n, out, errorOut);
       if (status == FetchStatus::kOk) {
-        stats_.RecordBufferedServe();
-        lastBufferedRequest_ = request;
+        NoteBufferedServe(request);
         return status;
       }
       if (status != FetchStatus::kEvicted && status != FetchStatus::kError) return status;
@@ -588,6 +709,7 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   }
   out = seeked;
   stats_.RecordNonBufferedServe(n);
+  tl_servedBy = "separate decode (fallback)";
   return FetchStatus::kOk;
 }
 
@@ -745,8 +867,14 @@ SourceEngine::SeekStartPoint SourceEngine::ResolveSeekStart(int64_t essenceTarge
   return {startOffset, startEditUnit, reorderDelay};
 }
 
+std::unique_ptr<MxfReader> SourceEngine::OpenReader() const {
+  if (byteCache_) return std::make_unique<MxfReader>(std::make_unique<CachingByteSource>(byteCache_, nullptr));
+  return std::make_unique<MxfReader>(path_, httpHeaders_);
+}
+
 std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
-  MxfReader freshReader(path_, httpHeaders_);
+  const auto freshReaderOwner = OpenReader();
+  MxfReader& freshReader = *freshReaderOwner;
   if (!freshReader.IsOpen()) return nullptr;
 
   auto freshDecoder = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
@@ -806,6 +934,24 @@ void SourceEngine::DecodeThreadMain() {
   uint64_t audioGen = audioBuffer_ ? audioBuffer_->Generation() : 0;
   for (;;) {
     ProduceFrom(start, fromOpen, videoGen, audioGen);
+    if (trace_) {
+      std::string how;
+      if (restartRequested_) {
+        how = "a restart elsewhere was requested";
+      } else if (videoBuffer_->IsShutdown()) {
+        how = "shutdown";
+      } else if (auto err = videoBuffer_->ErrorMessage()) {
+        how = "error: " + *err;
+      } else if (videoBuffer_->EndOfStreamReached()) {
+        how = "end of stream";
+      } else {
+        how = "stopped";
+      }
+      AppendLogLine(LogLevel::kInfo, "[MxfSource] trace: decoder run from frame " + std::to_string(start) +
+                                         " ended (" + how + "), buffer " +
+                                         std::to_string(videoBuffer_->LowestValid()) + "-" +
+                                         std::to_string(videoBuffer_->HighestProduced()));
+    }
     // Production ended (end of stream, error, shutdown) or a consumer asked
     // for a restart elsewhere (RepositionProducer). Either way, wait for the
     // next restart or the engine shutting down.
@@ -828,7 +974,7 @@ void SourceEngine::GrowBuffers(int newCapacity) {
   if (audioBuffer_) audioBuffer_->Grow(newCapacity);
 }
 
-bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
+bool SourceEngine::RepositionProducer(int64_t hostFrame, Jump jump) {
   if (hostFrame < 0 || hostFrame >= streamInfo_.numFrames) return false;
   int64_t start = hostFrame;
   {
@@ -837,10 +983,23 @@ bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
     // Another consumer thread may have moved the producer in the meantime
     // (AviSynth's Prefetch asks for several neighbouring frames at once).
     const int capacity = videoBuffer_->Capacity();
-    if (backward ? hostFrame >= videoBuffer_->LowestValid() - capacity
-                 : hostFrame <= videoBuffer_->HighestProduced() + capacity) {
-      return true;
+    bool alreadyMoved = false;
+    switch (jump) {
+      case Jump::kFarAhead:
+        alreadyMoved = hostFrame <= videoBuffer_->HighestProduced() + capacity;
+        break;
+      case Jump::kBelow:
+        alreadyMoved = hostFrame >= videoBuffer_->LowestValid();
+        break;
+      case Jump::kNearAhead:
+        // Another thread's restart just now covers it (its window starts at
+        // or below hostFrame), or the producer caught up meanwhile.
+        alreadyMoved = hostFrame <= videoBuffer_->HighestProduced() + eagerFrames_ ||
+                       (hostFrame >= videoBuffer_->LowestValid() &&
+                        SteadyNowNs() - lastRestartNs_.load() < kIdleBeforeRestartNs);
+        break;
     }
+    if (alreadyMoved) return true;
     // Restart a few frames early (OpenOptions::back_seek_preroll): a
     // temporal filter after the jump (e.g. TemporalSoften radius 3 behind
     // Trim) also asks for the frames just before it, and each of those would
@@ -852,11 +1011,15 @@ bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
     videoBuffer_->Reset(start);
     pendingRestart_ = start;
     restartRequested_ = true;
+    lastRestartNs_ = SteadyNowNs();
   }
   repositionCv_.notify_all();
   stats_.RecordReposition();
+  tl_restarted = true;
   AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(hostFrame) +
-                (backward ? " requested far behind" : " requested far ahead of") +
+                (jump == Jump::kBelow       ? " requested below the buffer, behind"
+                 : jump == Jump::kNearAhead ? " requested after a pause, its keyframe beyond"
+                                            : " requested far ahead of") +
                 " the decode position; restarting the decoder at frame " +
                 std::to_string(start));
   return true;
@@ -887,6 +1050,11 @@ void SourceEngine::ProduceFrom(int64_t startHostFrame, bool fromOpen, uint64_t v
     const SeekStartPoint seek = ResolveSeekStart(originSkip_ + startHostFrame);
     hintStartEditUnit = seek.editUnit;
     hintReorderDelay = seek.reorderDelay;
+    if (trace_) {
+      AppendLogLine(LogLevel::kInfo, "[MxfSource] trace: decoder run starts at frame " +
+                                         std::to_string(startHostFrame) + ", decoding from keyframe " +
+                                         std::to_string(seek.editUnit - originSkip_));
+    }
     walker_.reset();
     walker_ = std::make_unique<EssenceWalker>(*reader_, seek.byteOffset, streamInfo_.videoTrackNumber,
                                                streamInfo_.hasVideo, walkerAudioTracks_, WalkerOptions());
@@ -1316,7 +1484,8 @@ FetchStatus SourceEngine::FetchAudioBlock(int64_t hostEditUnit, uint64_t byteOff
 }
 
 std::shared_ptr<AudioBlock> SourceEngine::FreshReadAudioBlock(uint64_t byteOffset) {
-  MxfReader freshReader(path_, httpHeaders_);
+  const auto freshReaderOwner = OpenReader();
+  MxfReader& freshReader = *freshReaderOwner;
   if (!freshReader.IsOpen()) return nullptr;
 
   std::vector<std::array<uint8_t, 4>> audioTrackNumbers;

@@ -131,6 +131,38 @@ void TestDroppedConnectionRecoversViaRetry() {
   CHECK(server.RequestCount() >= 1);
 }
 
+// SeekForRange (used by ByteCache after a jump) requests just the range;
+// reading on past its end continues with a second, open-ended request.
+void TestBoundedRangeContinuesPastItsEnd() {
+  auto pattern = MakePattern(1'000'000);
+  MiniHttpServer server(pattern);
+  HttpByteSource src(server.BaseUrl() + "/test.mxf", "");
+  CHECK(src.IsOpen());
+  const int afterProbe = server.RequestCount();
+
+  CHECK(src.SeekForRange(300'000, 400'000));
+  std::vector<uint8_t> buf(250'000);  // crosses the range end at 400'000
+  CHECK(src.ReadBytes(buf.data(), buf.size()));
+  CHECK(MatchesPattern(buf.data(), buf.size(), 300'000));
+  CHECK(src.Tell() == 550'000);
+  CHECK(server.RequestCount() == afterProbe + 2);
+}
+
+// The known-size constructor (another reader of a URL already opened) sends
+// no probe request.
+void TestKnownSizeSkipsProbe() {
+  auto pattern = MakePattern(200'000);
+  MiniHttpServer server(pattern);
+  HttpByteSource src(server.BaseUrl() + "/test.mxf", "", pattern.size(), true);
+  CHECK(src.IsOpen());
+  CHECK(src.Size() == pattern.size());
+  CHECK(server.RequestCount() == 0);
+  CHECK(src.Seek(1000));
+  std::vector<uint8_t> buf(500);
+  CHECK(src.ReadBytes(buf.data(), buf.size()));
+  CHECK(MatchesPattern(buf.data(), buf.size(), 1000));
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +173,8 @@ int main() {
   TestNonRangeCapableServerFallback();
   TestForced403SurfacesExpiredHint();
   TestDroppedConnectionRecoversViaRetry();
+  TestBoundedRangeContinuesPastItsEnd();
+  TestKnownSizeSkipsProbe();
 
   if (g_failures == 0) {
     std::cout << "all http_byte_source tests passed" << std::endl;

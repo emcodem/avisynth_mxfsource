@@ -486,6 +486,50 @@ side and the other side stays on the fallback, as before. Tests:
 `TestBackwardJumpRepositionsOnceIdle` (fails without the change),
 `TestAlternatingFarPositionsDoNotThrash`.
 
+Near jumps back (2026-11-07, AvsPmod over HTTP): seek to 3265 (restart at
+3257), play from 3212 -- frames 3212-3256 each via fallback at ~0.4 s
+(80 ms latency, 200 Mbit/s), about 18 s at 2.5 fps, then normal speed.
+The backward rule only applied more than a buffer length below the
+window. Now any request below the window moves the producer after the 4
+idle requests. Test: `TestPlayFromJustBelowBufferRestarts`.
+
+Then (same day): with nothing served from the buffer for 0.5 s (an editor
+after a seek), a request below the buffer restarts at once instead of after
+4 fallback frames, and a forward jump shorter than the buffer restarts when
+the target's keyframe lies beyond the producer (FFMS2's rule) instead of
+decoding every frame up to it (seek 3000, play from 3200 over HTTP: 2.1 s
+-> 0.4 s). Without the pause (encodes, Prefetch, positions read in turn)
+both keep the old behaviour. Tests: `TestPlayAfterPauseBelowBufferRestartsAtOnce`,
+`TestNearForwardJumpAfterPauseRestarts`. `trace=true` logs every request
+and decoder run. Checked: editor scenarios over the slow HTTP server
+(tools/slow_http_server.py, 80 ms / 200 Mbit/s), ten encode chains
+bit-identical (framemd5) to per-segment references, sequential speed
+unchanged.
+
+Read cache (2026-11-07): every restart and every fallback re-read its GOP
+from the source, with a fresh connection per fallback; over HTTP Reverse()
+of 300 XDCAM HD frames moved ~690 MB (~2.3 MB per frame of a 0.3 MB/frame
+file). Now `ByteCache` (src/mxf/byte_cache.h): 64 KiB pages, LRU, shared by
+the producer's reader and every one-off reader; one-off readers open their
+own source only on a miss (HTTP without the probe), and after a jump the
+HTTP request is bounded by the next cached page (`SeekForRange`). Parameter
+`read_cache` (MB; auto 256 network/HTTP/UNC, 64 local; 0 off). Measured,
+throttled HTTP (80 ms, 200 Mbit/s): Reverse 300 frames 38.6 s / 692 MB ->
+12.9 s / 124 MB (open included), forward unchanged; editor back-steps 40 ms
+apart 5.1 s -> 2.6 s. Local and loopback UNC: Reverse 5-10 % faster,
+sequential 1-2 % slower (one more memcpy per byte). Ten encode chains
+bit-identical. Tests: mxf_byte_cache_tests, two new HTTP tests.
+
+Next for Reverse (proposed, not done): recognise backward stepping (request
+just below the buffer right after one just above it) and restart at once
+with a large lead (about half the buffer) instead of 4 fallbacks plus
+`back_seek_preroll` frames; measured by hand with back_seek_preroll=128:
+17.5 s -> 4.8 s for 1000 HD frames locally.
+
+Noise: every restart logs "leading audio edit unit near the start_frame
+hint's own seek-start point is unreachable" at info level; harmless but
+should be logged once, or only with trace.
+
 Still open, for the "forward decoding preferred, everything else supported"
 goal:
 - Alternating far positions: half the frames via the fallback. Proper fix is

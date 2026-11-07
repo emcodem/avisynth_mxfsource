@@ -2,6 +2,7 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -111,6 +112,19 @@ HttpByteSource::HttpByteSource(const std::string& url, const std::string& rawHea
   opened_ = ProbeSizeAndRangeSupport();
 }
 
+HttpByteSource::HttpByteSource(const std::string& url, const std::string& rawHeaders, uint64_t knownSize,
+                               bool rangeSupported)
+    : url_(url), totalSize_(knownSize), rangeSupported_(rangeSupported) {
+  EnsureCurlGlobalInit();
+  easy_ = curl_easy_init();
+  if (!easy_) {
+    lastError_ = "failed to initialize libcurl easy handle";
+    return;
+  }
+  headerList_ = BuildHeaderList(rawHeaders);
+  opened_ = true;
+}
+
 HttpByteSource::~HttpByteSource() {
   StopTransfer();
   if (easy_) curl_easy_cleanup(static_cast<CURL*>(easy_));
@@ -200,7 +214,7 @@ size_t HttpByteSource::StreamingWriteCallback(char* ptr, size_t size, size_t nme
   return n;
 }
 
-void HttpByteSource::RunTransfer(uint64_t fromByte) {
+void HttpByteSource::RunTransfer(uint64_t fromByte, uint64_t endByte) {
   CURL* easy = static_cast<CURL*>(easy_);
   for (int attempt = 0; attempt <= kMaxRetries; ++attempt) {
     uint64_t rangeStart;
@@ -216,12 +230,18 @@ void HttpByteSource::RunTransfer(uint64_t fromByte) {
       // fromByte again -- otherwise a mid-transfer retry would duplicate
       // already-buffered bytes.
       rangeStart = fromByte + deliveredThisTransfer_;
+      if (endByte != 0 && rangeStart >= endByte) {  // a retry after everything arrived
+        transferDone_ = true;
+        cv_.notify_all();
+        return;
+      }
     }
-    const std::string rangeStr = std::to_string(rangeStart) + "-";
+    const std::string rangeStr =
+        std::to_string(rangeStart) + "-" + (endByte != 0 ? std::to_string(endByte - 1) : std::string());
 
     curl_easy_reset(easy);
     ApplyCommonOptions(easy, url_, headerList_);
-    if (rangeStart > 0) curl_easy_setopt(easy, CURLOPT_RANGE, rangeStr.c_str());
+    if (rangeStart > 0 || endByte != 0) curl_easy_setopt(easy, CURLOPT_RANGE, rangeStr.c_str());
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, &HttpByteSource::StreamingWriteCallback);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, this);
 
@@ -255,7 +275,7 @@ void HttpByteSource::RunTransfer(uint64_t fromByte) {
   }
 }
 
-bool HttpByteSource::StartTransfer(uint64_t fromByte) {
+bool HttpByteSource::StartTransfer(uint64_t fromByte, uint64_t endByte) {
   StopTransfer();
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -271,7 +291,30 @@ bool HttpByteSource::StartTransfer(uint64_t fromByte) {
   // itself (a no-op update), Seek()'s restart branches pass the seek
   // target, so this is always correct, not just for the lazy-start case.
   logicalPos_ = fromByte;
-  worker_ = std::thread([this, fromByte] { RunTransfer(fromByte); });
+  rangeEnd_ = endByte;
+  worker_ = std::thread([this, fromByte, endByte] { RunTransfer(fromByte, endByte); });
+  return true;
+}
+
+bool HttpByteSource::ContinueTransfer() {
+  // Only called once the bounded transfer finished (transferDone_ without
+  // an error), so the worker is exiting on its own; the buffer holds
+  // [logicalPos_, rangeEnd_) and stays.
+  if (worker_.joinable()) worker_.join();
+  uint64_t from;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Where the buffered bytes end, not rangeEnd_: a server that sent less
+    // than asked must not leave a gap.
+    from = logicalPos_ + buffer_.size();
+    transferDone_ = false;
+    transferError_ = false;
+    transferErrorMsg_.clear();
+    deliveredThisTransfer_ = 0;
+    abortRequested_ = false;
+  }
+  rangeEnd_ = 0;
+  worker_ = std::thread([this, from] { RunTransfer(from, 0); });
   return true;
 }
 
@@ -292,11 +335,20 @@ bool HttpByteSource::EnsureStreamStarted() {
 
 bool HttpByteSource::FillAtLeast(size_t n) {
   if (!EnsureStreamStarted()) return false;
-  std::unique_lock<std::mutex> lock(mutex_);
-  cv_.wait(lock, [this, n] { return buffer_.size() >= n || transferDone_; });
-  if (buffer_.size() >= n) return true;
-  if (transferError_) lastError_ = transferErrorMsg_;
-  return false;
+  for (;;) {
+    bool continueOpenEnded = false;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this, n] { return buffer_.size() >= n || transferDone_; });
+      if (buffer_.size() >= n) return true;
+      if (transferError_) {
+        lastError_ = transferErrorMsg_;
+        return false;
+      }
+      continueOpenEnded = rangeEnd_ != 0 && rangeEnd_ < totalSize_;
+    }
+    if (!continueOpenEnded || !ContinueTransfer()) return false;
+  }
 }
 
 bool HttpByteSource::ReadBytes(void* dst, size_t n) {
@@ -304,10 +356,8 @@ bool HttpByteSource::ReadBytes(void* dst, size_t n) {
   if (!FillAtLeast(n)) return false;
   std::lock_guard<std::mutex> lock(mutex_);
   auto* out = static_cast<uint8_t*>(dst);
-  for (size_t i = 0; i < n; ++i) {
-    out[i] = buffer_.front();
-    buffer_.pop_front();
-  }
+  std::copy_n(buffer_.begin(), n, out);
+  buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(n));
   logicalPos_ += n;
   cv_.notify_all();  // wake the writer if it was blocked on a full buffer
   return true;
@@ -359,5 +409,14 @@ bool HttpByteSource::Seek(uint64_t pos) {
 }
 
 bool HttpByteSource::Skip(uint64_t n) { return Seek(logicalPos_ + n); }
+
+bool HttpByteSource::SeekForRange(uint64_t pos, uint64_t endHint) {
+  if (!rangeSupported_ || endHint <= pos) return Seek(pos);
+  if (worker_.joinable()) {
+    if (pos == logicalPos_) return true;
+    if (pos > logicalPos_ && pos - logicalPos_ <= kSmallSeekThreshold) return DiscardBytes(pos - logicalPos_);
+  }
+  return StartTransfer(pos, (std::min)(endHint, totalSize_));
+}
 
 }  // namespace mxfsrc

@@ -258,13 +258,18 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const bool debug = args[10].AsBool(false);
   const bool verify = args[11].AsBool(false);
   const int backSeekPreroll = args[12].AsInt(OpenOptions().back_seek_preroll);
+  const bool trace = args[13].AsBool(false);
+  const int readCache = args[14].AsInt(OpenOptions().read_cache);
   if (backSeekPreroll < 0) env->ThrowError("MxfSource: back_seek_preroll must not be negative");
+  if (readCache < -1) env->ThrowError("MxfSource: read_cache must be -1 (auto), 0 (off) or a size in MB");
 
   auto engine = std::make_unique<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
   options.back_seek_preroll = backSeekPreroll;
+  options.trace = trace;
+  options.read_cache = readCache;
   options.logfile = logFile;
   options.http_headers = httpHeaders;
   options.handle_origin = handleOrigin;
@@ -318,7 +323,7 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
   env->AddFunction(
       "MxfSource",
       "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
-      "[indexurl]s[start_frame]i[strict]b[debug]b[verify]b[back_seek_preroll]i",
+      "[indexurl]s[start_frame]i[strict]b[debug]b[verify]b[back_seek_preroll]i[trace]b[read_cache]i",
       CreateMxfSource, nullptr);
   env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b[verify]b", CreateMxfExtractIndex,
                    nullptr);

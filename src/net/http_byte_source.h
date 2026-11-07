@@ -43,6 +43,9 @@ class HttpByteSource : public IByteSource {
   // ignored characters/lines are tolerated defensively but callers should
   // pass well-formed header lines (see OpenOptions::http_headers).
   HttpByteSource(const std::string& url, const std::string& rawHeaders);
+  // Skips the probe request: for another reader of a URL whose size and
+  // range support an earlier instance already found out (see ByteCache).
+  HttpByteSource(const std::string& url, const std::string& rawHeaders, uint64_t knownSize, bool rangeSupported);
   ~HttpByteSource() override;
   HttpByteSource(const HttpByteSource&) = delete;
   HttpByteSource& operator=(const HttpByteSource&) = delete;
@@ -53,6 +56,10 @@ class HttpByteSource : public IByteSource {
   uint64_t Size() const override { return totalSize_; }
   bool ReadBytes(void* dst, size_t n) override;
   bool Skip(uint64_t n) override;
+  // A jump requests only [pos, endHint) instead of the rest of the file, so
+  // the server doesn't push megabytes nobody reads before the next jump.
+  // Reading on past endHint continues with an open-ended request.
+  bool SeekForRange(uint64_t pos, uint64_t endHint) override;
   bool SupportsRandomAccess() const override { return rangeSupported_; }
   std::string LastError() const override { return lastError_; }
 
@@ -61,8 +68,12 @@ class HttpByteSource : public IByteSource {
   bool DiscardBytes(uint64_t n);
   bool EnsureStreamStarted();
   void StopTransfer();
-  bool StartTransfer(uint64_t fromByte);
-  void RunTransfer(uint64_t fromByte);
+  // endByte 0: open-ended (to the end of the file); otherwise exclusive end.
+  bool StartTransfer(uint64_t fromByte, uint64_t endByte = 0);
+  // A bounded transfer has delivered everything up to rangeEnd_ but the
+  // reader wants more: continue open-ended from there, keeping the buffer.
+  bool ContinueTransfer();
+  void RunTransfer(uint64_t fromByte, uint64_t endByte);
   bool FillAtLeast(size_t n);
 
   static size_t StreamingWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata);
@@ -92,6 +103,7 @@ class HttpByteSource : public IByteSource {
   std::atomic<bool> abortRequested_{false};
 
   uint64_t logicalPos_ = 0;  // next byte ReadBytes() will return
+  uint64_t rangeEnd_ = 0;    // exclusive end of the current transfer, 0 = open-ended
   std::thread worker_;
 };
 

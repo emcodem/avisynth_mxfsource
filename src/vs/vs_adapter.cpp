@@ -318,12 +318,24 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
     vsapi->mapSetError(out, "MxfSource: back_seek_preroll must not be negative");
     return;
   }
+  int traceErr = 0;
+  const int64_t traceArg = vsapi->mapGetInt(in, "trace", 0, &traceErr);
+  const bool trace = traceErr ? false : (traceArg != 0);
+  int readCacheErr = 0;
+  const int64_t readCacheArg = vsapi->mapGetInt(in, "read_cache", 0, &readCacheErr);
+  const int readCache = readCacheErr ? OpenOptions().read_cache : static_cast<int>(readCacheArg);
+  if (readCache < -1) {
+    vsapi->mapSetError(out, "MxfSource: read_cache must be -1 (auto), 0 (off) or a size in MB");
+    return;
+  }
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
   options.buffer_frames = bufferFrames;
   options.eagerdecode = eagerdecode;
   options.back_seek_preroll = backSeekPreroll;
+  options.trace = trace;
+  options.read_cache = readCache;
   options.logfile = logFileErr ? "" : logFile;
   options.http_headers = httpHeadersErr ? "" : httpHeaders;
   options.handle_origin = handleOrigin;
@@ -470,7 +482,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;back_seek_preroll:int:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;back_seek_preroll:int:opt;trace:int:opt;read_cache:int:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the

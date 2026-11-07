@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include "core/frame_buffer.h"
 #include "core/options.h"
 #include "mxf/audio_sample_index.h"
+#include "mxf/byte_cache.h"
 #include "mxf/essence_walker.h"
 #include "mxf/header_parser.h"
 #include "mxf/index_table.h"
@@ -43,6 +45,11 @@ struct ServeStats {
   int64_t repositions = 0;
   // How often buffer_frames=auto doubled the buffer (SourceEngine::GetVideoFrame).
   int64_t growths = 0;
+  // Interim summary (SourceEngine::MaybeLogProgress): when the last one was
+  // written, and how many requests / fallback frames it had covered.
+  std::chrono::steady_clock::time_point lastProgressLog = std::chrono::steady_clock::now();
+  int64_t loggedRequests = 0;
+  size_t loggedNonBuffered = 0;
 
   void RecordBufferedServe() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -223,11 +230,14 @@ class SourceEngine {
   // after a forward jump -- e.g. a script starting with Trim(1250, ...) --
   // was decoded separately via SeekAndDecode. Returns false if the engine is
   // shutting down or `hostFrame` is out of range; the caller then keeps its
-  // old fallback. `backward`: the frame lies far below the window instead
-  // (Trim segments spliced out of order, Loop, scrubbing back in an editor);
-  // the caller has already checked that nothing is still reading at the
-  // producer's current position (see GetVideoFrame).
-  bool RepositionProducer(int64_t hostFrame, bool backward = false);
+  // old fallback. kBelow: the frame lies below the window instead (Trim
+  // segments spliced out of order, Loop, playing from before the last seek
+  // in an editor). kNearAhead: ahead of the producer but within the buffer
+  // length, where restarting at its keyframe is cheaper than decoding every
+  // frame up to it. For both, the caller has already checked that nothing
+  // is still reading at the producer's current position (see GetVideoFrame).
+  enum class Jump { kFarAhead, kNearAhead, kBelow };
+  bool RepositionProducer(int64_t hostFrame, Jump jump = Jump::kFarAhead);
 
   // Grows both ring buffers to `newCapacity` (buffer_frames=auto).
   void GrowBuffers(int newCapacity);
@@ -298,6 +308,16 @@ class SourceEngine {
   // to OpenOptions::logfile (if set, every level) prefixed with a timestamp
   // -- stderr alone is invisible to GUI hosts.
   void AppendLogLine(LogLevel level, const std::string& line) const;
+  // The serve-stats summary; caller holds stats_.mutex. `interim`: "so far"
+  // wording, and only the fallback frames since stats_.loggedNonBuffered.
+  std::string ServeSummaryLocked(bool interim) const;
+  FetchStatus GetVideoFrameImpl(int64_t n, std::shared_ptr<NormalizedFrame>& out, std::string* errorOut);
+  void NoteBufferedServe(uint64_t request);
+  // Writes an interim summary while frames are being requested, at most
+  // every kProgressLogInterval and only when something was served since
+  // the last one -- the final summary only appears when the clip closes,
+  // which an editor may not do for a long time.
+  void MaybeLogProgress();
 
   // Options for every EssenceWalker this engine creates: no resync past
   // damage in strict mode, a bounded one otherwise, each damaged spot
@@ -334,6 +354,11 @@ class SourceEngine {
   int64_t hintStartEditUnit_ = 0;
   int hintReorderDelay_ = 0;
   std::unique_ptr<MxfReader> reader_;
+  // Read cache shared by reader_ and every one-off reader (OpenReader);
+  // null with read_cache=0.
+  std::shared_ptr<ByteCache> byteCache_;
+  // Another reader on the same file, through byteCache_ when there is one.
+  std::unique_ptr<MxfReader> OpenReader() const;
   MxfStreamInfo streamInfo_;
   // Best-effort Index Table lookup (mxf/index_table.h), built once in
   // Open() and never mutated afterward -- read-only, no locking needed,
@@ -363,6 +388,13 @@ class SourceEngine {
   // producer's position any more, so a far backward request may move it.
   std::atomic<uint64_t> videoRequestSeq_{0};
   std::atomic<uint64_t> lastBufferedRequest_{0};
+  // steady_clock nanoseconds of the last buffered serve: when nothing came
+  // from the buffer for a while (an editor seeked, paused, then played from
+  // a little before), a request below the buffer moves the producer at once.
+  std::atomic<int64_t> lastBufferedServeNs_{0};
+  std::atomic<int64_t> lastRestartNs_{0};  // steady_clock ns of the last RepositionProducer restart
+  int eagerFrames_ = 8;                     // the eagerdecode margin in effect
+  bool trace_ = false;  // OpenOptions::trace
   // OpenOptions::buffer_frames <= 0: capacity sized by memory, grown on
   // demand up to autoBufferMaxFrames_ (set in Open() from the frame size).
   bool autoBuffer_ = false;

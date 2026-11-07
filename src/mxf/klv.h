@@ -49,6 +49,11 @@ class IByteSource {
   virtual bool ReadBytes(void* dst, size_t n) = 0;
   virtual bool Skip(uint64_t n) = 0;
 
+  // Seek for a read that is expected to end at `endHint` (exclusive): a
+  // network source can then request just that range instead of the rest of
+  // the file. Reading on past it must still work. See ByteCache.
+  virtual bool SeekForRange(uint64_t pos, uint64_t /*endHint*/) { return Seek(pos); }
+
   // True if arbitrary byte ranges of this source can be fetched
   // independently of one another (e.g. concurrent ranged GETs against the
   // same URL) -- local files and a range-capable HTTP server are both true;

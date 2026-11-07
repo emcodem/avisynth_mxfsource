@@ -118,6 +118,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `buffer_frames` | int | auto | Ring-buffer window size, in frames -- how much decoded history is retained before the oldest frame is evicted. Not given: sized by memory, 1 GiB worth of frames (16-300; about 240 for HD, 30 for UHD 10-bit 4:2:2), doubled up to 4 GiB (at most 1024 frames) whenever a frame just below the window is requested, e.g. when stepping backwards in an editor. A given value is a fixed size and never grows. |
 | `eagerdecode` | int | `8` | How far ahead of the highest-ever-requested frame the background decode thread may eagerly race unsolicited, capped at `buffer_frames`. |
 | `back_seek_preroll` | int | `8` | When a jump far ahead or far back restarts the decoder, it starts this many frames before the requested frame (at most half the buffer), so a temporal filter after the jump and stepping back from there are served from the buffer. Usually free on long-GOP, where decoding starts at the preceding keyframe anyway; raise it for wide temporal filters or `Reverse()`. |
+| `read_cache` | int | auto | Read cache in MB, shared by everything that reads the file: a decoder restart or a separately decoded frame reads data read before from memory instead of from the source again. Auto: 256 for `http(s)://` URLs, UNC paths and mapped network drives, 64 for local files (Windows caches those too). `0` turns it off. See [Seeking and access patterns](#seeking-and-access-patterns). |
 | `logfile` | string | *(none)* | Path to append every plugin message to, warnings and informational ones (including the serve-stats summary when the clip closes), timestamped, regardless of `debug` -- stderr alone is invisible to GUI hosts. |
 | `httpheaders` | string | *(none)* | Raw `"Name: value\r\n..."` header block sent with every request when `file` is an `http(s)://` URL. |
 | `handle_origin` | bool | `true` | Whether to honor the MXF SourcePackage `Track.Origin` pre-roll trim (matches what an NLE shows for the edited sequence) or expose the full untrimmed essence. |
@@ -126,6 +127,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `start_frame` | int | `0` | Performance hint: the first frame the caller will request. The decode thread starts at the nearest keyframe before it (via the Index Table) instead of at frame 0, so a pipeline that processes a chunk far into the file is served from the ring buffer. Earlier frames still work, just without this optimization. Values `<= 0` or past the end are ignored. |
 | `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
 | `verify` | bool (VapourSynth: int) | `false` | Check every index entry against the essence before opening, see [Verifying an index](#verifying-an-index). With `strict`, a wrong index or damaged essence fails the open; without, wrong entries are repaired from the essence. |
+| `trace` | bool (VapourSynth: int) | `false` | Log one line per frame request (frame, from the buffer or decoded separately, after a decoder restart or not, time taken, buffer range) and every decoder run (start, keyframe, how it ended) to `logfile`, and with `debug` to stderr. For diagnosing seeking and playback in an editor; slows down a fast encode. |
 | `debug` | bool (VapourSynth: int) | `false` | Also print informational messages to stderr, such as the serve-stats summary when the clip closes (frames served from the ring buffer vs. via fallback re-decode). By default only warnings are printed (damaged essence, missing index, audio dropped, ...). |
 
 In VapourSynth, `MxfSource` returns a single video clip for files without
@@ -171,12 +173,21 @@ instead:
 | Access pattern | Example | What happens |
 |---|---|---|
 | Sequential | encoding a whole file | Everything from the buffer. |
-| Jump ahead | `Trim(1250, 7250)`, seeking forward in an editor | The decoder restarts at the target (from its keyframe), `back_seek_preroll` frames early; everything after it comes from the buffer. |
-| Jump back | `Trim(5000,6000) ++ Trim(100,200)`, `Loop()`, scrubbing back to the start and playing | The first 4 frames after the jump are decoded separately, then the decoder restarts there and the rest comes from the buffer. The wait keeps two positions read in turn (next row) from moving the decoder back and forth. |
+| Jump ahead | `Trim(1250, 7250)`, seeking forward in an editor | More than the buffer ahead: the decoder restarts at the target (from its keyframe), `back_seek_preroll` frames early; everything after it comes from the buffer. Less than the buffer ahead: if nothing was served from the buffer for 0.5 s (an editor after a seek) and the target's keyframe lies beyond the decoder, it restarts the same way; otherwise it decodes on up to the target. |
+| Jump back, near or far | `Trim(5000,6000) ++ Trim(100,200)`, `Loop()`, scrubbing back to the start and playing, playing from a little before the last seek in an editor | If nothing was served from the buffer for 0.5 s (an editor after a seek), the decoder restarts there at once. Otherwise the first 4 frames below the buffer are decoded separately, then the decoder restarts there and the rest comes from the buffer. The wait keeps a temporal filter or `Prefetch` thread reaching just below the buffer, and two positions read in turn (next row), from moving the decoder back and forth: as long as other requests are still served from the buffer, the decoder stays. |
 | Two positions far apart, read in turn | `Interleave(c, c.Trim(1000,0))`, `StackHorizontal` of a clip and a Trim of it | The decoder stays with one of them; the other is decoded frame by frame. |
 | Temporal filters, `Prefetch()` | `TemporalSoften(3, ...)`, `Prefetch(16)` | From the buffer: requests spread around the current position, within the buffer. With `buffer_frames` auto, a request just below the buffer doubles it (up to 4 GiB, at most 1024 frames). |
-| Stepping back | `Reverse()`, stepping backwards frame by frame in an editor | Frames still in the buffer come from it; earlier ones are decoded separately. After a jump only `back_seek_preroll` frames lie below the target, so stepping back past them is slow on long-GOP. |
+| Stepping back | `Reverse()`, stepping backwards frame by frame in an editor | Frames still in the buffer come from it. Below it, 4 steps are decoded separately, then the decoder restarts `back_seek_preroll` frames below the current one, which serves the next steps from the buffer; on long-GOP stepping back is a mix of fast and slow steps, fewer slow ones with a larger `back_seek_preroll`. |
 | Audio ahead of video by more than the buffer | large negative `DelayAudio`, a host that reads audio far ahead | Correct, but slow: audio and video move the decoder in turn, and most video frames are decoded separately. |
+
+Every restart and every separately decoded frame reads the compressed data
+from its keyframe on, often data that was read shortly before (stepping back
+reads each GOP several times). The read cache (`read_cache`) keeps the most
+recently read part of the file in memory for all of them, so that data comes
+from the source only once. It matters over HTTP and network shares: stepping
+back with `Reverse()` over HTTP transfers about as much data as playing
+forward, instead of several times as much. For local files the gain is small
+(Windows caches them as well) and sequential reading costs 1-2 % more.
 
 Threading: AviSynth+ sees the plugin as `MT_SERIALIZED`, so `Prefetch()`
 threads call it one at a time; in VapourSynth it is `fmUnordered`. Either
@@ -188,10 +199,16 @@ What helps:
 - `debug=true` or `logfile=...` prints a summary when the clip closes:
   `served N frame(s) from buffer, M frame(s) via fallback re-decode`, the
   frame ranges that were decoded separately, how often the buffer grew and
-  how often the decoder restarted after a jump. Each restart is also logged.
+  how often the decoder restarted after a jump, and how much was read from
+  the source for how much the parser read (the difference came from the read
+  cache). Each restart is also logged.
 - `back_seek_preroll`: raise it for wide temporal filters behind a `Trim`,
   or for `Reverse()` / stepping back after a jump. It is limited to half the
   buffer, so raise `buffer_frames` along with it when needed.
+- `read_cache`: larger for long backward stretches over HTTP or a network
+  share; it holds compressed data, so it goes much further than the same
+  memory in `buffer_frames` (an XDCAM HD frame is about 0.3 MB compressed,
+  4 MB decoded).
 - `buffer_frames`: a fixed, larger buffer for patterns that reach further
   back than the auto size allows; costs memory (one UHD 10-bit 4:2:2 frame
   is about 33 MB).
@@ -241,7 +258,13 @@ MxfSource("https://my-bucket.s3.eu-central-1.amazonaws.com/clip.mxf?X-Amz-Algori
   size from `Content-Range`.
 - Reading is sequential, with up to 4 MiB read ahead. A forward jump of up
   to 256 KiB is skipped on the open connection; a larger or backward jump
-  starts a new request with a `Range` header.
+  starts a new request with a `Range` header. When the data after the jump
+  target is already in the read cache, the request covers only the gap up
+  to it; reading on past that continues with an open-ended request.
+- A decoder restart, a separately decoded frame or an audio block read on
+  its own reads through the same read cache, and opens its own connection
+  only when it needs data the cache doesn't hold (without repeating the
+  size request).
 - A server without range support still works. Seeking is then emulated by
   discarding data or restarting the download, which can be slow, and a
   warning is logged once.

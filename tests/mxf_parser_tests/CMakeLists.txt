@@ -115,6 +115,16 @@ if(WIN32)
 endif()
 add_test(NAME mxf_http_byte_source_tests COMMAND mxf_http_byte_source_tests)
 
+add_executable(mxf_byte_cache_tests
+  byte_cache_test.cpp
+)
+target_compile_features(mxf_byte_cache_tests PRIVATE cxx_std_17)
+target_link_libraries(mxf_byte_cache_tests PRIVATE mxf_core)
+if(WIN32)
+  target_link_libraries(mxf_byte_cache_tests PRIVATE ws2_32)
+endif()
+add_test(NAME mxf_byte_cache_tests COMMAND mxf_byte_cache_tests)
+
 add_executable(mxf_index_table_http_tests
   index_table_http_test.cpp
 )

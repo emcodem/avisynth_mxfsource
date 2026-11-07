@@ -1414,6 +1414,96 @@ void TestBackwardJumpRepositionsOnceIdle() {
   std::filesystem::remove(path);
 }
 
+// Playing from a little before the last seek (AvsPmod: seek to 3265, play
+// from 3212): the frames are below the buffer but less than a buffer length
+// below it. Same rule as a far jump back: 4 fallback frames, then the
+// producer moves there and the rest comes from the buffer.
+void TestPlayFromJustBelowBufferRestarts() {
+  const int width = 4, height = 2, numFrames = 60;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_just_below.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 20;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      auto check = [&](int n) {
+        CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+        CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+      };
+      for (int n = 30; n < 34; ++n) check(n);  // seek: restart at 30 - 8 = 22
+      CHECK(engine.RepositionCount() == 1);
+      for (int n = 15; n < 45; ++n) check(n);  // play from 15, 7 frames below the buffer
+      CHECK(engine.RepositionCount() == 2);
+      const std::vector<int64_t> expected{15, 16, 17, 18};
+      CHECK(engine.NonBufferedServedFrames() == expected);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// The same after a pause (AvsPmod: seek, look, press play from a little
+// before): nothing came from the buffer for over 0.5 s, so the producer moves
+// on the first request below the buffer -- no fallback frames at all.
+void TestPlayAfterPauseBelowBufferRestartsAtOnce() {
+  const int width = 4, height = 2, numFrames = 60;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_pause_below.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 20;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      auto check = [&](int n) {
+        CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+        CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+      };
+      check(30);  // seek: restart at 22
+      std::this_thread::sleep_for(std::chrono::milliseconds(600));
+      for (int n = 15; n < 40; ++n) check(n);
+      CHECK(engine.RepositionCount() == 2);
+      CHECK(engine.NonBufferedServedFrames().empty());
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// A forward jump shorter than the buffer after a pause (AvsPmod: seek to
+// 3000, then play from 3200): restart at the target instead of decoding
+// every frame up to it. Without the pause (frames being read), the producer
+// decodes on as before -- the window serves both positions.
+void TestNearForwardJumpAfterPauseRestarts() {
+  const int width = 4, height = 2, numFrames = 200;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_near_fwd.mxf");
+  for (bool pause : {true, false}) {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 100;
+    opts.eagerdecode = 2;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) continue;
+    std::shared_ptr<NormalizedFrame> frame;
+    auto check = [&](int n) {
+      CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+      CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+    };
+    check(0);
+    if (pause) std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    for (int n = 60; n < 70; ++n) check(n);
+    check(0);  // without the restart, frame 0 is still in the buffer
+    CHECK(engine.RepositionCount() == (pause ? 1 : 0));
+    CHECK(engine.NonBufferedServedFrames().size() == (pause ? 1u : 0u));
+  }
+  std::filesystem::remove(path);
+}
+
 // Two far-apart positions read in turn (Interleave(a, a.Trim(k, 0))): the
 // producer stays with one of them instead of bouncing between both.
 void TestAlternatingFarPositionsDoNotThrash() {
@@ -2734,6 +2824,9 @@ int main() {
   TestBackwardJumpRepositionsOnceIdle();
   TestBackSeekPrerollSetsRestartLead();
   TestAlternatingFarPositionsDoNotThrash();
+  TestPlayFromJustBelowBufferRestarts();
+  TestPlayAfterPauseBelowBufferRestartsAtOnce();
+  TestNearForwardJumpAfterPauseRestarts();
   TestForwardJumpWithConcurrentRequestsRepositionsOnce();
   TestAutoBufferGrowsOnceOnStepBack();
   TestExplicitBufferFramesNeverGrows();
