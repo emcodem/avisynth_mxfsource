@@ -21,10 +21,11 @@ the video frames:
   and starts without any scan. See
   [Chunked distributed processing](#chunked-distributed-processing).
 - **Optimized for sequential processing, with random access.** A
-  background thread decodes ahead into a configurable ring buffer (default
-  300 frames), so a sequential run such as an ffmpeg encode is served from
-  cache. Jumps outside the buffer use the Index Table to restart at the
-  nearest keyframe, so scrubbing in an editor like AvsPmod works too.
+  background thread decodes ahead into a ring buffer (sized by memory by
+  default), so a sequential run such as an ffmpeg encode is served from
+  it. Jumps outside the buffer use the Index Table to restart at the
+  nearest keyframe, so `Trim`, `Loop` and scrubbing in an editor like
+  AvsPmod work too; see [Seeking and access patterns](#seeking-and-access-patterns).
 
 ## Features
 
@@ -67,174 +68,6 @@ clip = r if isinstance(r, vs.VideoNode) else r["clip"]
 ```
 
 All parameters are listed under [Parameters](#parameters).
-
-## Development history
-
-The notes below record how the plugin was built, phase by phase, and what
-real-world files taught along the way. They are kept for reference.
-
-Status:
-- **Phase 0 (scaffolding) -- done.** The build system and both plugin ABIs
-  are wired up and verified end to end via the actual production pipeline
-  (`ffmpeg -f avisynth -i test.avs` and `vspipe -c y4m test.vpy - | ffmpeg`).
-  `MxfSource()` still takes explicit width/height/num_frames/fps arguments
-  and synthesizes solid-color frames instead of decoding real MXF essence.
-- **Phase 1 (MXF Header Metadata parser) -- done.** `src/mxf/` parses the
-  Header Partition Pack and walks Header Metadata (ContentStorage -> Package
-  -> Track -> Sequence -> Descriptor) to resolve video/audio parameters and
-  frame count from a real `.mxf` file, with zero essence decode and zero
-  Index Table dependency. Not yet wired into `MxfSource()` -- that lands with
-  Phase 2's essence walker. Unit-tested (`tests/mxf_parser_tests/`) against a
-  hand-crafted synthetic header; real-world vendor-file testing is Phase 8.
-- **Phase 2 (sequential essence KLV walker) -- done.** `src/mxf/essence_walker.*`
-  walks forward from `headerMetadataEnd` through Body Partition(s), yielding
-  one raw essence element (KLV Value bytes) at a time for the video/audio
-  Track identified in Phase 1 (matched via TrackNumber, see FFmpeg
-  mxfdec.c's `mxf_essence_element_key`), skipping partition packs, KLV Fill,
-  index tables, system items, and other tracks' elements. Never seeks
-  backward. MVP scope: frame-wrapped OP1a only (clip-wrapped essence and
-  OP-Atom are Phase 7). Unit-tested against a synthetic Body Partition.
-- **Phase 3 (codec decode integration) -- done.** `src/codec/` adds a small
-  `Decoder` interface (`SendAndReceive`, with an empty-input "drain" call
-  for codecs with internal reorder latency) plus two implementations:
-  `RawUyvyDecoder` (uncompressed 4:2:2 8-bit, no FFmpeg involved -- the KLV
-  Value already *is* the pixel data) and `AvcodecDecoder` (generic
-  libavcodec wrapper covering every `CodecFamily` in `ul_tables.h` --
-  MPEG-2, DNxHD, ProRes, H.264/AVC-Intra, FFV1, ...). FFmpeg is vendored via
-  `cmake/FetchFFmpeg.cmake` (see Build section). Verified with a genuine
-  encode-then-decode round trip (avcodec's own MPEG-2 encoder produces the
-  test input, since no real MXF/ES sample files are available in this
-  environment) on both Windows and Linux.
-- **Phase 4 (ring-buffer engine + decode thread) -- done.** `src/core/frame_buffer.h`
-  is a thread-safe sliding-window ring buffer: a single background decode
-  thread produces frames in order, self-pacing to stay at most
-  `buffer_frames` ahead of the highest index any consumer has requested (the
-  "watermark"), eagerly filling from empty rather than waiting to be asked.
-  `src/core/source_engine.*` wires this to the Phase 1-3 pieces (open file
-  -> parse header -> pick a decoder -> walk essence -> decode -> ring
-  buffer), including codec decode-latency handling (draining buffered
-  frames once essence runs out, exactly the MPEG-2 behavior hit in the
-  Phase 3 test). `GetVideoFrame(n)` blocks until `n` is ready, evicted (past
-  the buffer window -- reported as a clear error, never a silent reseek),
-  or end-of-stream. Unit-tested for sequential playback, cache hits,
-  eviction, and unsupported-codec handling; stress-run 30-45x on both
-  platforms with no observed race conditions. Audio is not wired into a
-  ring buffer yet (`EssenceWalker` already yields audio elements; consuming
-  them is a follow-up, see Phase 7/8).
-- **Phase 5 (AviSynth+ adapter) -- done.** `MxfSource(file, buffer_frames=300)`
-  now wraps a real `SourceEngine`: `GetVideoInfo()` reflects the actual
-  parsed/decoded stream (dimensions, frame rate, frame count, pixel format
-  -- UYVY packed essence is repacked to YUY2 since that's AviSynth's only
-  packed 4:2:2 format, other formats map straight to CS_YV12/YV16/YUV420P10/
-  YUV422P10), and `GetFrame(n)` blocks on the ring buffer. `MT_SERIALIZED`
-  is declared so the AviSynth+ core funnels concurrent `Prefetch()` callers
-  through us one at a time. Verified against the **real** AviSynth+ 3.7.3
-  core DLL through ffmpeg's actual `-f avisynth` demuxer (not just our own
-  unit tests) using synthetic `.mxf` files generated by
-  `tests/mxf_parser_tests/gen_test_mxf.cpp` -- this real-host testing caught
-  two genuine ring-buffer eviction bugs the in-process unit tests missed
-  entirely (peeking frame 0 for its pixel format let the eager-fill producer
-  evict frame 0 before the host's real first request; and real hosts
-  legitimately re-request the same frame index twice in a row -- e.g. once
-  to probe the stream format, once for real -- which an off-by-one in the
-  producer's pacing formula didn't tolerate). Both are now covered by
-  dedicated regression tests in `source_engine_test.cpp`. Also fixed along
-  the way: Linux shared-library builds needed `POSITION_INDEPENDENT_CODE`
-  once the adapters started actually linking `mxf_core`'s implementation
-  rather than just its headers.
-- **Phase 6 (VapourSynth adapter) -- done.** `MxfSource(file, buffer_frames=300)`
-  wraps the same `SourceEngine`. `fmUnordered` is used (matches BestSource's
-  own choice for this exact "single logical decode stream the core still
-  prefetches" situation). Since VapourSynth has no packed pixel formats at
-  all, UYVY essence is unpacked into 3-plane YUV422P8 (`queryVideoFormat`
-  with `subSamplingW=1, subSamplingH=0`) rather than AviSynth's YUY2
-  byte-shuffle; other formats map straight across. Verified against the
-  real VapourSynth R76 core through `vspipe -c y4m ... | ffmpeg`, including
-  under explicit high concurrency (`vspipe -r 16`, forcing 16 concurrent
-  frame requests) -- all passed cleanly with no changes needed beyond
-  Phase 5's fixes, confirming those ring-buffer fixes were correctly made
-  host-agnostic at the `SourceEngine`/`FrameBuffer` layer rather than
-  AviSynth-specific. Stress-run 18+ times across both small (buffer_frames=5,
-  20 frames) and larger (default buffer_frames=300, 60 frames) synthetic
-  files with no failures.
-- **Phase 9 (real-world Atomos Shogun XAVC fix + XAVC-L support) -- done.**
-  Real XAVC-Intra and XAVC-L (long-GOP) files from an Atomos Shogun (both
-  1920x1088/1080p50) exposed two general parsing bugs, not anything
-  XAVC-specific: (1) `header_parser.cpp`'s RIP-based `headerMetadataEnd`
-  fixup assumed RIP's second entry is always a Body Partition immediately
-  following the Header -- files with no separate Body Partition at all
-  (essence written directly after Header Metadata, RIP's second entry is
-  the Footer instead) had it jump `headerMetadataEnd` straight to the
-  Footer, causing `EssenceWalker` to skip every essence element and fail
-  with "MXF essence ended before reaching the declared frame count"; fixed
-  by only trusting that RIP entry when it actually resolves to a Body
-  Partition Pack. (2) `EssenceWalker` misparsed this recorder's raw
-  zero-byte KAG-boundary padding (not a spec-compliant KLV Fill Item) as a
-  run of bogus zero-length KLVs, desyncing before it reached the real
-  essence; fixed with a resync helper that scans forward for the next
-  legitimate KLV key (SMPTE UL designator `06.0E.2B.34`) instead of
-  trusting a length field derived from noise. **Correction (2026-10-21):**
-  (2) was a misdiagnosis. A KLV walk from byte 0 shows these files are
-  intact KLV for KLV; their padding is regular KLV Fill. The walk started
-  at a wrong offset, inside a KLV Fill's zero value, because
-  HeaderByteCount was counted from the end of the Partition Pack instead
-  of from after its KAG Fill (see `PartitionContentStart`). With the
-  corrected base, no resync is needed on these files, and strict mode no
-  longer resyncs at all (see [Strict mode](#strict-mode)). Both are regression-tested
-  with hand-crafted synthetic files reproducing each layout
-  (`essence_walker_test.cpp`). Separately, XAVC-L's PictureEssenceCoding UL
-  (registered under a different family than AVC-Intra) is now classified as
-  its own `CodecFamily::kH264LongGop` -- decoded via the same generic
-  `AvcodecDecoder`/H.264 path as `kH264`, but correctly excluded from the
-  intra-only seek fast path since it has real B-frame dependencies (XAVC-I
-  itself already matched the existing AVC-Intra UL entry and needed no
-  table change). Verified end-to-end against the real files with
-  `read_test_mxf` (every frame of both files decodes correctly), not just
-  synthetic unit tests.
-- **Phase 10 (Index Table Segment reading for real random-access seeks) --
-  done.** New `src/mxf/index_table.h/.cpp` parses MXF Index Table Segments
-  (SMPTE 377-1 SS10, key/tags verified against FFmpeg's mxfdec.c/mxfenc.c)
-  and builds a flattened, binary-searchable per-BodySID lookup
-  (`EssenceIndex`) supporting both CBR (`EditUnitByteCount` formula) and
-  VBR (`IndexEntryArray`, via a new batch reader -- `GetUlArray` wasn't
-  reusable, it's hardcoded to 16-byte-UL batches) edit units, stitched
-  across multiple segments/partitions where present.
-  `SourceEngine::SeekAndDecode`'s GOP-based branch (previously always a
-  full O(target) redecode from essence element 0 for every out-of-window
-  request -- the real mechanism behind slow/janky scrubbing for long-GOP
-  codecs like XDCAM MPEG-2 and XAVC-L) now consults this index first: when
-  it resolves, decode starts from the nearest preceding keyframe's byte
-  offset instead, exposed via a new `IndexAssistedSeekCount()` diagnostic.
-  Absent or inapplicable index (nothing found, target outside every
-  covered range) degrades silently to the original from-0 behavior --
-  purely additive, verified via the existing intra-only fast path and a
-  new synthetic-GOP regression suite remaining unaffected. Also unblocks
-  the frame-count fallback: `Open()` now derives `numFrames` from the
-  index's own covered range when Header Metadata's Duration is absent.
-  Real-file verification (`read_test_mxf`, extended to report index
-  coverage) against the Phase 9 XAVC-L file found and fixed a second
-  instance of that phase's zero-byte-KAG-padding bug (since found to be the
-  same wrong-offset error, see the correction under Phase 9) -- this time in the
-  new Index Table scanner, not `EssenceWalker` -- fixed by promoting the
-  resync helpers to shared utilities in `mxf/klv.h/.cpp`. Confirmed against
-  the real file: index built, covers all 3115 frames, a genuine
-  eviction-forced seek resolved via the index and decoded correctly. New
-  tests: `tests/mxf_parser_tests/index_table_test.cpp` (13 cases) plus
-  `source_engine_test.cpp` additions using a real encoded MPEG-2 I/P-frame
-  sequence (avcodec's own encoder) to prove byte-identical output both with
-  and without an index present.
-- **Corpus hardening (2026-10-16 scan of 1479 real files, fixes 2026-10-19)
-  -- done, corpus re-run pending.** UL matching ignores the version byte
-  (DNxHR, KLV Fill); SMPTE 382 default PCM label; long and Unicode paths;
-  [strict mode](#strict-mode) (default on) that fails damaged files in under
-  a second instead of scanning them; essence carried in the Header Partition
-  (Fixup 1 no longer treats it as metadata: 39-978 GB UHD H.264 files open in
-  1-2 s); CBR index entries no longer run past the essence, and audio is
-  built when the index covers more than the Duration (audio back on about
-  250 files); D-10/IMX 8-Ch AES3 Element audio; yuv422p12/yuv444p10/
-  yuv444p12 output and 12-bit ProRes 4444 (codec tag from the coding UL);
-  block-read resync over raw padding and garbage. Each fix was checked
-  bit-exactly against ffmpeg on real files from the scan.
 
 ## Supported MXF files
 
@@ -344,6 +177,11 @@ instead:
 | Temporal filters, `Prefetch()` | `TemporalSoften(3, ...)`, `Prefetch(16)` | From the buffer: requests spread around the current position, within the buffer. With `buffer_frames` auto, a request just below the buffer doubles it (up to 4 GiB, at most 1024 frames). |
 | Stepping back | `Reverse()`, stepping backwards frame by frame in an editor | Frames still in the buffer come from it; earlier ones are decoded separately. After a jump only `back_seek_preroll` frames lie below the target, so stepping back past them is slow on long-GOP. |
 | Audio ahead of video by more than the buffer | large negative `DelayAudio`, a host that reads audio far ahead | Correct, but slow: audio and video move the decoder in turn, and most video frames are decoded separately. |
+
+Threading: AviSynth+ sees the plugin as `MT_SERIALIZED`, so `Prefetch()`
+threads call it one at a time; in VapourSynth it is `fmUnordered`. Either
+way there is one background decoder per clip; the decoding itself is
+multithreaded inside libavcodec where the codec supports it.
 
 What helps:
 
@@ -550,8 +388,6 @@ descriptor.
 when the field order is unknown. On the sample share, interlaced XDCAM HD422,
 XAVC, D-10 and K2 SD material is TFF, and ProRes, DNxHR, XAVC-L UHD and 720p
 material is progressive. The plugin matches ffprobe frame for frame on these.
-(Before 2026-10-21, `GetParity` always returned false, i.e. BFF, and no
-`_FieldBased` was set.)
 
 ### Audio
 
@@ -746,8 +582,8 @@ decode without errors, audio bit-identical to ffmpeg.
 
 #### Real-world examples
 
-From the 2026-10-16 scan of 1479 files on `SERVER/SHARE/...`, opened
-with `strict=true`:
+From a scan of 1479 files on `SERVER/SHARE/...`, opened with
+`strict=true`:
 
 | File | Result |
 |---|---|
@@ -785,8 +621,8 @@ Requires a C++17 compiler and CMake >= 3.24. FFmpeg's `libavcodec`/`libavutil`
 (LGPL prebuilt shared libraries, from BtbN/FFmpeg-Builds) are fetched
 automatically by CMake's `FetchContent` on first configure -- no system
 FFmpeg install needed, and nothing is committed to the repo (cached under
-`build/_deps/`, gitignored). Phase 0-2 alone have no external dependencies
-beyond the vendored AviSynth+/VapourSynth SDK headers in `third_party/`.
+`build/_deps/`, gitignored). The AviSynth+/VapourSynth SDK headers are
+vendored in `third_party/`.
 
 **If building on WSL against a Windows-hosted checkout** (`/mnt/c`, `/mnt/d`,
 ...): the DrvFs mount doesn't reliably preserve the symlinks inside the
