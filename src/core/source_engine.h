@@ -162,7 +162,7 @@ class SourceEngine {
     return stats_.indexAssistedSeeks;
   }
   // How often the background producer was restarted at a frame requested
-  // far ahead of it -- see RepositionProducer.
+  // far ahead of it or far behind it -- see RepositionProducer.
   int64_t RepositionCount() const {
     std::lock_guard<std::mutex> lock(stats_.mutex);
     return stats_.repositions;
@@ -223,8 +223,11 @@ class SourceEngine {
   // after a forward jump -- e.g. a script starting with Trim(1250, ...) --
   // was decoded separately via SeekAndDecode. Returns false if the engine is
   // shutting down or `hostFrame` is out of range; the caller then keeps its
-  // old fallback.
-  bool RepositionProducer(int64_t hostFrame);
+  // old fallback. `backward`: the frame lies far below the window instead
+  // (Trim segments spliced out of order, Loop, scrubbing back in an editor);
+  // the caller has already checked that nothing is still reading at the
+  // producer's current position (see GetVideoFrame).
+  bool RepositionProducer(int64_t hostFrame, bool backward = false);
 
   // Grows both ring buffers to `newCapacity` (buffer_frames=auto).
   void GrowBuffers(int newCapacity);
@@ -350,15 +353,20 @@ class SourceEngine {
   // DecodeThreadMain (producer): pendingRestart_ is the host frame to
   // restart at, -1 for none; stopProducer_ is set by the destructor.
   // restartRequested_ is checked by the running ProduceFrom without the lock.
-  // OpenOptions::buffer_frames <= 0: capacity sized by memory, grown on
-  // demand up to autoBufferMaxFrames_ (set in Open() from the frame size).
-  bool autoBuffer_ = false;
-  int autoBufferMaxFrames_ = 0;
   std::mutex repositionMutex_;
   std::condition_variable repositionCv_;
   int64_t pendingRestart_ = -1;
   bool stopProducer_ = false;
   std::atomic<bool> restartRequested_{false};
+  // Video requests are numbered; lastBufferedRequest_ is the number of the
+  // last one served from the buffer. A large gap means nothing reads at the
+  // producer's position any more, so a far backward request may move it.
+  std::atomic<uint64_t> videoRequestSeq_{0};
+  std::atomic<uint64_t> lastBufferedRequest_{0};
+  // OpenOptions::buffer_frames <= 0: capacity sized by memory, grown on
+  // demand up to autoBufferMaxFrames_ (set in Open() from the frame size).
+  bool autoBuffer_ = false;
+  int autoBufferMaxFrames_ = 0;
   std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;
   std::shared_ptr<NormalizedFrame> firstFrame_;
   std::thread decodeThread_;

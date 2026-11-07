@@ -203,7 +203,7 @@ SourceEngine::~SourceEngine() {
                    std::to_string(videoBuffer_->Capacity()) + " frames";
       }
       if (stats_.repositions > 0) {
-        summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump ahead";
+        summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump";
       }
       if (!stats_.nonBufferedFrames.empty()) {
         summary += ": " + FormatFrameRanges(stats_.nonBufferedFrames);
@@ -487,6 +487,7 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   // producer to `n` instead; this request then waits in the buffer for the
   // restarted producer like any other, and the frames after it follow from
   // the buffer. SeekAndDecode remains for when that isn't possible.
+  const uint64_t request = ++videoRequestSeq_;
   if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) RepositionProducer(n);
   if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) {
     auto seeked = SeekAndDecode(n);
@@ -505,6 +506,7 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   FetchStatus status = videoBuffer_->Get(n, out, errorOut);
   if (status == FetchStatus::kOk) {
     stats_.RecordBufferedServe();
+    lastBufferedRequest_ = request;
     return status;
   }
   // kEndOfStream: DecodeThreadMain legitimately reached streamInfo_.numFrames
@@ -540,6 +542,32 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
       stats_.RecordGrowth();
       AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(n) +
                     " requested just below the buffer; buffer_frames=auto grows to " + std::to_string(grown));
+    }
+  }
+
+  // A far backward jump (Trim segments spliced out of order, Loop, scrubbing
+  // back in an editor) is the Trim problem in reverse: the producer would
+  // stay where it was and every following frame would be evicted too and
+  // re-decoded from its keyframe. Move the producer back -- but only once
+  // nothing has read from the buffer for a few requests. Two far-apart
+  // positions read in turn (Interleave or StackHorizontal of a clip and a
+  // Trim of it) keep the producer busy at one of them; moving it would
+  // throw that position away each time, so the other one stays on the
+  // fallback. The first few frames after a real jump also take the
+  // fallback, a one-off cost.
+  if (status == FetchStatus::kEvicted) {
+    constexpr uint64_t kIdleRequestsBeforeBackwardRestart = 4;
+    const int64_t lowest = videoBuffer_->LowestValid();
+    if (n < lowest - videoBuffer_->Capacity() &&
+        request - lastBufferedRequest_.load() > kIdleRequestsBeforeBackwardRestart &&
+        RepositionProducer(n, /*backward=*/true)) {
+      status = videoBuffer_->Get(n, out, errorOut);
+      if (status == FetchStatus::kOk) {
+        stats_.RecordBufferedServe();
+        lastBufferedRequest_ = request;
+        return status;
+      }
+      if (status != FetchStatus::kEvicted && status != FetchStatus::kError) return status;
     }
   }
 
@@ -799,7 +827,7 @@ void SourceEngine::GrowBuffers(int newCapacity) {
   if (audioBuffer_) audioBuffer_->Grow(newCapacity);
 }
 
-bool SourceEngine::RepositionProducer(int64_t hostFrame) {
+bool SourceEngine::RepositionProducer(int64_t hostFrame, bool backward) {
   if (hostFrame < 0 || hostFrame >= streamInfo_.numFrames) return false;
   constexpr int kRestartLeadFrames = 8;
   int64_t start = hostFrame;
@@ -809,7 +837,10 @@ bool SourceEngine::RepositionProducer(int64_t hostFrame) {
     // Another consumer thread may have moved the producer in the meantime
     // (AviSynth's Prefetch asks for several neighbouring frames at once).
     const int capacity = videoBuffer_->Capacity();
-    if (hostFrame <= videoBuffer_->HighestProduced() + capacity) return true;
+    if (backward ? hostFrame >= videoBuffer_->LowestValid() - capacity
+                 : hostFrame <= videoBuffer_->HighestProduced() + capacity) {
+      return true;
+    }
     // Restart a few frames early: a temporal filter after the jump (e.g.
     // TemporalSoften radius 3 behind Trim) also asks for the frames just
     // before it, and each of those would otherwise be a separate keyframe
@@ -824,7 +855,8 @@ bool SourceEngine::RepositionProducer(int64_t hostFrame) {
   repositionCv_.notify_all();
   stats_.RecordReposition();
   AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(hostFrame) +
-                " requested far ahead of the decode position; restarting the decoder at frame " +
+                (backward ? " requested far behind" : " requested far ahead of") +
+                " the decode position; restarting the decoder at frame " +
                 std::to_string(start));
   return true;
 }

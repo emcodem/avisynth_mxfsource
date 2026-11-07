@@ -471,6 +471,32 @@ Still to check on the real files: the 30020-frame UHD file above (last 25
 frames) and the user's Trim + Prefetch script should both show (almost) all
 frames from the buffer and one restart.
 
+Backward jumps (2026-11-07, branch `adaptive-buffer`): the same storm in
+reverse -- `Trim(5000,6000) ++ Trim(100,200)`, `Loop()` over more than the
+buffer, scrubbing back to the start in an editor and playing. The producer
+stayed at the far position, so every frame of the earlier segment was
+evicted and re-decoded from its keyframe. Now a request more than one buffer
+length below the window moves the producer back too
+(`RepositionProducer(n, backward=true)`), but only once no request has been
+served from the buffer for 4 requests: the first 4 frames after the jump
+take the fallback. That guard keeps two far-apart positions read in turn
+(`Interleave(a, a.Trim(1000,0))`, `StackHorizontal` of a clip and a Trim of
+it) from bouncing the producer between them; the producer stays with one
+side and the other side stays on the fallback, as before. Tests:
+`TestBackwardJumpRepositionsOnceIdle` (fails without the change),
+`TestAlternatingFarPositionsDoNotThrash`.
+
+Still open, for the "forward decoding preferred, everything else supported"
+goal:
+- Alternating far positions: half the frames via the fallback. Proper fix is
+  BestSource's approach, a small pool of producers (2-4, each with its own
+  buffer, request goes to the nearest one, least recently used one is moved).
+  Needs the auto memory budget split between them.
+- Reverse stepping right after a jump (see item 3 of the 2026-10-19 scan).
+- Audio far below its buffer is still read block by block with a fresh
+  reader (cheap for PCM, but an audio-only consumer that loops opens the file
+  once per edit unit).
+
 ### Corpus re-run against the 2026-10-16 baseline -- done 2026-10-19
 
 Ran as part of the 2026-10-19 scan: no regressions (all 64 baseline-OK files

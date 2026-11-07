@@ -1370,6 +1370,76 @@ void TestExplicitBufferFramesNeverGrows() {
   std::filesystem::remove(path);
 }
 
+// A far backward jump that stays there (Trim(30,39) ++ Trim(5,14), Loop):
+// the first few frames take the fallback, then the producer moves back and
+// the rest of the segment comes from the buffer -- on long-GOP content too.
+void TestBackwardJumpRepositionsOnceIdle() {
+  constexpr int kFrames = 40;
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kFrames));
+  if (encoded.size() != static_cast<size_t>(kFrames)) return;
+
+  auto referenceBytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_backjump_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_backjump.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 3;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      auto check = [&](int64_t i) {
+        std::shared_ptr<NormalizedFrame> frame;
+        CHECK(engine.GetVideoFrame(i, frame, nullptr) == FetchStatus::kOk);
+        if (frame) CHECK(frame->planeData[0] == reference[static_cast<size_t>(i)]);
+      };
+      const int64_t hi = 34;
+      for (int64_t i = hi - 4; i < hi; ++i) check(i);  // first segment, after one jump ahead
+      CHECK(engine.RepositionCount() == 1);
+      CHECK(engine.NonBufferedServedFrames().empty());
+
+      for (int64_t i = 2; i < 2 + 10; ++i) check(i);  // second segment, far back
+      CHECK(engine.RepositionCount() == 2);
+      // Requests 1-4 since the last buffered one take the fallback, the 5th
+      // moves the producer; everything from there on comes from the buffer.
+      CHECK(engine.NonBufferedServedFrames().size() == 4);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Two far-apart positions read in turn (Interleave(a, a.Trim(k, 0))): the
+// producer stays with one of them instead of bouncing between both.
+void TestAlternatingFarPositionsDoNotThrash() {
+  const int width = 4, height = 2, numFrames = 60;
+  auto path = WriteTempFile(BuildFile(width, height, numFrames), "mxfsrc_test_engine_alternate.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 4;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      std::shared_ptr<NormalizedFrame> frame;
+      for (int i = 0; i < 20; ++i) {
+        for (int n : {i, i + 30}) {
+          CHECK(engine.GetVideoFrame(n, frame, nullptr) == FetchStatus::kOk);
+          CHECK(frame && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + n));
+        }
+      }
+      CHECK(engine.RepositionCount() <= 1);  // the one jump ahead to 30, never back
+    }
+  }
+  std::filesystem::remove(path);
+}
+
 // AviSynth's Prefetch: several threads ask for neighbouring frames at once,
 // right after a jump ahead (Trim at the start of a script). Exactly one of
 // them moves the producer; all of them get the right content.
@@ -2634,6 +2704,8 @@ int main() {
   TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference();
   TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
+  TestBackwardJumpRepositionsOnceIdle();
+  TestAlternatingFarPositionsDoNotThrash();
   TestForwardJumpWithConcurrentRequestsRepositionsOnce();
   TestAutoBufferGrowsOnceOnStepBack();
   TestExplicitBufferFramesNeverGrows();
