@@ -131,8 +131,14 @@ class FrameBuffer {
   // where this is the difference between allocating a fresh multi-MB
   // NormalizedFrame per frame (paying OS page-fault cost on every single
   // decode) and reusing one whose buffers are already resident.
-  std::optional<T> Put(int64_t index, T value) {
+  //
+  // `generation` (see Reset()): a producer that was told to start over
+  // passes the generation it was started for; a Put() for an older
+  // generation arrives after the reset and is dropped, so a frame decoded
+  // for the previous position can never land in the new window.
+  std::optional<T> Put(int64_t index, T value, std::optional<uint64_t> generation = std::nullopt) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (generation && *generation != generation_) return std::nullopt;
     std::optional<T> evicted;
     if (highestProduced_ >= 0 && index - lowestValid_ + 1 > capacity_) {
       evicted = std::move(slots_[SlotOf(lowestValid_)]);
@@ -145,16 +151,45 @@ class FrameBuffer {
     return evicted;
   }
 
-  void SignalEndOfStream() {
+  // `generation`: as for Put().
+  void SignalEndOfStream(std::optional<uint64_t> generation = std::nullopt) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (generation && *generation != generation_) return;
     endOfStream_ = true;
     cv_.notify_all();
   }
 
-  void SignalError(std::string message) {
+  void SignalError(std::string message, std::optional<uint64_t> generation = std::nullopt) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (generation && *generation != generation_) return;
     error_ = std::move(message);
     cv_.notify_all();
+  }
+
+  // Empties the window and makes `startIndex` the next index to produce,
+  // as if the buffer had just been constructed with it (end-of-stream and
+  // error are cleared too). Called by a consumer that jumped far ahead of
+  // the producer (see SourceEngine::RepositionProducer): the producer then
+  // restarts there instead of the consumer re-decoding every following
+  // frame separately. Bumps the generation, so producer calls still in
+  // flight for the old position are dropped. A consumer waiting for an
+  // index below `startIndex` wakes up with kEvicted, one waiting for an
+  // index at or above it keeps waiting for the restarted producer.
+  void Reset(int64_t startIndex) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& slot : slots_) slot.reset();
+    lowestValid_ = startIndex;
+    highestProduced_ = startIndex - 1;
+    watermark_ = startIndex;
+    endOfStream_ = false;
+    error_.reset();
+    ++generation_;
+    cv_.notify_all();
+  }
+
+  uint64_t Generation() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generation_;
   }
 
   // Wakes any blocked producer/consumer so threads can exit; subsequent
@@ -267,6 +302,7 @@ class FrameBuffer {
   int64_t watermark_ = 0;
   bool endOfStream_ = false;
   bool shutdown_ = false;
+  uint64_t generation_ = 0;
   std::optional<std::string> error_;
 };
 

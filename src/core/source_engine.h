@@ -1,5 +1,8 @@
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,6 +38,9 @@ struct ServeStats {
   // (mxf/index_table.h) and started decoding from a nearby keyframe instead
   // of essence element 0 -- see SourceEngine::videoIndex_.
   int64_t indexAssistedSeeks = 0;
+  // How often the background producer was moved to a frame requested far
+  // ahead of it (SourceEngine::RepositionProducer).
+  int64_t repositions = 0;
 
   void RecordBufferedServe() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -43,6 +49,10 @@ struct ServeStats {
   void RecordNonBufferedServe(int64_t n) {
     std::lock_guard<std::mutex> lock(mutex);
     nonBufferedFrames.push_back(n);
+  }
+  void RecordReposition() {
+    std::lock_guard<std::mutex> lock(mutex);
+    ++repositions;
   }
   void RecordIndexAssistedSeek() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -145,6 +155,12 @@ class SourceEngine {
     std::lock_guard<std::mutex> lock(stats_.mutex);
     return stats_.indexAssistedSeeks;
   }
+  // How often the background producer was restarted at a frame requested
+  // far ahead of it -- see RepositionProducer.
+  int64_t RepositionCount() const {
+    std::lock_guard<std::mutex> lock(stats_.mutex);
+    return stats_.repositions;
+  }
 
   // Diagnostics for manual tools (see tests/mxf_parser_tests/read_test_mxf.cpp):
   // whether a usable Index Table Segment-derived lookup was built at all,
@@ -183,7 +199,20 @@ class SourceEngine {
   FetchStatus GetAudioSamples(int64_t start, int64_t count, void* buf, std::string* errorOut = nullptr);
 
  private:
+  // The background producer thread: runs ProduceFrom, then waits for a
+  // restart request (RepositionProducer) or shutdown, and repeats.
   void DecodeThreadMain();
+  void ProduceFrom(int64_t startHostFrame, bool fromOpen, uint64_t videoGen, uint64_t audioGen);
+
+  // Called by a consumer whose frame `hostFrame` lies more than the buffer
+  // capacity ahead of the producer: empties both ring buffers, makes
+  // `hostFrame` their next index, and has the producer restart there (from
+  // the preceding keyframe, see ResolveSeekStart). Without this, every frame
+  // after a forward jump -- e.g. a script starting with Trim(1250, ...) --
+  // was decoded separately via SeekAndDecode. Returns false if the engine is
+  // shutting down or `hostFrame` is out of range; the caller then keeps its
+  // old fallback.
+  bool RepositionProducer(int64_t hostFrame);
 
   // Opens a *fresh*, independent MxfReader/EssenceWalker/Decoder on the
   // same file (separate file handle -- doesn't disturb the primary
@@ -295,8 +324,22 @@ class SourceEngine {
   // SeekAndDecode() falls back to its original from-essence-element-0
   // behavior whenever this is unset, so absence is never a hard failure.
   std::optional<EssenceIndex> videoIndex_;
+  // walker_/videoDecoder_ belong to the producer thread after Open(); a
+  // restart (ProduceFrom) replaces both.
   std::unique_ptr<EssenceWalker> walker_;
   std::unique_ptr<Decoder> videoDecoder_;
+  // Audio track numbers walker_ collects (empty unless audio is exposed),
+  // kept for the walker a restart creates.
+  std::vector<std::array<uint8_t, 4>> walkerAudioTracks_;
+  // Restart handshake between RepositionProducer (consumers) and
+  // DecodeThreadMain (producer): pendingRestart_ is the host frame to
+  // restart at, -1 for none; stopProducer_ is set by the destructor.
+  // restartRequested_ is checked by the running ProduceFrom without the lock.
+  std::mutex repositionMutex_;
+  std::condition_variable repositionCv_;
+  int64_t pendingRestart_ = -1;
+  bool stopProducer_ = false;
+  std::atomic<bool> restartRequested_{false};
   std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;
   std::shared_ptr<NormalizedFrame> firstFrame_;
   std::thread decodeThread_;

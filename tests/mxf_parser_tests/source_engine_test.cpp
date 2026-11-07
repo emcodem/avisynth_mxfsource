@@ -1260,11 +1260,12 @@ void TestIndexTableAssistedSeekUsesIndexAndMatchesReference() {
 // evicted from the ring buffer -- a *forward* jump to a not-yet-produced
 // frame just blocked on the buffer's Get(), which silently waits for the
 // single background thread to decode every intervening frame in order.
-// This is the very first GetVideoFrame() call the engine ever sees (nothing
-// has been evicted, nothing else has been requested yet), so the only way
-// this can pass is via the forward-jump bypass added to GetVideoFrame(),
-// not the pre-existing eviction-triggered path exercised by
-// TestIndexTableAssistedSeekUsesIndexAndMatchesReference above.
+// The jump now restarts the producer at the target (RepositionProducer)
+// instead of decoding just that one frame via SeekAndDecode: the target and
+// every frame after it come from the ring buffer. Before, the producer
+// stayed near frame 0, so each following frame was "far ahead" again and
+// went through SeekAndDecode separately (real report: Trim(1250, ...) on a
+// long-GOP file, 15 frames from the buffer, 6027 via fallback).
 void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
   auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
   CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
@@ -1284,14 +1285,120 @@ void TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait() {
     OpenResult res = engine.Open(path.string(), opts);
     CHECK(res.status == OpenStatus::kOk);
     if (res.status == OpenStatus::kOk) {
-      constexpr int64_t kTarget = 10;  // start of the third GOP -- itself a keyframe
-      std::shared_ptr<NormalizedFrame> frame;
-      FetchStatus st = engine.GetVideoFrame(kTarget, frame, nullptr);
-      CHECK(st == FetchStatus::kOk);
-      if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[kTarget]);
-      CHECK(!engine.NonBufferedServedFrames().empty());  // proves the fast path, not the sequential wait, was used
-      CHECK(engine.IndexAssistedSeekCount() > 0);
+      // 7: two frames past the keyframe at 5, so the restart has to decode
+      // and discard lead-in frames, not just start on the target itself.
+      constexpr int64_t kTarget = 7;
+      for (int64_t i = kTarget; i < kGopNumFrames; ++i) {
+        std::shared_ptr<NormalizedFrame> frame;
+        std::string err;
+        FetchStatus st = engine.GetVideoFrame(i, frame, &err);
+        CHECK(st == FetchStatus::kOk);
+        if (st == FetchStatus::kOk) CHECK(frame->planeData[0] == reference[i]);
+        else std::cerr << "frame " << i << " failed: " << err << std::endl;
+      }
+      CHECK(engine.RepositionCount() == 1);
+      CHECK(engine.NonBufferedServedFrames().empty());  // target and everything after it from the buffer
+      CHECK(engine.IndexAssistedSeekCount() > 0);       // the restart started at the keyframe, not at 0
+
+      // A frame before the new position: evicted, served via the fallback,
+      // and it doesn't move the producer back.
+      std::shared_ptr<NormalizedFrame> early;
+      CHECK(engine.GetVideoFrame(3, early, nullptr) == FetchStatus::kOk);
+      if (early) CHECK(early->planeData[0] == reference[3]);
+      CHECK(engine.NonBufferedServedFrames().size() == 1);
+      CHECK(engine.RepositionCount() == 1);
     }
+  }
+  std::filesystem::remove(path);
+}
+
+// AviSynth's Prefetch: several threads ask for neighbouring frames at once,
+// right after a jump ahead (Trim at the start of a script). Exactly one of
+// them moves the producer; all of them get the right content.
+void TestForwardJumpWithConcurrentRequestsRepositionsOnce() {
+  auto encoded = EncodeMpeg2Gop(kGopWidth, kGopHeight, kGopNumFrames, kGopSize);
+  CHECK(encoded.size() == static_cast<size_t>(kGopNumFrames));
+  if (encoded.size() != static_cast<size_t>(kGopNumFrames)) return;
+
+  auto referenceBytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/false);
+  auto referencePath = WriteTempFile(referenceBytes, "mxfsrc_test_gop_fwdjump_mt_reference.mxf");
+  auto reference = DecodeAllSequentially(referencePath.string(), kGopNumFrames);
+  std::filesystem::remove(referencePath);
+
+  auto bytes = BuildGopFile(encoded, kGopWidth, kGopHeight, kGopTrackNumber, /*includeIndexTable=*/true);
+  auto path = WriteTempFile(bytes, "mxfsrc_test_gop_fwdjump_mt.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    // Producer parked at frame 0 after Open (eagerdecode 1), so 7 is far
+    // ahead; once restarted at 7, every frame up to 7 + 6 - 1 is within the
+    // window, so a thread that runs ahead can't legitimately trigger a
+    // second restart.
+    opts.buffer_frames = 6;
+    opts.eagerdecode = 1;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status == OpenStatus::kOk) {
+      constexpr int kThreads = 3;
+      constexpr int64_t kStart = 7, kEnd = 13;
+      std::atomic<int> failures{0};
+      std::vector<std::thread> threads;
+      for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+          for (int64_t i = kStart + t; i < kEnd; i += kThreads) {
+            std::shared_ptr<NormalizedFrame> frame;
+            if (engine.GetVideoFrame(i, frame, nullptr) != FetchStatus::kOk ||
+                frame->planeData[0] != reference[static_cast<size_t>(i)]) {
+              ++failures;
+            }
+          }
+        });
+      }
+      for (auto& th : threads) th.join();
+      CHECK(failures == 0);
+      // Racing threads may land just below the restart point and take the
+      // fallback, but only one restart may happen: the others find the
+      // producer already moved.
+      CHECK(engine.RepositionCount() == 1);
+    }
+  }
+  std::filesystem::remove(path);
+}
+
+// Audio after a jump ahead: the restart refills the audio buffer from the
+// new position too, so video and audio for the frames after the jump both
+// come from the buffers with the right content.
+void TestForwardJumpRepositionsAudioToo() {
+  const int width = 4, height = 2, numFrames = 50, samplesPerEditUnit = 2, channels = 1;
+  auto path = WriteTempFile(BuildFileWithAudio(width, height, numFrames, samplesPerEditUnit, channels),
+                            "mxfsrc_test_engine_audio_fwdjump.mxf");
+  {
+    SourceEngine engine;
+    OpenOptions opts = NonStrictOptions();
+    opts.buffer_frames = 5;
+    opts.eagerdecode = 2;
+    OpenResult res = engine.Open(path.string(), opts);
+    CHECK(res.status == OpenStatus::kOk);
+    if (res.status != OpenStatus::kOk) {
+      std::cerr << "Open error: " << res.error << std::endl;
+      std::filesystem::remove(path);
+      return;
+    }
+    CHECK(engine.ExposesAudio());
+
+    constexpr int kTarget = 30;
+    for (int i = kTarget; i < kTarget + 8; ++i) {
+      std::shared_ptr<NormalizedFrame> frame;
+      CHECK(engine.GetVideoFrame(i, frame, nullptr) == FetchStatus::kOk);
+      CHECK(frame && !frame->planeData[0].empty() && frame->planeData[0][0] == static_cast<uint8_t>(0x10 + i));
+
+      std::vector<uint8_t> buf(static_cast<size_t>(samplesPerEditUnit) * channels * 2);
+      CHECK(engine.GetAudioSamples(static_cast<int64_t>(i) * samplesPerEditUnit, samplesPerEditUnit, buf.data(),
+                                   nullptr) == FetchStatus::kOk);
+      CHECK(buf == MakeAudioEditUnitPayload(i, samplesPerEditUnit, channels));
+    }
+    CHECK(engine.RepositionCount() == 1);
+    CHECK(engine.NonBufferedServedFrames().empty());
   }
   std::filesystem::remove(path);
 }
@@ -2469,6 +2576,8 @@ int main() {
   TestStartFrameHintGopWithBFramesAudioMatchesSequentialReference();
   TestSequentialAudioFromFrameZeroDoesNotRepeatDuringWarmup();
   TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait();
+  TestForwardJumpWithConcurrentRequestsRepositionsOnce();
+  TestForwardJumpRepositionsAudioToo();
   TestStartFrameHintGopServesFromBufferViaIndexAssistedJump();
   TestStartFrameHintIntraOnlyStartsProductionAtHint();
   TestStartFrameHintOutOfRangeIgnored();

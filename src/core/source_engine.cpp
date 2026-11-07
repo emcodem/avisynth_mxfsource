@@ -70,6 +70,32 @@ bool DecodeNextFrame(EssenceWalker& walker, Decoder& decoder, bool& essenceExhau
 // safe for intra-only codecs (see IsIntraOnlyCodec), where no frame depends
 // on any other, so there's nothing decoding it would have contributed
 // anyway.
+// "3, 7-9, 12, ..." for the serve-stats summary: sorted, duplicates dropped,
+// consecutive frames merged into a range, cut off after kMaxRanges ranges.
+// With Prefetch the fallback frames arrive out of order, and listing every
+// one of them made a single log line of thousands of numbers.
+std::string FormatFrameRanges(std::vector<int64_t> frames) {
+  constexpr size_t kMaxRanges = 50;
+  std::sort(frames.begin(), frames.end());
+  frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+  std::string out;
+  size_t ranges = 0;
+  for (size_t i = 0; i < frames.size();) {
+    size_t j = i;
+    while (j + 1 < frames.size() && frames[j + 1] == frames[j] + 1) ++j;
+    if (ranges == kMaxRanges) {
+      out += ", ... (" + std::to_string(frames.size() - i) + " more frame(s))";
+      break;
+    }
+    if (ranges != 0) out += ", ";
+    out += std::to_string(frames[i]);
+    if (j > i) out += "-" + std::to_string(frames[j]);
+    ++ranges;
+    i = j + 1;
+  }
+  return out;
+}
+
 bool SkipNextVideoElement(EssenceWalker& walker) {
   EssenceElement element;
   while (walker.Next(element, /*wantData=*/false)) {
@@ -156,6 +182,11 @@ void SourceEngine::AppendLogLine(LogLevel level, const std::string& line) const 
 }
 
 SourceEngine::~SourceEngine() {
+  {
+    std::lock_guard<std::mutex> lock(repositionMutex_);
+    stopProducer_ = true;
+  }
+  repositionCv_.notify_all();
   if (videoBuffer_) videoBuffer_->Shutdown();
   if (audioBuffer_) audioBuffer_->Shutdown();
   if (decodeThread_.joinable()) decodeThread_.join();
@@ -167,12 +198,11 @@ SourceEngine::~SourceEngine() {
       summary = "[MxfSource] " + path_ + ": served " + std::to_string(stats_.bufferedCount) +
                 " frame(s) from buffer, " + std::to_string(stats_.nonBufferedFrames.size()) +
                 " frame(s) via fallback re-decode (not buffered)";
+      if (stats_.repositions > 0) {
+        summary += ", decoder restarted " + std::to_string(stats_.repositions) + " time(s) after a jump ahead";
+      }
       if (!stats_.nonBufferedFrames.empty()) {
-        summary += ": ";
-        for (size_t i = 0; i < stats_.nonBufferedFrames.size(); ++i) {
-          if (i != 0) summary += ", ";
-          summary += std::to_string(stats_.nonBufferedFrames[i]);
-        }
+        summary += ": " + FormatFrameRanges(stats_.nonBufferedFrames);
       }
     }
     AppendLogLine(LogLevel::kInfo, summary);
@@ -390,6 +420,7 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   }
   walker_ = std::make_unique<EssenceWalker>(*reader_, walkerStartOffset, streamInfo_.videoTrackNumber,
                                              streamInfo_.hasVideo, audioTrackNumbersForWalker, WalkerOptions());
+  walkerAudioTracks_ = audioTrackNumbersForWalker;
 
   const int capacity = options.buffer_frames > 0 ? options.buffer_frames : 300;
   const int margin = options.eagerdecode > 0 ? options.eagerdecode : 32;
@@ -427,6 +458,16 @@ FetchStatus SourceEngine::GetVideoFrame(int64_t n, std::shared_ptr<NormalizedFra
   // the same Index Table-assisted SeekAndDecode() fallback used for genuine
   // backward seeks below, rather than only reaching for it once a frame has
   // already been evicted.
+  //
+  // Bypassing only the one request wasn't enough, though: the producer
+  // stayed where it was, so every following frame was still "far ahead"
+  // and went through the same keyframe re-decode (real report: a script
+  // starting with Trim(1250, ...) on long-GOP H.264 served 15 frames from
+  // the buffer and 6027 via fallback). RepositionProducer moves the
+  // producer to `n` instead; this request then waits in the buffer for the
+  // restarted producer like any other, and the frames after it follow from
+  // the buffer. SeekAndDecode remains for when that isn't possible.
+  if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) RepositionProducer(n);
   if (n > videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) {
     auto seeked = SeekAndDecode(n);
     if (!seeked) {
@@ -690,6 +731,58 @@ std::shared_ptr<NormalizedFrame> SourceEngine::SeekAndDecode(int64_t target) {
 }
 
 void SourceEngine::DecodeThreadMain() {
+  int64_t start = firstHostFrame_;
+  bool fromOpen = true;
+  uint64_t videoGen = videoBuffer_->Generation();
+  uint64_t audioGen = audioBuffer_ ? audioBuffer_->Generation() : 0;
+  for (;;) {
+    ProduceFrom(start, fromOpen, videoGen, audioGen);
+    // Production ended (end of stream, error, shutdown) or a consumer asked
+    // for a restart elsewhere (RepositionProducer). Either way, wait for the
+    // next restart or the engine shutting down.
+    std::unique_lock<std::mutex> lock(repositionMutex_);
+    repositionCv_.wait(lock, [&] { return stopProducer_ || pendingRestart_ >= 0; });
+    if (stopProducer_) return;
+    start = pendingRestart_;
+    pendingRestart_ = -1;
+    restartRequested_ = false;
+    // Read under repositionMutex_, which RepositionProducer holds while it
+    // resets both buffers: these are exactly the generations of that reset.
+    videoGen = videoBuffer_->Generation();
+    audioGen = audioBuffer_ ? audioBuffer_->Generation() : 0;
+    fromOpen = false;
+  }
+}
+
+bool SourceEngine::RepositionProducer(int64_t hostFrame) {
+  if (hostFrame < 0 || hostFrame >= streamInfo_.numFrames) return false;
+  {
+    std::lock_guard<std::mutex> lock(repositionMutex_);
+    if (stopProducer_) return false;
+    // Another consumer thread may have moved the producer in the meantime
+    // (AviSynth's Prefetch asks for several neighbouring frames at once).
+    if (hostFrame <= videoBuffer_->HighestProduced() + videoBuffer_->Capacity()) return true;
+    if (audioBuffer_) audioBuffer_->Reset(hostFrame);
+    videoBuffer_->Reset(hostFrame);
+    pendingRestart_ = hostFrame;
+    restartRequested_ = true;
+  }
+  repositionCv_.notify_all();
+  stats_.RecordReposition();
+  AppendLogLine(LogLevel::kInfo, "[MxfSource] " + path_ + ": frame " + std::to_string(hostFrame) +
+                " requested far ahead of the decode position; restarting the decoder there");
+  return true;
+}
+
+// One run of the background producer, from host frame `startHostFrame` until
+// the end of the stream, an error, shutdown, or a restart request. The
+// first run (`fromOpen`) uses the walker/decoder Open() prepared (from
+// essence element 0, or from the start_frame hint); a restart creates new
+// ones at the keyframe ResolveSeekStart picks for the new position and warms
+// up exactly like a start_frame hint. `videoGen`/`audioGen` are the buffer
+// generations this run fills (see FrameBuffer::Reset): once a consumer has
+// reset a buffer again, everything this run still puts there is dropped.
+void SourceEngine::ProduceFrom(int64_t startHostFrame, bool fromOpen, uint64_t videoGen, uint64_t audioGen) {
   bool essenceExhausted = false;
   EssenceElement scratch;
 
@@ -699,7 +792,26 @@ void SourceEngine::DecodeThreadMain() {
   // Origin-skip discard just below with the hinted discard/warm-up block
   // further down instead (walker_ already starts at hintStartEditUnit_, a
   // keyframe near the hint's own target, resolved once in Open()).
-  const bool hinted = firstHostFrame_ > 0;
+  const bool hinted = !fromOpen || startHostFrame > 0;
+  int64_t hintStartEditUnit = hintStartEditUnit_;
+  int hintReorderDelay = hintReorderDelay_;
+  if (!fromOpen) {
+    const SeekStartPoint seek = ResolveSeekStart(originSkip_ + startHostFrame);
+    hintStartEditUnit = seek.editUnit;
+    hintReorderDelay = seek.reorderDelay;
+    walker_.reset();
+    walker_ = std::make_unique<EssenceWalker>(*reader_, seek.byteOffset, streamInfo_.videoTrackNumber,
+                                               streamInfo_.hasVideo, walkerAudioTracks_, WalkerOptions());
+    videoDecoder_ = CreateVideoDecoder(streamInfo_.videoCodec, static_cast<int>(streamInfo_.width),
+                                        static_cast<int>(streamInfo_.height), streamInfo_.pictureEssenceCoding);
+    if (!videoDecoder_) {
+      const std::string err = "failed to create a video decoder for the restart at frame " +
+                              std::to_string(startHostFrame);
+      videoBuffer_->SignalError(err, videoGen);
+      if (audioBuffer_) audioBuffer_->SignalError(err, audioGen);
+      return;
+    }
+  }
 
   // Discard the leading `originSkip_` video essence elements (Origin
   // pre-roll/trim, see MxfStreamInfo::origin) before host frame 0 is ever
@@ -715,7 +827,7 @@ void SourceEngine::DecodeThreadMain() {
     if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
       for (int64_t i = 0; i < originSkip_; ++i) {
         if (!SkipNextVideoElement(*walker_)) {
-          videoBuffer_->SignalError(originError);
+          videoBuffer_->SignalError(originError, videoGen);
           return;
         }
       }
@@ -723,7 +835,7 @@ void SourceEngine::DecodeThreadMain() {
       NormalizedFrame discard;
       for (int64_t i = 0; i < originSkip_; ++i) {
         if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, discard, nullptr)) {
-          videoBuffer_->SignalError(originError);
+          videoBuffer_->SignalError(originError, videoGen);
           return;
         }
       }
@@ -771,7 +883,7 @@ void SourceEngine::DecodeThreadMain() {
   // starts, so the hinted case doesn't need (and doesn't get) the
   // best-effort-repeat gap described above at all.
   const int reorderDelay = hinted
-      ? hintReorderDelay_
+      ? hintReorderDelay
       : ((videoIndex_ && !IsIntraOnlyCodec(streamInfo_.videoCodec)) ? videoIndex_->EstimateReorderDelay(0) : 0);
   std::deque<std::shared_ptr<NormalizedFrame>> pending;
 
@@ -817,24 +929,26 @@ void SourceEngine::DecodeThreadMain() {
   // doc comment above) warm-up gap to pendingAudio's first few Put() calls
   // in the main loop below.
   if (hinted) {
-    const int64_t essenceTarget = originSkip_ + firstHostFrame_;
+    const int64_t essenceTarget = originSkip_ + startHostFrame;
     const std::string hintError =
         "MXF essence ended before reaching the start_frame hint's target position (" +
-        std::to_string(firstHostFrame_) + ")";
+        std::to_string(startHostFrame) + ")";
     if (IsIntraOnlyCodec(streamInfo_.videoCodec)) {
-      for (int64_t i = hintStartEditUnit_; i < essenceTarget; ++i) {
+      for (int64_t i = hintStartEditUnit; i < essenceTarget; ++i) {
+        if (restartRequested_ || videoBuffer_->IsShutdown()) return;
         if (!SkipNextVideoElement(*walker_)) {
-          videoBuffer_->SignalError(hintError);
+          videoBuffer_->SignalError(hintError, videoGen);
           return;
         }
       }
     } else {
-      for (int64_t i = hintStartEditUnit_; i < essenceTarget; ++i) {
+      for (int64_t i = hintStartEditUnit; i < essenceTarget; ++i) {
+        if (restartRequested_ || videoBuffer_->IsShutdown()) return;
         auto discardFrame = std::make_shared<NormalizedFrame>();
         std::vector<EssenceElement> audioScratch;
         if (!DecodeNextFrame(*walker_, *videoDecoder_, essenceExhausted, scratch, *discardFrame,
                              (audioBuffer_ && !audioFailed) ? &audioScratch : nullptr)) {
-          videoBuffer_->SignalError(hintError);
+          videoBuffer_->SignalError(hintError, videoGen);
           return;
         }
         pending.push_back(std::move(discardFrame));
@@ -903,10 +1017,11 @@ void SourceEngine::DecodeThreadMain() {
   }
 
   for (;;) {
+    if (restartRequested_) return;
     const int64_t next = videoBuffer_->NextIndex();
     if (next >= streamInfo_.numFrames) {
-      videoBuffer_->SignalEndOfStream();
-      if (audioBuffer_) audioBuffer_->SignalEndOfStream();
+      videoBuffer_->SignalEndOfStream(videoGen);
+      if (audioBuffer_) audioBuffer_->SignalEndOfStream(audioGen);
       return;
     }
     // audioBuffer_ deliberately has no unconditional WaitForCapacity gate of
@@ -938,7 +1053,7 @@ void SourceEngine::DecodeThreadMain() {
     // progress is enough to justify continuing.
     for (;;) {
       if (videoBuffer_->WaitForCapacityOrTimeout(next, std::chrono::milliseconds(20))) break;
-      if (videoBuffer_->IsShutdown()) return;
+      if (videoBuffer_->IsShutdown() || restartRequested_) return;
       if (audioBuffer_ && audioBuffer_->WantsMore(next)) break;
     }
 
@@ -953,8 +1068,8 @@ void SourceEngine::DecodeThreadMain() {
                          (audioBuffer_ && !audioFailed) ? &audioScratch : nullptr)) {
       const std::string err =
           "MXF essence ended before reaching the declared frame count (" + std::to_string(streamInfo_.numFrames) + ")";
-      videoBuffer_->SignalError(err);
-      if (audioBuffer_) audioBuffer_->SignalError(err);
+      videoBuffer_->SignalError(err, videoGen);
+      if (audioBuffer_) audioBuffer_->SignalError(err, audioGen);
       return;
     }
     pending.push_back(std::move(frame));
@@ -963,7 +1078,7 @@ void SourceEngine::DecodeThreadMain() {
       auto block = std::make_shared<AudioBlock>();
       std::string audioErr;
       if (!InterleaveAudioEditUnit(audioScratch, streamInfo_.audioTracks, *block, &audioErr)) {
-        audioBuffer_->SignalError("audio decode error near ring index " + std::to_string(next) + ": " + audioErr);
+        audioBuffer_->SignalError("audio decode error near ring index " + std::to_string(next) + ": " + audioErr, audioGen);
         audioFailed = true;
       } else {
         pendingAudio.push_back(std::move(block));
@@ -977,7 +1092,7 @@ void SourceEngine::DecodeThreadMain() {
     } else {
       outputFrame = pending.front();  // still warming up -- best-effort repeat, not yet consumed
     }
-    recycled = videoBuffer_->Put(next, std::move(outputFrame)).value_or(nullptr);
+    recycled = videoBuffer_->Put(next, std::move(outputFrame), videoGen).value_or(nullptr);
 
     if (audioBuffer_ && !audioFailed) {
       std::shared_ptr<AudioBlock> outputAudio;
@@ -1005,7 +1120,7 @@ void SourceEngine::DecodeThreadMain() {
         // at all) -- only this leading window's fallback changes.
         outputAudio = pendingAudio.back();
       }
-      if (outputAudio) audioBuffer_->Put(next, std::move(outputAudio));
+      if (outputAudio) audioBuffer_->Put(next, std::move(outputAudio), audioGen);
     }
   }
 }
@@ -1079,7 +1194,12 @@ FetchStatus SourceEngine::FetchAudioBlock(int64_t hostEditUnit, uint64_t byteOff
   // Mirrors GetVideoFrame's forward-seek bypass: a request far enough ahead
   // of what's actually been produced so far would otherwise block on the
   // background thread sequentially producing every intervening edit unit --
-  // go straight to the fresh-reader fallback instead.
+  // go straight to the fresh-reader fallback instead -- unless the video
+  // producer is far behind too (an audio-only consumer, or audio requested
+  // ahead of video): then move the producer there, like GetVideoFrame does.
+  // RepositionProducer checks the *video* position, so audio that only lags
+  // because its production failed doesn't keep restarting video.
+  if (hostEditUnit > audioBuffer_->HighestProduced() + audioBuffer_->Capacity()) RepositionProducer(hostEditUnit);
   if (hostEditUnit > audioBuffer_->HighestProduced() + audioBuffer_->Capacity()) {
     out = FreshReadAudioBlock(byteOffset);
     if (!out) {

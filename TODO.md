@@ -422,7 +422,7 @@ real-host step just because it's slower.
 
 ## Open items from the 2026-10-16 corpus scan
 
-### Jump to the end of a long-GOP file re-decodes every frame separately
+### Jump to the end of a long-GOP file re-decodes every frame separately -- fixed 2026-11-06, real-file check pending
 
 Observed 2026-10-19 on `SERVER/SHARE/...`
 (39.2 GB, UHD H.264 long-GOP, 30020 frames), AviSynth+ via ffmpeg:
@@ -445,8 +445,31 @@ continue from there, so the following frames come from the buffer (compare
 covers a forward jump but apparently not this access pattern).
 `start_frame` avoids it when the caller knows the range up front.
 
-Not investigated yet: whether the cause is the jump distance, the
-end-of-stream position, or the access pattern of AviSynth's `Trim`.
+Cause (found 2026-11-06 after a second user report: `Trim(1250, 6000+1250)`
+with `Prefetch(6)` on long-GOP H.264 x264-encoded fine, but the serve stats
+said 15 frames from the buffer and 6027 via fallback, followed by thousands
+of frame numbers): the jump distance. The forward-jump bypass in
+`GetVideoFrame` served the one far-ahead frame via `SeekAndDecode` but left
+the producer parked near frame 0 (its watermark never moves, nothing below
+the jump is requested), so every following frame was again more than
+`buffer_frames` ahead and took the same keyframe re-decode.
+
+Fix: `SourceEngine::RepositionProducer`. A far-ahead request (video, or
+audio when video is far behind too) resets both ring buffers to that frame
+(`FrameBuffer::Reset`, generation-checked so producer writes for the old
+position are dropped) and restarts the producer there with the
+start_frame-hint warm-up from the preceding keyframe. Frames below the new
+position are evicted and still go through `SeekAndDecode`; the producer is
+never moved backwards. The serve-stats line now prints the fallback frames
+as sorted ranges (at most 50) and the restart count. Tests:
+`TestForwardSeekBeyondWindowUsesFastPathInsteadOfSequentialWait` (now
+expects buffered serving after the jump),
+`TestForwardJumpWithConcurrentRequestsRepositionsOnce`,
+`TestForwardJumpRepositionsAudioToo`.
+
+Still to check on the real files: the 30020-frame UHD file above (last 25
+frames) and the user's Trim + Prefetch script should both show (almost) all
+frames from the buffer and one restart.
 
 ### Corpus re-run against the 2026-10-16 baseline -- done 2026-10-19
 
@@ -796,11 +819,11 @@ Before deciding: measure more Prefetch levels (2/8/16/32) and wider temporal
 radii. Test files and bench script: a 30 min XDCAM HD422 RDD9 and a 2 min UHD
 10-bit 4:2:2 long-GOP H.264 MXF, both generated with ffmpeg.
 
-Note: after a far jump (beyond highestProduced + buffer_frames) every
-following frame goes through SeekAndDecode and the buffer settings have no
-effect -- see "Jump to the end of a long-GOP file re-decodes every frame
-separately" above. That, not the buffer size, is what makes AvsPmod slow
-after a jump.
+Note: before 2026-11-06, after a far jump (beyond highestProduced +
+buffer_frames) every following frame went through SeekAndDecode and the
+buffer settings had no effect -- see "Jump to the end of a long-GOP file
+re-decodes every frame separately" above (now fixed). Re-measure AvsPmod
+after a jump before drawing conclusions from the earlier numbers.
 
 ### 4. Review of "forward-only" wording in comments -- parked 2026-11-06
 
