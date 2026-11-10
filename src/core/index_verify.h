@@ -42,6 +42,8 @@ struct IndexVerifyResult {
   // keep the layout of the good entries (an entry may point at the content
   // package's System Item or straight at the picture element).
   std::vector<uint64_t> videoElementOffsets;
+  // Read requests made to the file (blocks with kStreaming), all readers.
+  uint64_t readRequests = 0;
 };
 
 // Checks every entry: at its byteOffset a KLV must start, and walking on from
@@ -49,11 +51,34 @@ struct IndexVerifyResult {
 // track must come before the next entry's offset (else: `issues`). Offsets
 // must increase and lie inside the file. From that picture element on, the
 // KLV headers must chain without damage exactly to the next entry's offset
-// (else: `essenceDamage`). Costs a few small reads per entry; entries are
-// checked on several threads, each with its own reader (one range request
-// per read over http(s), so this is slow on remote files).
+// (else: `essenceDamage`). One pass: each entry and the stretch up to the next
+// one are checked together, in file order.
+//
+// One request per frame: everything the checks need between the end of one
+// picture and the start of the next (the stretch to the next entry, that
+// entry's KLV headers, the first bytes of its picture) is contiguous and
+// fetched in one piece (RangeByteSource); the picture data itself is not
+// read.
+//
+// `overlapping`: requests in flight at once -- that many threads, each with
+// its own reader and its own runs of entries. 0 = auto: 16 over http(s), 4 on
+// a network share or a local drive without seek penalty (IsLocalSolidState),
+// 1 on any other local drive.
+//
+// `reads`: kRanges reads as above. kStreaming reads the whole file front to
+// back in large blocks with one reader (StreamingFileByteSource): on a hard
+// disk, rotating past the picture data costs about as much as reading it,
+// and the drive streams. kAuto: kStreaming for a local file on a drive with
+// seek penalty (or one that doesn't say) when `overlapping` comes to 1,
+// kRanges otherwise.
+enum class VerifyReads { kAuto, kRanges, kStreaming };
+
+// Upper bound for `overlapping`.
+inline constexpr int kMaxVerifyOverlapping = 64;
+
 IndexVerifyResult VerifyEssenceIndex(const std::string& path, const std::string& httpHeaders,
-                                     const EssenceIndex& index, const MxfStreamInfo& info);
+                                     const EssenceIndex& index, const MxfStreamInfo& info, int overlapping = 0,
+                                     VerifyReads reads = VerifyReads::kAuto);
 
 struct IndexRepairResult {
   EssenceIndex index;  // all entries, wrong ones replaced where possible

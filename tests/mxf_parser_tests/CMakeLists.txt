@@ -44,6 +44,9 @@ add_executable(mxf_index_verify_tests
 )
 target_compile_features(mxf_index_verify_tests PRIVATE cxx_std_17)
 target_link_libraries(mxf_index_verify_tests PRIVATE mxf_core)
+if(WIN32)
+  target_link_libraries(mxf_index_verify_tests PRIVATE ws2_32)
+endif()
 mxfsrc_deploy_ffmpeg_runtime(mxf_index_verify_tests)
 add_test(NAME mxf_index_verify_tests COMMAND mxf_index_verify_tests)
 
@@ -165,6 +168,12 @@ add_executable(time_extract_index EXCLUDE_FROM_ALL
 )
 target_compile_features(time_extract_index PRIVATE cxx_std_17)
 target_link_libraries(time_extract_index PRIVATE mxf_core)
+
+add_executable(bench_verify_index EXCLUDE_FROM_ALL
+  bench_verify_index.cpp
+)
+target_compile_features(bench_verify_index PRIVATE cxx_std_17)
+target_link_libraries(bench_verify_index PRIVATE mxf_core)
 
 add_executable(bench_extract_index EXCLUDE_FROM_ALL
   bench_extract_index.cpp

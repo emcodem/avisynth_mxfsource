@@ -8,6 +8,7 @@
 
 #include "avisynth.h"
 #include "core/index_extract.h"
+#include "core/index_verify.h"
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
@@ -260,6 +261,10 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   const int backSeekPreroll = args[12].AsInt(OpenOptions().back_seek_preroll);
   const bool trace = args[13].AsBool(false);
   const int readCache = args[14].AsInt(OpenOptions().read_cache);
+  const int verifyOverlapping = args[15].AsInt(0);
+  if (verifyOverlapping < 0 || verifyOverlapping > mxfsrc::kMaxVerifyOverlapping) {
+    env->ThrowError("MxfSource: verify_overlapping must be 0 (auto) to %d", mxfsrc::kMaxVerifyOverlapping);
+  }
   if (backSeekPreroll < 0) env->ThrowError("MxfSource: back_seek_preroll must not be negative");
   if (readCache < -1) env->ThrowError("MxfSource: read_cache must be -1 (auto), 0 (off) or a size in MB");
 
@@ -279,6 +284,7 @@ AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvi
   options.strict = strict;
   options.debug = debug;
   options.verify = verify;
+  options.verify_overlapping = verifyOverlapping;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     env->ThrowError("MxfSource: %s", result.error.c_str());
@@ -295,8 +301,13 @@ AVSValue __cdecl CreateMxfExtractIndex(AVSValue args, void* /*user_data*/, IScri
   const char* httpHeaders = args[2].AsString("");
   const bool strict = args[3].AsBool(true);
   const bool verify = args[4].AsBool(false);
+  const int verifyOverlapping = args[5].AsInt(0);
+  if (verifyOverlapping < 0 || verifyOverlapping > mxfsrc::kMaxVerifyOverlapping) {
+    env->ThrowError("MxfExtractIndex: verify_overlapping must be 0 (auto) to %d", mxfsrc::kMaxVerifyOverlapping);
+  }
 
-  const ExtractIndexResult result = ExtractAndPublishIndex(path, targetUrl, httpHeaders, strict, verify);
+  const ExtractIndexResult result =
+      ExtractAndPublishIndex(path, targetUrl, httpHeaders, strict, verify, verifyOverlapping);
   if (!result.ok) env->ThrowError("MxfExtractIndex: %s", result.error.c_str());
 
   return AVSValue(true);
@@ -323,10 +334,11 @@ extern "C" MXFSRC_AVS_EXPORT const char* __stdcall AvisynthPluginInit3(
   env->AddFunction(
       "MxfSource",
       "[file]s[buffer_frames]i[eagerdecode]i[logfile]s[httpheaders]s[handle_origin]b[use_audio]s"
-      "[indexurl]s[start_frame]i[strict]b[debug]b[verify]b[back_seek_preroll]i[trace]b[read_cache]i",
+      "[indexurl]s[start_frame]i[strict]b[debug]b[verify]b[back_seek_preroll]i[trace]b[read_cache]i"
+      "[verify_overlapping]i",
       CreateMxfSource, nullptr);
-  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b[verify]b", CreateMxfExtractIndex,
-                   nullptr);
+  env->AddFunction("MxfExtractIndex", "[file]s[targeturl]s[httpheaders]s[strict]b[verify]b[verify_overlapping]i",
+                   CreateMxfExtractIndex, nullptr);
   env->AddFunction("MxfSourceVersion", "", CreateMxfSourceVersion, nullptr);
   return "MXF source plugin " MXFSRC_VERSION;
 }

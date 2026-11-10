@@ -11,7 +11,8 @@
 namespace mxfsrc {
 
 ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const std::string& targetUrl,
-                                           const std::string& httpHeaders, bool strict, bool verify) {
+                                           const std::string& httpHeaders, bool strict, bool verify,
+                                           int verifyOverlapping) {
   MxfReader reader(sourcePath, httpHeaders);
   if (!reader.IsOpen()) {
     std::string error = "failed to open file: " + sourcePath;
@@ -47,7 +48,7 @@ ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const s
     return {false, *error};
   }
   if (verify) {
-    const IndexVerification verification = ApplyIndexVerification(sourcePath, httpHeaders, *info, strict, index);
+    const IndexVerification verification = ApplyIndexVerification(sourcePath, httpHeaders, *info, strict, index, verifyOverlapping);
     if (verification.error) return {false, *verification.error};
     for (const std::string& warning : verification.warnings) {
       std::fprintf(stderr, "[MxfExtractIndex] %s: %s\n", sourcePath.c_str(), warning.c_str());

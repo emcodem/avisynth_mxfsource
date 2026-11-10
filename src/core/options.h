@@ -191,9 +191,17 @@ struct OpenOptions {
   // index_url) against the essence before opening -- see core/
   // index_verify.h. With `strict`, a wrong index fails Open(); without, the
   // wrong entries are repaired from the essence where possible and logged
-  // as warnings. Costs one or a few small reads per frame. Off by default.
+  // as warnings. Costs one small read per frame. Off by default.
   // Exposed to scripts as MxfSource(..., verify=true).
   bool verify = false;
+
+  // With `verify`: reads in flight at once while checking (threads, each
+  // with its own reader). 0 = auto: 16 over http(s), 4 on a network share or
+  // an SSD, 1 on a hard disk (which then reads the whole file front to back
+  // instead). More hides more network latency; on a share backed by hard
+  // disks it makes the server's disks seek. At most kMaxVerifyOverlapping
+  // (64). Exposed to scripts as verify_overlapping=.
+  int verify_overlapping = 0;
 };
 
 } // namespace mxfsrc

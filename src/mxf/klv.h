@@ -54,6 +54,11 @@ class IByteSource {
   // the file. Reading on past it must still work. See ByteCache.
   virtual bool SeekForRange(uint64_t pos, uint64_t /*endHint*/) { return Seek(pos); }
 
+  // The reader is about to read bytes in [start, end): a source that fetches
+  // in requests (RangeByteSource) can get them all with one. A hint only;
+  // the position doesn't change, and other sources ignore it.
+  virtual void Prefetch(uint64_t /*start*/, uint64_t /*end*/) {}
+
   // True if arbitrary byte ranges of this source can be fetched
   // independently of one another (e.g. concurrent ranged GETs against the
   // same URL) -- local files and a range-capable HTTP server are both true;
@@ -100,6 +105,10 @@ class MxfReader {
   bool Seek(uint64_t pos);
   uint64_t Size() const;
   std::string LastError() const;
+  // See IByteSource::Prefetch.
+  void Prefetch(uint64_t start, uint64_t end) {
+    if (source_) source_->Prefetch(start, end);
+  }
 
   bool ReadBytes(void* dst, size_t n);
   bool ReadU8(uint8_t& v);

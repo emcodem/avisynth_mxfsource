@@ -21,6 +21,11 @@ std::unique_ptr<IByteSource> OpenByteSource(const std::string& path, const std::
 // (\\server\share, //server/share) or, on Windows, a mapped network drive.
 bool IsNetworkSource(const std::string& path);
 
+// True only if `path` is on a local drive that says it has no seek penalty
+// (SSD, NVMe). False for a hard disk, a network path, and whenever the drive
+// doesn't say (some USB bridges, RAID or Storage Spaces volumes).
+bool IsLocalSolidState(const std::string& path);
+
 // Read cache for one source file, shared by every reader SourceEngine opens
 // on it: the background decoder's, each restart's, and the one-off readers
 // for separately decoded frames and audio blocks. Holds the file in 64 KiB

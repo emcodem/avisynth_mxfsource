@@ -30,8 +30,9 @@ struct ExtractIndexResult {
 // is checked against the essence first (core/index_policy.h's
 // ApplyIndexVerification); with `strict` a wrong index is refused, without
 // it the repaired index is published and the warnings go to stderr.
+// `verifyOverlapping` has the meaning of OpenOptions::verify_overlapping.
 ExtractIndexResult ExtractAndPublishIndex(const std::string& sourcePath, const std::string& targetUrl,
                                            const std::string& httpHeaders = {}, bool strict = true,
-                                           bool verify = false);
+                                           bool verify = false, int verifyOverlapping = 0);
 
 }  // namespace mxfsrc

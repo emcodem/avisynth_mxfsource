@@ -339,7 +339,8 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   if (options.verify) {
     if (videoIndex_ && !videoIndex_->Empty()) {
       const IndexVerification verification =
-          ApplyIndexVerification(path_, httpHeaders_, streamInfo_, options.strict, *videoIndex_);
+          ApplyIndexVerification(path_, httpHeaders_, streamInfo_, options.strict, *videoIndex_,
+                                 options.verify_overlapping);
       if (verification.error) return {OpenStatus::kDamagedFile, *verification.error};
       for (const std::string& warning : verification.warnings) {
         AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": " + warning);

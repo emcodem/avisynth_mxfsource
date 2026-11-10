@@ -1,5 +1,8 @@
 #include "mxf/file_byte_source.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include "mxf/file_open.h"
 
 #if defined(_WIN32)
@@ -14,9 +17,10 @@ using mxfsrc_off_t = off_t;
 
 namespace mxfsrc {
 
-FileByteSource::FileByteSource(const std::string& path) {
+FileByteSource::FileByteSource(const std::string& path, bool unbuffered) {
   file_ = OpenFile(path, "rb");
   if (file_) {
+    if (unbuffered) setvbuf(file_, nullptr, _IONBF, 0);
     MXFSRC_FSEEK(file_, 0, SEEK_END);
     mxfsrc_off_t end = MXFSRC_FTELL(file_);
     size_ = end > 0 ? static_cast<uint64_t>(end) : 0;
@@ -71,6 +75,60 @@ bool FileByteSource::Skip(uint64_t n) {
     return true;
   }
   return MXFSRC_FSEEK(file_, static_cast<mxfsrc_off_t>(n), SEEK_CUR) == 0;
+}
+
+StreamingFileByteSource::StreamingFileByteSource(const std::string& path, size_t blockBytes)
+    : file_(path, /*unbuffered=*/true), block_(blockBytes > 0 ? blockBytes : 1) {}
+
+bool StreamingFileByteSource::Load(uint64_t pos) {
+  // Just past the current block and within one more block: read on from the
+  // block's end, so the file is read contiguously without a seek.
+  const uint64_t blockEnd = blockStart_ + blockLen_;
+  const uint64_t start = (blockLen_ > 0 && pos >= blockEnd && pos - blockEnd < block_.size()) ? blockEnd : pos;
+  const uint64_t size = file_.Size();
+  if (start >= size) return false;
+  const size_t len = static_cast<size_t>(std::min<uint64_t>(block_.size(), size - start));
+  if (filePos_ != start && !file_.Seek(start)) {
+    filePos_ = UINT64_MAX;
+    return false;
+  }
+  if (!file_.ReadBytes(block_.data(), len)) {
+    filePos_ = UINT64_MAX;
+    blockLen_ = 0;
+    return false;
+  }
+  filePos_ = start + len;
+  blockStart_ = start;
+  blockLen_ = len;
+  ++blocksRead_;
+  return true;
+}
+
+bool StreamingFileByteSource::ReadBytes(void* dst, size_t n) {
+  if (!file_.IsOpen()) return n == 0;
+  auto* out = static_cast<uint8_t*>(dst);
+  if (pos_ + n > file_.Size()) {
+    // Past the size known at open (a growing file): straight from the file.
+    if (!file_.Seek(pos_) || !file_.ReadBytes(out, n)) {
+      filePos_ = UINT64_MAX;
+      return false;
+    }
+    pos_ += n;
+    filePos_ = pos_;
+    return true;
+  }
+  while (n > 0) {
+    if (pos_ < blockStart_ || pos_ >= blockStart_ + blockLen_) {
+      if (!Load(pos_)) return false;
+    }
+    const size_t offset = static_cast<size_t>(pos_ - blockStart_);
+    const size_t chunk = std::min(n, blockLen_ - offset);
+    std::memcpy(out, block_.data() + offset, chunk);
+    out += chunk;
+    n -= chunk;
+    pos_ += chunk;
+  }
+  return true;
 }
 
 }  // namespace mxfsrc

@@ -127,6 +127,7 @@ keyword args to `core.mxfsource.MxfSource(...)`):
 | `start_frame` | int | `0` | Performance hint: the first frame the caller will request. The decode thread starts at the nearest keyframe before it (via the Index Table) instead of at frame 0, so a pipeline that processes a chunk far into the file is served from the ring buffer. Earlier frames still work, just without this optimization. Values `<= 0` or past the end are ignored. |
 | `strict` | bool (VapourSynth: int) | `true` | Refuse incomplete/damaged files with an explicit error instead of opening whatever can be salvaged, and never scan the whole file to build an index -- see [Strict mode](#strict-mode). |
 | `verify` | bool (VapourSynth: int) | `false` | Check every index entry against the essence before opening, see [Verifying an index](#verifying-an-index). With `strict`, a wrong index or damaged essence fails the open; without, wrong entries are repaired from the essence. |
+| `verify_overlapping` | int | `0` (auto) | With `verify`: reads in flight at once while checking (1-64). Auto: 16 for `http(s)://`, 4 for a network share or an SSD, 1 for a hard disk. See [Verifying an index](#verifying-an-index). |
 | `trace` | bool (VapourSynth: int) | `false` | Log one line per frame request (frame, from the buffer or decoded separately, after a decoder restart or not, time taken, buffer range) and every decoder run (start, keyframe, how it ended) to `logfile`, and with `debug` to stderr. For diagnosing seeking and playback in an editor; slows down a fast encode. |
 | `debug` | bool (VapourSynth: int) | `false` | Also print informational messages to stderr, such as the serve-stats summary when the clip closes (frames served from the ring buffer vs. via fallback re-decode). By default only warnings are printed (damaged essence, missing index, audio dropped, ...). |
 
@@ -138,7 +139,7 @@ r = core.mxfsource.MxfSource("file.mxf")
 clip = r if isinstance(r, vs.VideoNode) else r["clip"]
 ```
 
-`MxfExtractIndex(file, targeturl, httpheaders="", strict=true, verify=false)`
+`MxfExtractIndex(file, targeturl, httpheaders="", strict=true, verify=false, verify_overlapping=0)`
 (both hosts; `strict` and `verify` are ints in VapourSynth) builds the essence
 index of `file` and
 publishes it as JSON to `targeturl` (local path or `http(s)://` URL, written
@@ -314,10 +315,28 @@ The last two catch an index shifted by whole frames, whose offsets all land
 on valid KLVs: without `verify`, such an index makes seeks return the wrong
 frame without any error.
 
-Only KLV headers and the first 1 KiB of each frame are read: a few small
-reads per frame, spread over several threads. For a local file that is seconds for a feature
-length file; over `http(s)://` every read is a range request, so it takes
-much longer.
+The picture data itself is never needed. Everything the checks read between
+the end of one picture and the start of the next -- the sound elements up to
+the next entry, that entry's KLV headers, the first 1 KiB of its picture --
+lies in one piece, so it is fetched with **one read per frame** (one range
+request over `http(s)://`). On an XDCAM HD file with 8 sound tracks that is
+about 50 KB per frame.
+
+`verify_overlapping` sets how many of these reads are in flight at once
+(threads). Over a network the time is mostly latency: about frames x
+latency / `verify_overlapping`, for 45000 frames at 5 ms with 4 that is
+about a minute, with 16 about 15 s, until the line is full. On a share whose
+server keeps the file on hard disks, many overlapping reads make those disks
+seek, so start low there. Auto:
+
+- **SSD / NVMe** (the drive reports no seek penalty) and **network shares**: 4.
+- **`http(s)://`**: 16.
+- **Hard disk, or a local drive that doesn't say** (some USB enclosures,
+  RAID volumes): 1, and the whole file is read front to back in 8 MiB
+  blocks instead. The platter has to turn past the picture data anyway, so
+  reading it costs about as much as skipping it and the disk streams (at
+  150 MB/s, about a minute for 10 GB). A value above 1 uses the per-frame
+  reads on a hard disk too.
 
 | | `strict=true` (default) | `strict=false` |
 |---|---|---|

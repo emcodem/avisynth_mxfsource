@@ -138,9 +138,10 @@ EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
 namespace mxfsrc {
 
 IndexVerification ApplyIndexVerification(const std::string& path, const std::string& httpHeaders,
-                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index) {
+                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index,
+                                         int overlapping) {
   IndexVerification out;
-  const IndexVerifyResult verified = VerifyEssenceIndex(path, httpHeaders, index, info);
+  const IndexVerifyResult verified = VerifyEssenceIndex(path, httpHeaders, index, info, overlapping);
   if (verified.error) {
     out.error = *verified.error;
     return out;

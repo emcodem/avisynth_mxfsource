@@ -65,6 +65,8 @@ add_library(mxf_core STATIC
   src/mxf/file_byte_source.cpp
   src/mxf/byte_cache.cpp
   src/mxf/byte_cache.h
+  src/mxf/range_byte_source.cpp
+  src/mxf/range_byte_source.h
   src/mxf/file_open.cpp
   src/mxf/integrity.cpp
   src/mxf/integrity.h

@@ -13,6 +13,7 @@
 
 #include "VapourSynth4.h"
 #include "core/index_extract.h"
+#include "core/index_verify.h"
 #include "core/options.h"
 #include "core/source_engine.h"
 #include "core/use_audio_mode.h"
@@ -263,6 +264,21 @@ void VS_CC MxfAudioFree(void* instanceData, VSCore* /*core*/, const VSAPI* /*vsa
   delete static_cast<MxfAudioData*>(instanceData);
 }
 
+// verify_overlapping= (0 = auto when not given); false with the error set
+// when out of range.
+bool ReadVerifyOverlapping(const VSMap* in, VSMap* out, const VSAPI* vsapi, const char* function, int& value) {
+  int err = 0;
+  const int64_t arg = vsapi->mapGetInt(in, "verify_overlapping", 0, &err);
+  value = err ? 0 : static_cast<int>(std::clamp<int64_t>(arg, -1, mxfsrc::kMaxVerifyOverlapping + 1));
+  if (value < 0 || value > mxfsrc::kMaxVerifyOverlapping) {
+    vsapi->mapSetError(out, (std::string(function) + ": verify_overlapping must be 0 (auto) to " +
+                             std::to_string(mxfsrc::kMaxVerifyOverlapping))
+                                .c_str());
+    return false;
+  }
+  return true;
+}
+
 void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCore* core, const VSAPI* vsapi) {
   int err = 0;
   const char* path = vsapi->mapGetData(in, "file", 0, &err);
@@ -328,6 +344,8 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
     vsapi->mapSetError(out, "MxfSource: read_cache must be -1 (auto), 0 (off) or a size in MB");
     return;
   }
+  int verifyOverlapping = 0;
+  if (!ReadVerifyOverlapping(in, out, vsapi, "MxfSource", verifyOverlapping)) return;
 
   auto engine = std::make_shared<SourceEngine>();
   OpenOptions options;
@@ -345,6 +363,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   options.strict = strict;
   options.debug = debug;
   options.verify = verify;
+  options.verify_overlapping = verifyOverlapping;
   const OpenResult result = engine->Open(path, options);
   if (result.status != OpenStatus::kOk) {
     vsapi->mapSetError(out, ("MxfSource: " + result.error).c_str());
@@ -458,8 +477,10 @@ void VS_CC CreateMxfExtractIndex(const VSMap* in, VSMap* out, void* /*userData*/
   int verifyErr = 0;
   const int64_t verifyArg = vsapi->mapGetInt(in, "verify", 0, &verifyErr);
   const bool verify = verifyErr ? false : (verifyArg != 0);
+  int verifyOverlapping = 0;
+  if (!ReadVerifyOverlapping(in, out, vsapi, "MxfExtractIndex", verifyOverlapping)) return;
   const ExtractIndexResult result =
-      ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders, strict, verify);
+      ExtractAndPublishIndex(path, targetUrl, httpHeadersErr ? "" : httpHeaders, strict, verify, verifyOverlapping);
   if (!result.ok) {
     vsapi->mapSetError(out, ("MxfExtractIndex: " + result.error).c_str());
     return;
@@ -482,13 +503,16 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
   vspapi->registerFunction(
       "MxfSource",
       "file:data;buffer_frames:int:opt;eagerdecode:int:opt;logfile:data:opt;httpheaders:data:opt;"
-      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;back_seek_preroll:int:opt;trace:int:opt;read_cache:int:opt;",
+      "handle_origin:int:opt;use_audio:data:opt;indexurl:data:opt;start_frame:int:opt;strict:int:opt;debug:int:opt;verify:int:opt;back_seek_preroll:int:opt;trace:int:opt;read_cache:int:opt;"
+      "verify_overlapping:int:opt;",
       // "audio" is only actually present in the output VSMap for files whose
       // audio is exposed (see CreateMxfSource's early return when
       // !engine->ExposesAudio()) -- declared here regardless since the
       // return type spec is fixed for the plugin's whole lifetime, not
       // per-invocation.
       "clip:vnode;audio:anode;", CreateMxfSource, nullptr, plugin);
-  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;strict:int:opt;verify:int:opt;", "result:int;",
+  vspapi->registerFunction("MxfExtractIndex", "file:data;targeturl:data;httpheaders:data:opt;strict:int:opt;verify:int:opt;"
+                           "verify_overlapping:int:opt;",
+                           "result:int;",
                             CreateMxfExtractIndex, nullptr, plugin);
 }

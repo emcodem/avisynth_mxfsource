@@ -12,6 +12,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>
+#elif defined(__linux__)
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+
+#include <cstdio>
 #endif
 
 namespace mxfsrc {
@@ -40,6 +46,56 @@ bool IsNetworkSource(const std::string& path) {
   }
 #endif
   return false;
+}
+
+bool IsLocalSolidState(const std::string& path) {
+  if (path.empty() || IsNetworkSource(path)) return false;
+#if defined(_WIN32)
+  std::wstring wide;
+  for (const UINT codePage : {static_cast<UINT>(CP_UTF8), static_cast<UINT>(CP_ACP)}) {
+    const DWORD flags = codePage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0;
+    const int len = MultiByteToWideChar(codePage, flags, path.data(), static_cast<int>(path.size()), nullptr, 0);
+    if (len <= 0) continue;
+    wide.assign(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(codePage, flags, path.data(), static_cast<int>(path.size()), wide.data(), len);
+    break;
+  }
+  if (wide.empty()) return false;
+  wchar_t mountPoint[MAX_PATH + 1] = {};
+  if (!GetVolumePathNameW(wide.c_str(), mountPoint, MAX_PATH)) return false;
+  wchar_t volume[MAX_PATH + 1] = {};
+  if (!GetVolumeNameForVolumeMountPointW(mountPoint, volume, MAX_PATH)) return false;
+  std::wstring device = volume;  // \\?\Volume{guid}\ -- the volume itself without the backslash
+  if (!device.empty() && device.back() == L'\\') device.pop_back();
+  const HANDLE h = CreateFileW(device.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                               nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  STORAGE_PROPERTY_QUERY query{};
+  query.PropertyId = StorageDeviceSeekPenaltyProperty;
+  query.QueryType = PropertyStandardQuery;
+  DEVICE_SEEK_PENALTY_DESCRIPTOR penalty{};
+  DWORD bytes = 0;
+  const BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &penalty, sizeof(penalty),
+                                  &bytes, nullptr);
+  CloseHandle(h);
+  return ok && bytes >= sizeof(penalty) && !penalty.IncursSeekPenalty;
+#elif defined(__linux__)
+  // The block device's queue/rotational (a partition has it on its
+  // parent disk).
+  struct stat st {};
+  if (stat(path.c_str(), &st) != 0) return false;
+  const std::string dev = "/sys/dev/block/" + std::to_string(major(st.st_dev)) + ":" + std::to_string(minor(st.st_dev));
+  for (const char* rel : {"/queue/rotational", "/../queue/rotational"}) {
+    if (FILE* f = std::fopen((dev + rel).c_str(), "r")) {
+      const int c = std::fgetc(f);
+      std::fclose(f);
+      return c == '0';
+    }
+  }
+  return false;
+#else
+  return false;
+#endif
 }
 
 ByteCache::ByteCache(std::string path, std::string httpHeaders, uint64_t size, bool randomAccess,

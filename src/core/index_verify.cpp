@@ -8,7 +8,10 @@
 #include <mutex>
 #include <thread>
 
+#include "mxf/byte_cache.h"
 #include "mxf/essence_walker.h"
+#include "mxf/file_byte_source.h"
+#include "mxf/range_byte_source.h"
 #include "mxf/h264_bitstream.h"
 #include "mxf/klv.h"
 #include "mxf/mpeg2_bitstream.h"
@@ -21,8 +24,23 @@ constexpr uint64_t kNoBound = std::numeric_limits<uint64_t>::max();
 // Entries per work item: contiguous runs keep each worker's reads moving
 // forward through the file.
 constexpr size_t kEntriesPerChunk = 256;
-constexpr size_t kLocalWorkers = 4;
-constexpr size_t kHttpWorkers = 16;
+// verify_overlapping=0 (auto): requests in flight on a fast or network
+// source.
+constexpr int kLocalWorkers = 4;
+constexpr int kHttpWorkers = 16;
+// Bytes past the next entry's offset fetched with the stretch to it (the
+// entry's "head"): everything from the entry to its picture element (System
+// Item, sound elements placed before the picture, Fill) plus the start of
+// the picture the type check reads. Learned per reader from the previous
+// entry, within these bounds; when it falls short, the rest costs one more
+// request. Beyond the maximum (e.g. a large KAG Fill before every picture)
+// the second request is cheaper than reading the fill.
+constexpr uint64_t kMinEntryHeadBytes = 4096;
+constexpr uint64_t kMaxEntryHeadBytes = 256 * 1024;
+// A stretch from a picture's end to the next entry longer than this (e.g.
+// many uncompressed sound tracks, or a wrong next entry) is not fetched in
+// one piece; it is read in RangeByteSource::kMissBytes pieces as needed.
+constexpr uint64_t kMaxStretchBytes = 16 * 1024 * 1024;
 // The repair walk ends this many consecutive agreeing entries after the last
 // wrong one -- more than a long GOP, so a region shifted by whole edit units
 // is not ended early by entries that pass by coincidence.
@@ -125,35 +143,55 @@ std::optional<std::string> CheckEntryOffset(MxfReader& reader, uint64_t offset, 
   return std::nullopt;
 }
 
-// Runs `check(reader, i)` for i in [0, n) on several threads, each with its
-// own reader, in contiguous chunks. Returns an error if a reader can't open.
+// Runs `check(reader, head, i)` for i in [0, n) in contiguous chunks, on
+// `workers` threads, each with its own reader: a StreamingFileByteSource
+// with `streaming`, a RangeByteSource otherwise. `head` is the reader's
+// entry head size (kMinEntryHeadBytes at the start), kept across its
+// entries. Within a chunk, entries go in file order. Adds the readers'
+// requests to `requests`. Returns an error if a reader can't open.
 template <typename Check>
-std::optional<std::string> ParallelForEntries(const std::string& path, const std::string& httpHeaders, size_t n,
-                                              Check check) {
+std::optional<std::string> ForEntries(const std::string& path, const std::string& httpHeaders, size_t n,
+                                      size_t workers, bool streaming, uint64_t& requests, Check check) {
   if (n == 0) return std::nullopt;
   const size_t chunks = (n + kEntriesPerChunk - 1) / kEntriesPerChunk;
-  const size_t workerCount = std::min(IsHttpUrl(path) ? kHttpWorkers : kLocalWorkers, chunks);
+  const size_t workerCount = std::max<size_t>(1, std::min(workers, chunks));
   std::atomic<size_t> nextChunk{0};
+  std::atomic<uint64_t> requestCount{0};
   std::mutex errorMutex;
   std::optional<std::string> error;
   auto work = [&] {
-    MxfReader reader(path, httpHeaders);
+    std::unique_ptr<IByteSource> source;
+    const StreamingFileByteSource* streamingSource = nullptr;
+    const RangeByteSource* rangeSource = nullptr;
+    if (streaming) {
+      auto s = std::make_unique<StreamingFileByteSource>(path);
+      streamingSource = s.get();
+      source = std::move(s);
+    } else {
+      auto s = std::make_unique<RangeByteSource>(OpenRangeByteSource(path, httpHeaders));
+      rangeSource = s.get();
+      source = std::move(s);
+    }
+    MxfReader reader(std::move(source));
     if (!reader.IsOpen()) {
       std::lock_guard<std::mutex> lock(errorMutex);
       if (!error) error = "verify: failed to open file: " + path;
       return;
     }
+    uint64_t head = kMinEntryHeadBytes;
     for (;;) {
       const size_t chunk = nextChunk.fetch_add(1);
       if (chunk >= chunks) break;
       const size_t end = std::min(n, (chunk + 1) * kEntriesPerChunk);
-      for (size_t i = chunk * kEntriesPerChunk; i < end; ++i) check(reader, i);
+      for (size_t i = chunk * kEntriesPerChunk; i < end; ++i) check(reader, head, i);
     }
+    requestCount += streamingSource ? streamingSource->BlocksRead() : rangeSource->Requests();
   };
-  std::vector<std::thread> workers;
-  workers.reserve(workerCount);
-  for (size_t w = 0; w < workerCount; ++w) workers.emplace_back(work);
-  for (auto& t : workers) t.join();
+  std::vector<std::thread> threads;
+  threads.reserve(workerCount);
+  for (size_t w = 0; w < workerCount; ++w) threads.emplace_back(work);
+  for (auto& t : threads) t.join();
+  requests += requestCount;
   return error;
 }
 
@@ -204,7 +242,8 @@ ChainProblem CheckChainTo(MxfReader& reader, uint64_t from, uint64_t nextEntryOf
 }  // namespace
 
 IndexVerifyResult VerifyEssenceIndex(const std::string& path, const std::string& httpHeaders,
-                                     const EssenceIndex& index, const MxfStreamInfo& info) {
+                                     const EssenceIndex& index, const MxfStreamInfo& info, int overlapping,
+                                     VerifyReads reads) {
   IndexVerifyResult result;
   const std::vector<FlatIndexEntry>& entries = index.GetEntries();
   const size_t n = entries.size();
@@ -212,34 +251,60 @@ IndexVerifyResult VerifyEssenceIndex(const std::string& path, const std::string&
   result.videoElementOffsets.assign(n, 0);
   if (n == 0) return result;
 
-  // Pass 1: each entry leads to its own picture element.
+  const bool network = IsNetworkSource(path);  // also true for http(s)
+  const bool solidState = !network && IsLocalSolidState(path);
+  int workers = std::min(overlapping, kMaxVerifyOverlapping);
+  if (workers <= 0) workers = IsHttpUrl(path) ? kHttpWorkers : (network || solidState) ? kLocalWorkers : 1;
+  bool streaming = !IsHttpUrl(path) && (reads == VerifyReads::kStreaming ||
+                                        (reads == VerifyReads::kAuto && workers == 1 && !network && !solidState));
+  if (streaming) workers = 1;
+
+  // Per entry i, in file order: the entry leads to its own picture element
+  // (problems[i]); from there the essence chains without damage to the next
+  // entry (damage[i]), passing no other picture element (skipped[i + 1]: the
+  // next entry skips an edit unit). The chain is only counted below if the
+  // next entry is good too. Iteration i writes only problems[i], damage[i]
+  // and skipped[i + 1].
   std::vector<std::optional<std::string>> problems(n);
-  std::vector<uint64_t> videoEnds(n, 0);
-  result.error = ParallelForEntries(path, httpHeaders, n, [&](MxfReader& reader, size_t i) {
+  std::vector<std::optional<std::string>> damage(n);
+  std::vector<std::optional<std::string>> skipped(n);
+  result.error = ForEntries(path, httpHeaders, n, static_cast<size_t>(workers), streaming, result.readRequests,
+                            [&](MxfReader& reader, uint64_t& head, size_t i) {
     if (i > 0 && entries[i].byteOffset <= entries[i - 1].byteOffset) {
       problems[i] =
           "offset does not increase (previous entry is at byte " + std::to_string(entries[i - 1].byteOffset) + ")";
       return;
     }
     const uint64_t next = i + 1 < n ? entries[i + 1].byteOffset : kNoBound;
+    // Usually already fetched with the previous entry's stretch; else (first
+    // entry of a run, previous entry bad) one request here.
+    reader.Prefetch(entries[i].byteOffset, entries[i].byteOffset + head);
+    uint64_t videoEnd = 0;
     problems[i] = CheckEntryOffset(reader, entries[i].byteOffset, next, info, entries[i].flags,
-                                   result.videoElementOffsets[i], &videoEnds[i]);
-  });
-  if (result.error) return result;
-
-  // Pass 2: between two good entries the essence chains without damage, and
-  // the next entry doesn't skip an edit unit. Iteration i writes only
-  // damage[i] and skipped[i + 1].
-  std::vector<std::optional<std::string>> damage(n);
-  std::vector<std::optional<std::string>> skipped(n);
-  result.error = ParallelForEntries(path, httpHeaders, n - 1, [&](MxfReader& reader, size_t i) {
-    if (problems[i] || problems[i + 1]) return;
-    ChainProblem chain = CheckChainTo(reader, videoEnds[i], entries[i + 1].byteOffset, info);
+                                   result.videoElementOffsets[i], &videoEnd);
+    if (problems[i]) return;
+    // This entry's head, for the next one: up to its picture's KLV header
+    // (at most 25 bytes) and the bytes the type check reads (1 KiB, for
+    // H.264 up to 8 KiB).
+    const uint64_t typeCheckBytes = info.videoCodec == CodecFamily::kH264LongGop ? 8192
+                                    : HasPictureTypeParser(info.videoCodec)      ? 1024
+                                                                                 : 0;
+    head = std::clamp<uint64_t>(result.videoElementOffsets[i] - entries[i].byteOffset + 32 + typeCheckBytes + 256,
+                                kMinEntryHeadBytes, kMaxEntryHeadBytes);
+    if (i + 1 >= n || next <= entries[i].byteOffset) return;
+    // The stretch to the next entry plus that entry's head: one request
+    // covers this chain check and the next entry's check.
+    if (next >= videoEnd && next - videoEnd <= kMaxStretchBytes) reader.Prefetch(videoEnd, next + head);
+    ChainProblem chain = CheckChainTo(reader, videoEnd, next, info);
     damage[i] = std::move(chain.damage);
     skipped[i + 1] = std::move(chain.skipped);
   });
   if (result.error) return result;
 
+  for (size_t i = 0; i < n; ++i) {
+    // A chain towards a bad entry says nothing: the entry is reported itself.
+    if (i + 1 < n && problems[i + 1]) damage[i].reset();
+  }
   for (size_t i = 0; i < n; ++i) {
     if (!problems[i] && skipped[i]) problems[i] = std::move(skipped[i]);
     if (problems[i]) {

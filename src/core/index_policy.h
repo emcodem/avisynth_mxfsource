@@ -80,13 +80,15 @@ EssenceEnd EssenceEndsAfter(MxfReader& reader, uint64_t lastEditUnitOffset,
 // with `strict`, `error` is set (refuse the file / don't publish); without,
 // the entries are repaired in `index` where the essence allows, and
 // `warnings` says what was wrong and what could not be repaired. `summary`
-// is an informational one-liner either way.
+// is an informational one-liner either way. `overlapping`: requests in
+// flight while checking, see VerifyEssenceIndex (0 = auto).
 struct IndexVerification {
   std::optional<std::string> error;
   std::vector<std::string> warnings;
   std::string summary;
 };
 IndexVerification ApplyIndexVerification(const std::string& path, const std::string& httpHeaders,
-                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index);
+                                         const MxfStreamInfo& info, bool strict, EssenceIndex& index,
+                                         int overlapping = 0);
 
 }  // namespace mxfsrc
