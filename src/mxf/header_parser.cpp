@@ -88,6 +88,11 @@ constexpr uint16_t kDescriptorStoredWidth = 0x3203;
 constexpr uint16_t kDescriptorStoredHeight = 0x3202;
 constexpr uint16_t kDescriptorFrameLayout = 0x320C;
 constexpr uint16_t kDescriptorFieldDominance = 0x3212;
+constexpr uint16_t kDescriptorTransferCharacteristic = 0x3210;
+constexpr uint16_t kDescriptorColorPrimaries = 0x3219;
+constexpr uint16_t kDescriptorCodingEquations = 0x321A;
+constexpr uint16_t kDescriptorBlackRefLevel = 0x3304;
+constexpr uint16_t kDescriptorWhiteRefLevel = 0x3305;
 constexpr uint16_t kDescriptorSampleRate = 0x3D03;
 constexpr uint16_t kDescriptorChannelCount = 0x3D07;
 constexpr uint16_t kDescriptorQuantizationBits = 0x3D01;
@@ -106,6 +111,33 @@ struct RawSets {
   std::map<Ul, bool> packageIsSource;
 };
 
+// _ColorRange from BlackRefLevel/WhiteReflevel: 1 (limited) for 16/235
+// scaled to any bit depth 8-16, 0 (full) for 0/2^n-1, else -1. The pair is
+// matched without trusting ComponentDepth: real files carry 8-bit levels
+// next to a 10-bit essence (an HLG DNxHR file with ComponentDepth 8 and
+// 16/235 decodes as 10-bit limited range).
+int ColorRangeFromRefLevels(const LocalTagMap& d) {
+  uint32_t black = 0, white = 0;
+  if (!GetU32(d, tag::kDescriptorBlackRefLevel, black) || !GetU32(d, tag::kDescriptorWhiteRefLevel, white)) {
+    return -1;
+  }
+  for (int shift = 0; shift <= 8; ++shift) {
+    if (black == (16u << shift) && white == (235u << shift)) return 1;
+    if (black == 0 && white == (256u << shift) - 1) return 0;
+  }
+  return -1;
+}
+
+void ExtractColorParams(const LocalTagMap& d, MxfStreamInfo& info) {
+  Ul ul{};
+  if (GetUl(d, tag::kDescriptorCodingEquations, ul)) info.colorMatrix = ClassifyColorUl(ul, kColorGroupCodingEquations);
+  if (GetUl(d, tag::kDescriptorColorPrimaries, ul)) info.colorPrimaries = ClassifyColorUl(ul, kColorGroupPrimaries);
+  if (GetUl(d, tag::kDescriptorTransferCharacteristic, ul)) {
+    info.colorTransfer = ClassifyColorUl(ul, kColorGroupTransfer);
+  }
+  info.colorRange = ColorRangeFromRefLevels(d);
+}
+
 bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   uint32_t width = 0, height = 0;
   if (!GetU32(d, tag::kDescriptorStoredWidth, width)) return false;
@@ -117,6 +149,7 @@ bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   if (frameLayout != d.end() && frameLayout->second.size() == 1) info.frameLayout = frameLayout->second[0];
   auto fieldDominance = d.find(tag::kDescriptorFieldDominance);
   if (fieldDominance != d.end() && fieldDominance->second.size() == 1) info.fieldDominance = fieldDominance->second[0];
+  ExtractColorParams(d, info);
   Ul coding{};
   if (GetUl(d, tag::kDescriptorPictureEssenceCoding, coding)) {
     info.pictureEssenceCoding = coding;

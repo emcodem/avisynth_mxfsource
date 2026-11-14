@@ -431,6 +431,27 @@ when the field order is unknown. On the sample share, interlaced XDCAM HD422,
 XAVC, D-10 and K2 SD material is TFF, and ProRes, DNxHR, XAVC-L UHD and 720p
 material is progressive. The plugin matches ffprobe frame for frame on these.
 
+### Colour
+
+Every frame carries `_Matrix`, `_Primaries`, `_Transfer` and `_ColorRange`
+(AviSynth+ interface 8 or later, and VapourSynth), taken from the MXF picture
+descriptor, so an encoder downstream can tag its output (e.g. BT.2020 / HLG
+for HDR material). The values are the ITU-T H.273 codes the hosts use:
+
+- `_Matrix` from CodingEquations: BT.601, BT.709, SMPTE 240M, YCgCo, GBR,
+  BT.2020 NCL.
+- `_Primaries` from ColorPrimaries: SMPTE 170M, BT.470 BG, BT.709, BT.2020,
+  DCDM XYZ, P3 D65.
+- `_Transfer` from TransferCharacteristic: BT.709 (also SMPTE 274M/296M),
+  SMPTE 240M, BT.1361, linear, DCDM, xvYCC, BT.2020, PQ (ST 2084), HLG.
+- `_ColorRange` from BlackRefLevel/WhiteReflevel: 16/235 at any bit depth
+  is limited (1), 0/max is full (0). ComponentDepth is not used, because
+  some files declare 8 bits next to 10-bit essence.
+
+A property is not set when the descriptor doesn't carry the label or uses
+one that isn't in these lists. The bitstream's own colour description
+(H.264 VUI, ProRes and DNxHR headers) is not read.
+
 ### Audio
 
 Every audio track found in the file is summed into one interleaved output

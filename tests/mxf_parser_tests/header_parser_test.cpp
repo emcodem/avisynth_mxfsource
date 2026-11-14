@@ -665,6 +665,79 @@ void TestNonPcmCodecMarksAudioUnsupported() {
   std::filesystem::remove(path);
 }
 
+// Colour description: the HLG UHD file's picture descriptor (labels copied
+// byte for byte, 8-bit levels on a 10-bit essence) maps to BT.2020 NCL /
+// BT.2020 / HLG / limited; full-range levels, unmapped labels and absent tags.
+void TestColorDescriptorParsed() {
+  auto parse = [](const SyntheticFile& cfg, const char* name) {
+    auto path = WriteTempFile(BuildSyntheticHeader(cfg), name);
+    MxfStreamInfo out;
+    {
+      MxfReader reader(path.string());
+      auto info = ParseMxfHeader(reader);
+      CHECK(info.has_value());
+      if (info) out = *info;
+    }
+    std::filesystem::remove(path);
+    return out;
+  };
+  const Ul kCodingBt2020 = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+                            0x04, 0x01, 0x01, 0x01, 0x02, 0x06, 0x00, 0x00};
+  const Ul kPrimariesBt2020 = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+                               0x04, 0x01, 0x01, 0x01, 0x03, 0x04, 0x00, 0x00};
+  const Ul kTransferHlg = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+                           0x04, 0x01, 0x01, 0x01, 0x01, 0x0B, 0x00, 0x00};
+  // Register version byte (7) 0x01, unlike the 0x0D labels above: the
+  // version byte is ignored when matching.
+  const Ul kTransferBt709 = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+                               0x04, 0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00};
+  const Ul kTransferBt470 = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x01,
+                             0x04, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00};
+
+  {
+    SyntheticFile cfg;
+    cfg.codingEquations = kCodingBt2020;
+    cfg.colorPrimaries = kPrimariesBt2020;
+    cfg.transferCharacteristic = kTransferHlg;
+    cfg.blackRefLevel = 16;
+    cfg.whiteRefLevel = 235;
+    MxfStreamInfo info = parse(cfg, "mxfsrc_test_color_hlg.mxf");
+    CHECK(info.colorMatrix == 9);
+    CHECK(info.colorPrimaries == 9);
+    CHECK(info.colorTransfer == 18);
+    CHECK(info.colorRange == 1);
+  }
+  {
+    SyntheticFile cfg;
+    cfg.transferCharacteristic = kTransferBt709;
+    cfg.blackRefLevel = 64;
+    cfg.whiteRefLevel = 940;
+    MxfStreamInfo info = parse(cfg, "mxfsrc_test_color_709.mxf");
+    CHECK(info.colorMatrix == -1);
+    CHECK(info.colorPrimaries == -1);
+    CHECK(info.colorTransfer == 1);
+    CHECK(info.colorRange == 1);
+  }
+  {
+    SyntheticFile cfg;
+    cfg.transferCharacteristic = kTransferBt470;  // no unambiguous H.273 value
+    cfg.colorPrimaries = kTransferHlg;            // a transfer label in the primaries tag
+    cfg.blackRefLevel = 0;
+    cfg.whiteRefLevel = 1023;
+    MxfStreamInfo info = parse(cfg, "mxfsrc_test_color_full.mxf");
+    CHECK(info.colorTransfer == -1);
+    CHECK(info.colorPrimaries == -1);
+    CHECK(info.colorRange == 0);
+  }
+  {
+    MxfStreamInfo info = parse(SyntheticFile{}, "mxfsrc_test_color_none.mxf");
+    CHECK(info.colorMatrix == -1);
+    CHECK(info.colorPrimaries == -1);
+    CHECK(info.colorTransfer == -1);
+    CHECK(info.colorRange == -1);
+  }
+}
+
 void TestRejectsNonMxfFile() {
   std::vector<uint8_t> garbage = {'n', 'o', 't', ' ', 'm', 'x', 'f'};
   auto path = WriteTempFile(garbage, "mxfsrc_test_garbage.mxf");
@@ -703,6 +776,7 @@ int main() {
   TestMultiAudioTrackSummedAndBoundByLinkedTrackId();
   TestMismatchedBitDepthMarksAudioUnsupported();
   TestNonPcmCodecMarksAudioUnsupported();
+  TestColorDescriptorParsed();
   TestRejectsNonMxfFile();
 
   if (g_failures == 0) {

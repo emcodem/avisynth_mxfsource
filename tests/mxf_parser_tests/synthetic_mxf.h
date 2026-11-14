@@ -152,6 +152,14 @@ struct SyntheticFile {
   // (the default) leaves the tag out.
   int frameLayout = -1;
   int fieldDominance = -1;
+  // Colour labels (0x321A CodingEquations, 0x3219 ColorPrimaries, 0x3210
+  // TransferCharacteristic) and BlackRefLevel/WhiteReflevel (0x3304/0x3305);
+  // an all-zero UL or a negative level leaves the tag out.
+  Ul codingEquations{};
+  Ul colorPrimaries{};
+  Ul transferCharacteristic{};
+  int64_t blackRefLevel = -1;
+  int64_t whiteRefLevel = -1;
 
   // Adds a second Package -- a SourcePackage -- alongside the MaterialPackage
   // built unconditionally below, so tests can exercise Origin handling (see
@@ -307,6 +315,12 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     AppendTagUl(entries, 0x3201, cfg.pictureEssenceCoding);
     if (cfg.frameLayout >= 0) AppendTagBytes(entries, 0x320C, {static_cast<uint8_t>(cfg.frameLayout)});
     if (cfg.fieldDominance >= 0) AppendTagBytes(entries, 0x3212, {static_cast<uint8_t>(cfg.fieldDominance)});
+    const Ul zeroUl{};
+    if (cfg.codingEquations != zeroUl) AppendTagUl(entries, 0x321A, cfg.codingEquations);
+    if (cfg.colorPrimaries != zeroUl) AppendTagUl(entries, 0x3219, cfg.colorPrimaries);
+    if (cfg.transferCharacteristic != zeroUl) AppendTagUl(entries, 0x3210, cfg.transferCharacteristic);
+    if (cfg.blackRefLevel >= 0) AppendTagU32(entries, 0x3304, static_cast<uint32_t>(cfg.blackRefLevel));
+    if (cfg.whiteRefLevel >= 0) AppendTagU32(entries, 0x3305, static_cast<uint32_t>(cfg.whiteRefLevel));
     AppendLocalSet(metadata, 0x28, 0x00, entries);
   }
 

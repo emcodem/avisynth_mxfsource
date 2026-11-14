@@ -2113,6 +2113,18 @@ void TestGetAudioSamplesSequentialMatchesExpectedBytes() {
     expected.insert(expected.end(), eu0.begin() + 2 * bytesPerFrame, eu0.end());       // samples 2,3 of edit unit 0
     expected.insert(expected.end(), eu1.begin(), eu1.begin() + 4 * bytesPerFrame);     // samples 0..3 of edit unit 1
     CHECK(buf == expected);
+
+    // A window starting before sample 0 is silence up to it, then the real
+    // samples (AviSynth asks for these, e.g. after DelayAudio).
+    std::vector<uint8_t> early(6 * static_cast<size_t>(bytesPerFrame), 0xAB);
+    CHECK(engine.GetAudioSamples(-3, 6, early.data(), &err) == FetchStatus::kOk);
+    std::vector<uint8_t> earlyExpected(3 * static_cast<size_t>(bytesPerFrame), 0);
+    earlyExpected.insert(earlyExpected.end(), eu0.begin(), eu0.begin() + 3 * bytesPerFrame);
+    CHECK(early == earlyExpected);
+    // Entirely before the start: all silence.
+    std::fill(early.begin(), early.end(), 0xAB);
+    CHECK(engine.GetAudioSamples(-10, 6, early.data(), &err) == FetchStatus::kOk);
+    CHECK(std::all_of(early.begin(), early.end(), [](uint8_t b) { return b == 0; }));
   }
 
   std::filesystem::remove(path);

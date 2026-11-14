@@ -52,6 +52,18 @@ struct MxfStreamInfo {
   // (see SourceEngine::FieldOrderOf).
   int frameLayout = -1;
   int fieldDominance = -1;
+  // Colour description from the picture descriptor, as ITU-T H.273 codes
+  // (the values of the _Matrix/_Primaries/_Transfer frame properties); -1 if
+  // the tag is absent or its label isn't mapped (see ul_tables.h's
+  // ClassifyColorUl). colorMatrix comes from CodingEquations (0x321A),
+  // colorPrimaries from ColorPrimaries (0x3219), colorTransfer from
+  // TransferCharacteristic (0x3210). colorRange uses the _ColorRange
+  // convention (0 full, 1 limited) and is derived from the CDCI
+  // BlackRefLevel/WhiteReflevel pair (0x3304/0x3305).
+  int colorMatrix = -1;
+  int colorPrimaries = -1;
+  int colorTransfer = -1;
+  int colorRange = -1;
   // Track.TrackNumber (baseline tag 0x4804): the last 4 bytes of an Essence
   // Element KLV key identify which Track it belongs to (see FFmpeg
   // mxfdec.c's mxf_essence_element_key matching) -- Phase 2's essence

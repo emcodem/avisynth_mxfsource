@@ -199,6 +199,14 @@ const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instan
     const int64_t fieldBased = fieldOrder == FieldOrder::kTff ? 2 : fieldOrder == FieldOrder::kBff ? 1 : 0;
     vsapi->mapSetInt(vsapi->getFramePropertiesRW(out), "_FieldBased", fieldBased, maReplace);
   }
+  // Colour description from the MXF picture descriptor (H.273 codes); each
+  // left unset when the descriptor doesn't carry it.
+  const mxfsrc::MxfStreamInfo& info = d->engine->StreamInfo();
+  VSMap* props = vsapi->getFramePropertiesRW(out);
+  if (info.colorMatrix >= 0) vsapi->mapSetInt(props, "_Matrix", info.colorMatrix, maReplace);
+  if (info.colorPrimaries >= 0) vsapi->mapSetInt(props, "_Primaries", info.colorPrimaries, maReplace);
+  if (info.colorTransfer >= 0) vsapi->mapSetInt(props, "_Transfer", info.colorTransfer, maReplace);
+  if (info.colorRange >= 0) vsapi->mapSetInt(props, "_ColorRange", info.colorRange, maReplace);
   return out;
 }
 

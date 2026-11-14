@@ -2,6 +2,7 @@
 // forward essence walk, codec decode, ring-buffer decode thread) behind
 // IClip. GetFrame(n) blocks on the engine's ring buffer -- see plan
 // "avs/ adapter" section for the MT_SERIALIZED rationale.
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -175,6 +176,11 @@ class MxfSource final : public IClip {
   }
 
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override {
+    // AviSynth passes frame numbers outside the clip on to source filters
+    // (temporal filters reaching past either end; AviSynth+ clamps them in
+    // its cache, but not every version or host does). Like FFMS2 and
+    // L-SMASH, answer with the nearest frame instead of an error.
+    n = std::clamp(n, 0, vi_.num_frames - 1);
     std::shared_ptr<NormalizedFrame> frame;
     std::string err;
     if (engine_->GetVideoFrame(n, frame, &err) != FetchStatus::kOk) {
@@ -196,6 +202,14 @@ class MxfSource final : public IClip {
         const int64_t fieldBased = fieldOrder == FieldOrder::kTff ? 2 : fieldOrder == FieldOrder::kBff ? 1 : 0;
         env->propSetInt(env->getFramePropsRW(out), "_FieldBased", fieldBased, PROPAPPENDMODE_REPLACE);
       }
+      // Colour description from the MXF picture descriptor (H.273 codes);
+      // each left unset when the descriptor doesn't carry it.
+      const mxfsrc::MxfStreamInfo& info = engine_->StreamInfo();
+      AVSMap* props = env->getFramePropsRW(out);
+      if (info.colorMatrix >= 0) env->propSetInt(props, "_Matrix", info.colorMatrix, PROPAPPENDMODE_REPLACE);
+      if (info.colorPrimaries >= 0) env->propSetInt(props, "_Primaries", info.colorPrimaries, PROPAPPENDMODE_REPLACE);
+      if (info.colorTransfer >= 0) env->propSetInt(props, "_Transfer", info.colorTransfer, PROPAPPENDMODE_REPLACE);
+      if (info.colorRange >= 0) env->propSetInt(props, "_ColorRange", info.colorRange, PROPAPPENDMODE_REPLACE);
     }
     return out;
   }

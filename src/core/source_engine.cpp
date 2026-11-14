@@ -1394,6 +1394,16 @@ FetchStatus SourceEngine::GetAudioSamples(int64_t start, int64_t count, void* bu
   int64_t remaining = count;
   int64_t hostSamplePos = start;
 
+  // Samples before the start (AviSynth asks for them, e.g. after
+  // DelayAudio) are silence; the rest of the request is served normally.
+  if (hostSamplePos < 0) {
+    const int64_t leading = std::min(remaining, -hostSamplePos);
+    std::memset(dst, 0, static_cast<size_t>(leading) * bytesPerFrame);
+    dst += leading * bytesPerFrame;
+    remaining -= leading;
+    hostSamplePos += leading;
+  }
+
   while (remaining > 0) {
     // audioSampleIndex_ operates in raw essence-edit-unit/sample space
     // (like videoIndex_'s EssenceIndex); audioSampleOriginSkip_ translates

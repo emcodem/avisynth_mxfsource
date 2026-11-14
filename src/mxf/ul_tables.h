@@ -163,6 +163,63 @@ inline CodecFamily ClassifyCodecUl(const Ul& ul) {
   return CodecFamily::kUnknown;
 }
 
+// Picture descriptor colour labels (SMPTE RP224 / ST 2067-21), mapped to the
+// ITU-T H.273 code points that AviSynth+ and VapourSynth use for _Primaries,
+// _Transfer and _Matrix. All three share the prefix
+// 06 0E 2B 34 04 01 01 xx 04 01 01 01 and differ in byte 12 (01 transfer,
+// 02 coding equations, 03 primaries) and byte 13 (the value). Labels with no
+// unambiguous H.273 equivalent (e.g. "ITU-R BT.470" transfer) map to -1.
+struct ColorUl {
+  uint8_t group;  // byte 12
+  uint8_t item;   // byte 13
+  int h273;
+};
+
+inline constexpr uint8_t kColorUlPrefix[] = {0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01,
+                                             0x00, 0x04, 0x01, 0x01, 0x01};
+inline constexpr uint8_t kColorGroupTransfer = 0x01;
+inline constexpr uint8_t kColorGroupCodingEquations = 0x02;
+inline constexpr uint8_t kColorGroupPrimaries = 0x03;
+
+inline constexpr ColorUl kColorUls[] = {
+    // TransferCharacteristic (descriptor tag 0x3210)
+    {0x01, 0x02, 1},   // ITU-R BT.709
+    {0x01, 0x03, 7},   // SMPTE 240M
+    {0x01, 0x04, 1},   // SMPTE 274M/296M (same curve as BT.709)
+    {0x01, 0x05, 12},  // ITU-R BT.1361 extended colour gamut
+    {0x01, 0x06, 8},   // linear
+    {0x01, 0x07, 17},  // SMPTE DC28 DCDM (ST 428-1)
+    {0x01, 0x08, 11},  // IEC 61966-2-4 (xvYCC)
+    {0x01, 0x09, 14},  // ITU-R BT.2020
+    {0x01, 0x0A, 16},  // SMPTE ST 2084 (PQ)
+    {0x01, 0x0B, 18},  // Hybrid Log-Gamma (ARIB STD-B67 / BT.2100 HLG)
+    // CodingEquations (0x321A)
+    {0x02, 0x01, 5},  // ITU-R BT.601
+    {0x02, 0x02, 1},  // ITU-R BT.709
+    {0x02, 0x03, 7},  // SMPTE 240M
+    {0x02, 0x04, 8},  // YCgCo
+    {0x02, 0x05, 0},  // GBR (identity)
+    {0x02, 0x06, 9},  // ITU-R BT.2020 non-constant luminance
+    // ColorPrimaries (0x3219)
+    {0x03, 0x01, 6},   // SMPTE 170M (BT.601 525)
+    {0x03, 0x02, 5},   // ITU-R BT.470 BG (BT.601 625)
+    {0x03, 0x03, 1},   // ITU-R BT.709
+    {0x03, 0x04, 9},   // ITU-R BT.2020
+    {0x03, 0x05, 10},  // SMPTE DC28 DCDM (XYZ, ST 428-1)
+    {0x03, 0x06, 12},  // P3 D65 (SMPTE EG 432-1)
+};
+
+// H.273 code for a colour label of the given group, or -1 if the UL is not
+// such a label or not one we map. The version byte (7) is ignored.
+inline int ClassifyColorUl(const Ul& ul, uint8_t group) {
+  if (!UlPrefixEquals(ul, kColorUlPrefix, sizeof(kColorUlPrefix))) return -1;
+  if (ul[12] != group) return -1;
+  for (const auto& entry : kColorUls) {
+    if (entry.group == group && entry.item == ul[13]) return entry.h273;
+  }
+  return -1;
+}
+
 // True for codecs where every essence element decodes independently (no
 // inter-frame prediction) -- these have no "anchor"/keyframe concept at
 // all, so a forward seek can skip straight to the target frame's essence
