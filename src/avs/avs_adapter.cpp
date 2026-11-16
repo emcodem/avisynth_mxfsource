@@ -148,6 +148,7 @@ class MxfSource final : public IClip {
     if (clipFieldOrder == FieldOrder::kTff) vi_.Set(VideoInfo::IT_TFF);
     if (clipFieldOrder == FieldOrder::kBff) vi_.Set(VideoInfo::IT_BFF);
     clipTff_ = clipFieldOrder == FieldOrder::kTff;
+    geometry_ = engine_->Geometry();
     // Frame properties (_FieldBased per frame) need AviSynth+ interface 8;
     // classic AviSynth has no such API.
     try {
@@ -210,6 +211,19 @@ class MxfSource final : public IClip {
       if (info.colorPrimaries >= 0) env->propSetInt(props, "_Primaries", info.colorPrimaries, PROPAPPENDMODE_REPLACE);
       if (info.colorTransfer >= 0) env->propSetInt(props, "_Transfer", info.colorTransfer, PROPAPPENDMODE_REPLACE);
       if (info.colorRange >= 0) env->propSetInt(props, "_ColorRange", info.colorRange, PROPAPPENDMODE_REPLACE);
+      // Sample aspect ratio from the descriptor's AspectRatio and display
+      // rectangle; the display window only when it is smaller than the frame
+      // (D-10's VBI lines). See mxfsrc::ComputePictureGeometry.
+      if (geometry_.sarNum > 0) {
+        env->propSetInt(props, "_SARNum", geometry_.sarNum, PROPAPPENDMODE_REPLACE);
+        env->propSetInt(props, "_SARDen", geometry_.sarDen, PROPAPPENDMODE_REPLACE);
+      }
+      if (geometry_.hasWindow) {
+        env->propSetInt(props, "MxfDisplayLeft", geometry_.windowLeft, PROPAPPENDMODE_REPLACE);
+        env->propSetInt(props, "MxfDisplayTop", geometry_.windowTop, PROPAPPENDMODE_REPLACE);
+        env->propSetInt(props, "MxfDisplayWidth", geometry_.windowWidth, PROPAPPENDMODE_REPLACE);
+        env->propSetInt(props, "MxfDisplayHeight", geometry_.windowHeight, PROPAPPENDMODE_REPLACE);
+      }
     }
     return out;
   }
@@ -251,6 +265,7 @@ class MxfSource final : public IClip {
   bool isPackedUyvy_ = false;
   bool clipTff_ = false;
   bool hasFrameProps_ = false;
+  mxfsrc::PictureGeometry geometry_;
 };
 
 AVSValue __cdecl CreateMxfSource(AVSValue args, void* /*user_data*/, IScriptEnvironment* env) {

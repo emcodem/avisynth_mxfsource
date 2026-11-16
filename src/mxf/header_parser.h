@@ -64,6 +64,23 @@ struct MxfStreamInfo {
   int colorPrimaries = -1;
   int colorTransfer = -1;
   int colorRange = -1;
+  // Picture geometry from the picture descriptor, in descriptor units (for
+  // FrameLayout SeparateFields / MixedFields the heights and Y offsets count
+  // the lines of one field). aspectRatio is AspectRatio (0x320E), the display
+  // aspect ratio of the display rectangle; {0, 0} if absent. The sampled
+  // rectangle (0x3205 width, 0x3204 height, 0x3206/0x3207 offsets from the
+  // stored rectangle) and the display rectangle (0x3209 width, 0x3208
+  // height, 0x320A/0x320B offsets from the sampled rectangle) are -1 if
+  // absent (offsets 0). See ComputePictureGeometry.
+  Rational aspectRatio{0, 0};
+  int64_t sampledWidth = -1;
+  int64_t sampledHeight = -1;
+  int64_t sampledXOffset = 0;
+  int64_t sampledYOffset = 0;
+  int64_t displayWidth = -1;
+  int64_t displayHeight = -1;
+  int64_t displayXOffset = 0;
+  int64_t displayYOffset = 0;
   // Track.TrackNumber (baseline tag 0x4804): the last 4 bytes of an Essence
   // Element KLV key identify which Track it belongs to (see FFmpeg
   // mxfdec.c's mxf_essence_element_key matching) -- Phase 2's essence
@@ -130,5 +147,30 @@ struct MxfStreamInfo {
 // produce MxfStreamInfo. No essence decode, no Index Table/RIP dependency --
 // see plan Phase 1.
 std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* errorOut = nullptr);
+
+// Sample aspect ratio and display window of the decoded frame
+// (decodedWidth x decodedHeight), from MxfStreamInfo's descriptor geometry.
+// The display rectangle (else the sampled one) is converted to frame lines
+// (x2 for FrameLayout SeparateFields / MixedFields); when it doesn't fit in
+// the decoded frame, the whole frame is used instead. SAR = AspectRatio x
+// rectangle height / rectangle width, reduced; e.g. D-10 PAL 720x608 with
+// a 720x576 display rectangle at line 32 and AspectRatio 16/9 gives 64:45
+// and the window (0, 32, 720, 576). Only the known ratios 4:3 and 16:9 are
+// used (within 1 %, snapped to the exact value), and for rectangles of 720
+// lines and more only 16:9; any other AspectRatio is a defective label and
+// gives no SAR (rejectedAspect says why).
+struct PictureGeometry {
+  int64_t sarNum = 0;  // 0: no usable AspectRatio in the descriptor
+  int64_t sarDen = 0;
+  std::string rejectedAspect;  // non-empty: the descriptor's AspectRatio was not used
+  // The display rectangle in frame pixels; set only when it is valid and
+  // smaller than the decoded frame (e.g. the VBI lines of D-10).
+  bool hasWindow = false;
+  int64_t windowLeft = 0;
+  int64_t windowTop = 0;
+  int64_t windowWidth = 0;
+  int64_t windowHeight = 0;
+};
+PictureGeometry ComputePictureGeometry(const MxfStreamInfo& info, int decodedWidth, int decodedHeight);
 
 }  // namespace mxfsrc

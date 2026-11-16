@@ -452,6 +452,35 @@ A property is not set when the descriptor doesn't carry the label or uses
 one that isn't in these lists. The bitstream's own colour description
 (H.264 VUI, ProRes and DNxHR headers) is not read.
 
+### Aspect ratio and display window
+
+Every frame carries `_SARNum` / `_SARDen` (AviSynth+ interface 8 or later,
+and VapourSynth), computed from the picture descriptor's AspectRatio, which
+is the display aspect ratio of the display rectangle (DisplayWidth/Height,
+else SampledWidth/Height, else the decoded frame):
+SAR = AspectRatio x rectangle height / rectangle width. For FrameLayout
+SeparateFields / MixedFields the descriptor's heights and Y offsets count one
+field, so they are doubled.
+
+| File | Decoded frame | Display rectangle | AspectRatio | SAR |
+|---|---|---|---|---|
+| D-10 / IMX PAL | 720x608 | 720x576 at line 32 | 16/9 | 64:45 |
+| D-10 / IMX PAL | 720x608 | 720x576 at line 32 | 4/3 | 16:15 |
+| XDCAM HD 1440 | 1440x1080 | 1440x1080 | 16/9 | 4:3 |
+| HD 1920 | 1920x1080 | 1920x1080 | 16/9 | 1:1 |
+
+A display rectangle of 720 lines or more uses only AspectRatio 16/9: any
+other value there is a labelling error (seen: a 1920x1080 MPEG-2 file
+declaring 4/3 whose sequence header says 16:9), and the SAR is then not set.
+It is also not set without an AspectRatio. The bitstream's own aspect ratio
+(MPEG-2 sequence header, H.264 VUI) and AFD / WSS are not read.
+
+When the display rectangle lies inside the decoded frame but is smaller (the
+32 VBI lines of D-10), each frame also carries `MxfDisplayLeft`,
+`MxfDisplayTop`, `MxfDisplayWidth` and `MxfDisplayHeight` (pixels of the
+decoded frame), e.g. 0, 32, 720, 576. The frame itself is not cropped; a
+script that wants the picture alone crops to these.
+
 ### Audio
 
 Every audio track found in the file is summed into one interleaved output

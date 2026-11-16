@@ -154,6 +154,7 @@ struct MxfSourceData {
   VSVideoInfo vi{};
   bool isPackedUyvy = false;
   int bytesPerSample = 1;
+  mxfsrc::PictureGeometry geometry;
 };
 
 struct MxfAudioData {
@@ -207,6 +208,18 @@ const VSFrame* VS_CC MxfSourceGetFrame(int n, int activationReason, void* instan
   if (info.colorPrimaries >= 0) vsapi->mapSetInt(props, "_Primaries", info.colorPrimaries, maReplace);
   if (info.colorTransfer >= 0) vsapi->mapSetInt(props, "_Transfer", info.colorTransfer, maReplace);
   if (info.colorRange >= 0) vsapi->mapSetInt(props, "_ColorRange", info.colorRange, maReplace);
+  // Sample aspect ratio and display window, see avs_adapter.cpp.
+  const mxfsrc::PictureGeometry& g = d->geometry;
+  if (g.sarNum > 0) {
+    vsapi->mapSetInt(props, "_SARNum", g.sarNum, maReplace);
+    vsapi->mapSetInt(props, "_SARDen", g.sarDen, maReplace);
+  }
+  if (g.hasWindow) {
+    vsapi->mapSetInt(props, "MxfDisplayLeft", g.windowLeft, maReplace);
+    vsapi->mapSetInt(props, "MxfDisplayTop", g.windowTop, maReplace);
+    vsapi->mapSetInt(props, "MxfDisplayWidth", g.windowWidth, maReplace);
+    vsapi->mapSetInt(props, "MxfDisplayHeight", g.windowHeight, maReplace);
+  }
   return out;
 }
 
@@ -400,6 +413,7 @@ void VS_CC CreateMxfSource(const VSMap* in, VSMap* out, void* /*userData*/, VSCo
   d->vi.numFrames = static_cast<int>(info.numFrames);
   d->isPackedUyvy = fmtInfo.isPackedUyvy;
   d->bytesPerSample = fmtInfo.bytesPerSample;
+  d->geometry = engine->Geometry();
   d->engine = engine;
 
   // Explicitly disabled (cmForceDisable) rather than left at VS core's

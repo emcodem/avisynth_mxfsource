@@ -498,6 +498,11 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
   if (videoBuffer_->Peek(firstHostFrame_, firstFrame_, &peekError) != FetchStatus::kOk) {
     return {OpenStatus::kDecodeError, "failed to decode first frame: " + peekError};
   }
+  geometry_ = ComputePictureGeometry(streamInfo_, firstFrame_->width, firstFrame_->height);
+  if (!geometry_.rejectedAspect.empty()) {
+    AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": " + geometry_.rejectedAspect +
+                  "; not used, no _SARNum/_SARDen");
+  }
   if (autoBuffer_) {
     int64_t frameBytes = 0;
     for (const auto& plane : firstFrame_->planeData) frameBytes += static_cast<int64_t>(plane.size());

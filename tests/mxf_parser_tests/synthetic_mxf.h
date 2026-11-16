@@ -160,6 +160,15 @@ struct SyntheticFile {
   Ul transferCharacteristic{};
   int64_t blackRefLevel = -1;
   int64_t whiteRefLevel = -1;
+  // AspectRatio (0x320E; den 0 leaves it out) and the display rectangle
+  // (0x3209 width, 0x3208 height, 0x320A/0x320B offsets; a negative width
+  // leaves all four out).
+  int32_t aspectNum = 0;
+  int32_t aspectDen = 0;
+  int64_t displayWidth = -1;
+  int64_t displayHeight = 0;
+  int32_t displayXOffset = 0;
+  int32_t displayYOffset = 0;
 
   // Adds a second Package -- a SourcePackage -- alongside the MaterialPackage
   // built unconditionally below, so tests can exercise Origin handling (see
@@ -321,6 +330,13 @@ inline std::vector<uint8_t> BuildHeaderMetadataBlock(const SyntheticFile& cfg) {
     if (cfg.transferCharacteristic != zeroUl) AppendTagUl(entries, 0x3210, cfg.transferCharacteristic);
     if (cfg.blackRefLevel >= 0) AppendTagU32(entries, 0x3304, static_cast<uint32_t>(cfg.blackRefLevel));
     if (cfg.whiteRefLevel >= 0) AppendTagU32(entries, 0x3305, static_cast<uint32_t>(cfg.whiteRefLevel));
+    if (cfg.aspectDen != 0) AppendTagRational(entries, 0x320E, cfg.aspectNum, cfg.aspectDen);
+    if (cfg.displayWidth >= 0) {
+      AppendTagU32(entries, 0x3209, static_cast<uint32_t>(cfg.displayWidth));
+      AppendTagU32(entries, 0x3208, static_cast<uint32_t>(cfg.displayHeight));
+      AppendTagU32(entries, 0x320A, static_cast<uint32_t>(cfg.displayXOffset));
+      AppendTagU32(entries, 0x320B, static_cast<uint32_t>(cfg.displayYOffset));
+    }
     AppendLocalSet(metadata, 0x28, 0x00, entries);
   }
 

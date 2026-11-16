@@ -738,6 +738,130 @@ void TestColorDescriptorParsed() {
   }
 }
 
+// Picture geometry: the D-10 descriptors of SD_D10_AESDolbyE_169.mxf /
+// SD_D10_PCM_43.mxf (stored 720x304 per field, display 720x288 at field line
+// 16, SeparateFields) give SAR 64:45 / 16:15 and the window (0, 32, 720, 576)
+// on the decoded 720x608 frame.
+void TestPictureGeometryParsed() {
+  SyntheticFile cfg;
+  cfg.width = 720;
+  cfg.height = 304;
+  cfg.frameLayout = 1;
+  cfg.aspectNum = 16;
+  cfg.aspectDen = 9;
+  cfg.displayWidth = 720;
+  cfg.displayHeight = 288;
+  cfg.displayYOffset = 16;
+  auto path = WriteTempFile(BuildSyntheticHeader(cfg), "mxfsrc_test_geometry_d10.mxf");
+  MxfStreamInfo info;
+  {
+    MxfReader reader(path.string());
+    auto parsed = ParseMxfHeader(reader);
+    CHECK(parsed.has_value());
+    if (parsed) info = *parsed;
+  }
+  std::filesystem::remove(path);
+  CHECK(info.aspectRatio.num == 16 && info.aspectRatio.den == 9);
+  CHECK(info.displayWidth == 720 && info.displayHeight == 288);
+  CHECK(info.displayXOffset == 0 && info.displayYOffset == 16);
+  CHECK(info.sampledWidth == -1 && info.sampledHeight == -1);
+
+  PictureGeometry g = ComputePictureGeometry(info, 720, 608);
+  CHECK(g.sarNum == 64 && g.sarDen == 45);
+  CHECK(g.hasWindow);
+  CHECK(g.windowLeft == 0 && g.windowTop == 32 && g.windowWidth == 720 && g.windowHeight == 576);
+
+  info.aspectRatio = {4, 3};
+  g = ComputePictureGeometry(info, 720, 608);
+  CHECK(g.sarNum == 16 && g.sarDen == 15);
+
+  // A decoder that hands back only the 576 active lines: the rectangle at
+  // line 32 doesn't fit, the whole frame is used (same SAR, no window).
+  g = ComputePictureGeometry(info, 720, 576);
+  CHECK(g.sarNum == 16 && g.sarDen == 15);
+  CHECK(!g.hasWindow);
+
+  // No descriptor tags: nothing.
+  g = ComputePictureGeometry(MxfStreamInfo{}, 720, 608);
+  CHECK(g.sarNum == 0 && !g.hasWindow);
+}
+
+// HD: full frame display rectangle (square pixels, no window), anamorphic
+// 1440x1080, and a 1920x1088 stored frame with a 1080-line display rectangle.
+void TestPictureGeometryHd() {
+  MxfStreamInfo info;
+  info.aspectRatio = {16, 9};
+  PictureGeometry g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  CHECK(!g.hasWindow);
+
+  g = ComputePictureGeometry(info, 1440, 1080);
+  CHECK(g.sarNum == 4 && g.sarDen == 3);
+
+  // DMX_Vistek_Test.mxf: 1920x1080 with AspectRatio 4/3 (the MPEG-2 sequence
+  // header says 16:9): ignored, no SAR.
+  info.aspectRatio = {4, 3};
+  g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.sarNum == 0);
+  CHECK(!g.rejectedAspect.empty());
+  info.aspectRatio = {16, 9};
+  g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.rejectedAspect.empty());
+
+  info.frameLayout = 1;
+  info.displayWidth = 1920;
+  info.displayHeight = 540;
+  g = ComputePictureGeometry(info, 1920, 1088);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  CHECK(g.hasWindow && g.windowTop == 0 && g.windowHeight == 1080);
+  g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  CHECK(!g.hasWindow);
+}
+
+// Only 4:3 and 16:9 are trusted: approximate labels are snapped, anything
+// else (a pixel aspect ratio, the stored size) gives no SAR.
+void TestPictureGeometryKnownRatiosOnly() {
+  MxfStreamInfo info;
+  info.aspectRatio = {1777, 1000};  // 16:9 written as 1.777
+  PictureGeometry g = ComputePictureGeometry(info, 1440, 1080);
+  CHECK(g.sarNum == 4 && g.sarDen == 3);
+  CHECK(g.rejectedAspect.empty());
+  info.aspectRatio = {1920, 1080};
+  g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  info.aspectRatio = {133, 100};  // 4:3 written as 1.33
+  g = ComputePictureGeometry(info, 720, 576);
+  CHECK(g.sarNum == 16 && g.sarDen == 15);
+  info.aspectRatio = {1, 1};  // a pixel aspect ratio
+  g = ComputePictureGeometry(info, 720, 576);
+  CHECK(g.sarNum == 0 && !g.rejectedAspect.empty());
+  info.aspectRatio = {720, 576};  // the stored size
+  g = ComputePictureGeometry(info, 720, 576);
+  CHECK(g.sarNum == 0 && !g.rejectedAspect.empty());
+  info.aspectRatio = {64, 45};  // D-10's SAR in the DAR field
+  g = ComputePictureGeometry(info, 720, 576);
+  CHECK(g.sarNum == 0 && !g.rejectedAspect.empty());
+
+  // HD and larger: the picture's own width/height (square pixels) is
+  // accepted too: DCI 4K 4096x2160 (256/135), DCI 2K flat 1998x1080.
+  info.aspectRatio = {256, 135};
+  g = ComputePictureGeometry(info, 4096, 2160);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  CHECK(g.rejectedAspect.empty());
+  info.aspectRatio = {185, 100};
+  g = ComputePictureGeometry(info, 1998, 1080);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  // UHD 3840x2160 16:9
+  info.aspectRatio = {16, 9};
+  g = ComputePictureGeometry(info, 3840, 2160);
+  CHECK(g.sarNum == 1 && g.sarDen == 1);
+  // ... but a 2.39 label on a 1920x1080 picture is not one of them
+  info.aspectRatio = {239, 100};
+  g = ComputePictureGeometry(info, 1920, 1080);
+  CHECK(g.sarNum == 0 && !g.rejectedAspect.empty());
+}
+
 void TestRejectsNonMxfFile() {
   std::vector<uint8_t> garbage = {'n', 'o', 't', ' ', 'm', 'x', 'f'};
   auto path = WriteTempFile(garbage, "mxfsrc_test_garbage.mxf");
@@ -777,6 +901,9 @@ int main() {
   TestMismatchedBitDepthMarksAudioUnsupported();
   TestNonPcmCodecMarksAudioUnsupported();
   TestColorDescriptorParsed();
+  TestPictureGeometryParsed();
+  TestPictureGeometryHd();
+  TestPictureGeometryKnownRatiosOnly();
   TestRejectsNonMxfFile();
 
   if (g_failures == 0) {

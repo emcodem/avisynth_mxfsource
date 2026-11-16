@@ -118,6 +118,12 @@ class SourceEngine {
   // before any real GetVideoFrame(0) call arrived.
   const NormalizedFrame& FirstFrame() const { return *firstFrame_; }
 
+  // Sample aspect ratio and display window of the decoded frames, from the
+  // picture descriptor and frame 0's size (see ComputePictureGeometry); a
+  // rejected AspectRatio is logged as a warning by Open(). Valid once Open()
+  // returns kOk.
+  const PictureGeometry& Geometry() const { return geometry_; }
+
   // A decoded frame's field order: the decoder's own report if it has one,
   // otherwise the MXF picture descriptor's (FrameLayout/FieldDominance). Only
   // descriptor combinations verified against real files map to a value:
@@ -402,6 +408,7 @@ class SourceEngine {
   int backSeekPreroll_ = 8;  // OpenOptions::back_seek_preroll
   std::unique_ptr<FrameBuffer<std::shared_ptr<NormalizedFrame>>> videoBuffer_;
   std::shared_ptr<NormalizedFrame> firstFrame_;
+  PictureGeometry geometry_;
   std::thread decodeThread_;
   ServeStats stats_;
 

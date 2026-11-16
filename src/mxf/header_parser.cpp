@@ -1,6 +1,7 @@
 #include "mxf/header_parser.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -93,6 +94,15 @@ constexpr uint16_t kDescriptorColorPrimaries = 0x3219;
 constexpr uint16_t kDescriptorCodingEquations = 0x321A;
 constexpr uint16_t kDescriptorBlackRefLevel = 0x3304;
 constexpr uint16_t kDescriptorWhiteRefLevel = 0x3305;
+constexpr uint16_t kDescriptorSampledHeight = 0x3204;
+constexpr uint16_t kDescriptorSampledWidth = 0x3205;
+constexpr uint16_t kDescriptorSampledXOffset = 0x3206;
+constexpr uint16_t kDescriptorSampledYOffset = 0x3207;
+constexpr uint16_t kDescriptorDisplayHeight = 0x3208;
+constexpr uint16_t kDescriptorDisplayWidth = 0x3209;
+constexpr uint16_t kDescriptorDisplayXOffset = 0x320A;
+constexpr uint16_t kDescriptorDisplayYOffset = 0x320B;
+constexpr uint16_t kDescriptorAspectRatio = 0x320E;
 constexpr uint16_t kDescriptorSampleRate = 0x3D03;
 constexpr uint16_t kDescriptorChannelCount = 0x3D07;
 constexpr uint16_t kDescriptorQuantizationBits = 0x3D01;
@@ -138,6 +148,29 @@ void ExtractColorParams(const LocalTagMap& d, MxfStreamInfo& info) {
   info.colorRange = ColorRangeFromRefLevels(d);
 }
 
+// Rectangle sizes are UInt32, offsets Int32 (SMPTE 377-1); absent tags keep
+// MxfStreamInfo's defaults.
+void ExtractGeometryParams(const LocalTagMap& d, MxfStreamInfo& info) {
+  auto size = [&](uint16_t t, int64_t& out) {
+    uint32_t v = 0;
+    if (GetU32(d, t, v)) out = v;
+  };
+  auto offset = [&](uint16_t t, int64_t& out) {
+    uint32_t v = 0;
+    if (GetU32(d, t, v)) out = static_cast<int32_t>(v);
+  };
+  size(tag::kDescriptorSampledWidth, info.sampledWidth);
+  size(tag::kDescriptorSampledHeight, info.sampledHeight);
+  offset(tag::kDescriptorSampledXOffset, info.sampledXOffset);
+  offset(tag::kDescriptorSampledYOffset, info.sampledYOffset);
+  size(tag::kDescriptorDisplayWidth, info.displayWidth);
+  size(tag::kDescriptorDisplayHeight, info.displayHeight);
+  offset(tag::kDescriptorDisplayXOffset, info.displayXOffset);
+  offset(tag::kDescriptorDisplayYOffset, info.displayYOffset);
+  Rational ar{};
+  if (GetRational32(d, tag::kDescriptorAspectRatio, ar) && ar.num > 0 && ar.den > 0) info.aspectRatio = ar;
+}
+
 bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   uint32_t width = 0, height = 0;
   if (!GetU32(d, tag::kDescriptorStoredWidth, width)) return false;
@@ -150,6 +183,7 @@ bool ExtractPictureParams(const LocalTagMap& d, MxfStreamInfo& info) {
   auto fieldDominance = d.find(tag::kDescriptorFieldDominance);
   if (fieldDominance != d.end() && fieldDominance->second.size() == 1) info.fieldDominance = fieldDominance->second[0];
   ExtractColorParams(d, info);
+  ExtractGeometryParams(d, info);
   Ul coding{};
   if (GetUl(d, tag::kDescriptorPictureEssenceCoding, coding)) {
     info.pictureEssenceCoding = coding;
@@ -730,6 +764,90 @@ std::optional<MxfStreamInfo> ParseMxfHeader(MxfReader& reader, std::string* erro
   info.durationReliable = info.hasVideo && info.numFrames >= 0 && info.footerPartitionPresent;
   ValidateAndSummarizeAudio(info);
   return info;
+}
+
+PictureGeometry ComputePictureGeometry(const MxfStreamInfo& info, int decodedWidth, int decodedHeight) {
+  PictureGeometry g;
+  if (decodedWidth <= 0 || decodedHeight <= 0) return g;
+  // SeparateFields / MixedFields: heights and Y offsets count one field's lines.
+  const int64_t lines = info.frameLayout == 1 || info.frameLayout == 3 ? 2 : 1;
+  const bool sampled = info.sampledWidth > 0 && info.sampledHeight > 0;
+  const bool display = info.displayWidth > 0 && info.displayHeight > 0;
+  int64_t x = 0, y = 0, w = decodedWidth, h = decodedHeight;
+  if (display) {
+    x = info.sampledXOffset + info.displayXOffset;
+    y = (info.sampledYOffset + info.displayYOffset) * lines;
+    w = info.displayWidth;
+    h = info.displayHeight * lines;
+  } else if (sampled) {
+    x = info.sampledXOffset;
+    y = info.sampledYOffset * lines;
+    w = info.sampledWidth;
+    h = info.sampledHeight * lines;
+  }
+  const bool fits = x >= 0 && y >= 0 && x + w <= decodedWidth && y + h <= decodedHeight;
+  if (!fits) {
+    x = 0;
+    y = 0;
+    w = decodedWidth;
+    h = decodedHeight;
+  }
+  // Only the known broadcast ratios are trusted: 4:3 and 16:9, snapped when
+  // written approximately (e.g. 1777/1000). Anything else is a defective
+  // label (a pixel aspect ratio, the stored size, ...) and gives no SAR.
+  // HD and larger pictures are 16:9 only (seen: a 1920x1080 MPEG-2 file
+  // with AspectRatio 4/3 whose sequence header says 16:9).
+  int64_t arNum = 0, arDen = 0;
+  if (info.aspectRatio.num > 0 && info.aspectRatio.den > 0) {
+    const double ar = static_cast<double>(info.aspectRatio.num) / info.aspectRatio.den;
+    const std::string label = std::to_string(info.aspectRatio.num) + "/" + std::to_string(info.aspectRatio.den);
+    const double square = static_cast<double>(w) / h;
+    if (std::abs(ar / (16.0 / 9.0) - 1.0) < 0.01) {
+      arNum = 16;
+      arDen = 9;
+    } else if (h >= 720 && std::abs(ar / square - 1.0) < 0.01) {
+      // HD and larger with square pixels: DCI 4K 4096x2160 (256/135), 2K
+      // flat 1998x1080 (1.85), ... (in SD, w/h is the stored size written
+      // as the label, a defect)
+      arNum = w;
+      arDen = h;
+    } else if (std::abs(ar / (4.0 / 3.0) - 1.0) < 0.01) {
+      if (h >= 720) {
+        g.rejectedAspect = "AspectRatio " + label + " on a " + std::to_string(w) + "x" + std::to_string(h) +
+                           " picture (HD is 16:9 only)";
+      } else {
+        arNum = 4;
+        arDen = 3;
+      }
+    } else {
+      g.rejectedAspect = "AspectRatio " + label + " is neither 4:3 nor 16:9" +
+                         (h >= 720 ? " nor the " + std::to_string(w) + "x" + std::to_string(h) + " picture's own ratio"
+                                   : std::string());
+    }
+  }
+  if (arNum > 0) {
+    int64_t n = arNum * h;
+    int64_t d = arDen * w;
+    int64_t a = n, b = d;
+    while (b != 0) {
+      const int64_t t = a % b;
+      a = b;
+      b = t;
+    }
+    // _SARNum/_SARDen consumers expect values that fit in an int
+    if (a > 0 && n / a <= INT32_MAX && d / a <= INT32_MAX) {
+      g.sarNum = n / a;
+      g.sarDen = d / a;
+    }
+  }
+  if (fits && (w < decodedWidth || h < decodedHeight)) {
+    g.hasWindow = true;
+    g.windowLeft = x;
+    g.windowTop = y;
+    g.windowWidth = w;
+    g.windowHeight = h;
+  }
+  return g;
 }
 
 }  // namespace mxfsrc
