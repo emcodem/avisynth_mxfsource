@@ -520,12 +520,6 @@ apart 5.1 s -> 2.6 s. Local and loopback UNC: Reverse 5-10 % faster,
 sequential 1-2 % slower (one more memcpy per byte). Ten encode chains
 bit-identical. Tests: mxf_byte_cache_tests, two new HTTP tests.
 
-Next for Reverse (proposed, not done): recognise backward stepping (request
-just below the buffer right after one just above it) and restart at once
-with a large lead (about half the buffer) instead of 4 fallbacks plus
-`back_seek_preroll` frames; measured by hand with back_seek_preroll=128:
-17.5 s -> 4.8 s for 1000 HD frames locally.
-
 Noise: every restart logs "leading audio edit unit near the start_frame
 hint's own seek-start point is unreachable" at info level; harmless but
 should be logged once, or only with trace.
@@ -536,7 +530,6 @@ goal:
   BestSource's approach, a small pool of producers (2-4, each with its own
   buffer, request goes to the nearest one, least recently used one is moved).
   Needs the auto memory budget split between them.
-- Reverse stepping right after a jump (see item 3 of the 2026-10-19 scan).
 - Audio far below its buffer is still read block by block with a fresh
   reader (cheap for PCM, but an audio-only consumer that loops opens the file
   once per edit unit).
@@ -922,13 +915,7 @@ frame is decoded, doubled on a request just below a full window up to 4 GiB
 Trim also asks for the frames just before it (each was a ~250 ms UHD
 fallback). Auto results: UHD sequential 83 fps at 2.1 GB (was 82 fps at
 10.6 GB), Prefetch(16) r3 84 fps / 0 fallbacks, Prefetch(32) r3 68-75 fps,
-grows to 64-128 frames; HD 700-800 fps at 1.1-1.8 GB.
-
-Still open: stepping backwards right after a jump (AvsPmod) is all fallback
-with any buffer size -- the buffer only fills forward from the restart
-point. ~30 ms/step HD, ~250 ms/step UHD. Idea: when a frame just below a
-fresh restart point is requested, restart further back (e.g. capacity/2
-before it) instead of re-decoding each frame. Bench script:
+grows to 64-128 frames; HD 700-800 fps at 1.1-1.8 GB. Bench script:
 `tools/bench_buffer.ps1`.
 
 ### 4. Review of "forward-only" wording in comments -- parked 2026-11-06
