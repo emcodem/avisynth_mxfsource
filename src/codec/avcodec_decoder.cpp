@@ -40,6 +40,7 @@ PixelFormat FromAvPixFmt(int fmt) {
     case AV_PIX_FMT_YUV422P12LE: return PixelFormat::kYuv422p12;
     case AV_PIX_FMT_YUV444P10LE: return PixelFormat::kYuv444p10;
     case AV_PIX_FMT_YUV444P12LE: return PixelFormat::kYuv444p12;
+    case AV_PIX_FMT_XYZ12LE: return PixelFormat::kXyz12;
     default: return PixelFormat::kUnknown;
   }
 }
@@ -51,6 +52,33 @@ int NumPlanes(PixelFormat f) { return f == PixelFormat::kUyvy422 || f == PixelFo
 // only the plane *height* needs deriving here since 4:2:0 halves it.
 int ChromaHeight(PixelFormat f, int lumaHeight) {
   return (f == PixelFormat::kYuv420p8 || f == PixelFormat::kYuv420p10) ? (lumaHeight + 1) / 2 : lumaHeight;
+}
+
+// FFmpeg's xyz12le is packed (X,Y,Z as three little-endian 16-bit words per
+// pixel) with the 12 bits in the top of each word. Unpacked into three
+// planes holding the plain 12-bit values, like every other planar format
+// here, so hosts can expose it as 12-bit planar RGB with no further work.
+void UnpackXyz12(const AVFrame* frame, NormalizedFrame& out) {
+  const int width = out.width;
+  const int height = out.height;
+  const int stride = width * 2;
+  for (int p = 0; p < 3; ++p) {
+    out.stride[p] = stride;
+    out.planeHeight[p] = height;
+    out.planeData[p].resize(static_cast<size_t>(stride) * height);
+  }
+  for (int y = 0; y < height; ++y) {
+    const uint8_t* s = frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0];
+    for (int p = 0; p < 3; ++p) {
+      uint8_t* d = out.planeData[p].data() + static_cast<size_t>(y) * stride;
+      const uint8_t* sp = s + p * 2;
+      for (int x = 0; x < width; ++x) {
+        const uint16_t v = static_cast<uint16_t>((sp[x * 6] | (sp[x * 6 + 1] << 8)) >> 4);
+        d[x * 2] = static_cast<uint8_t>(v);
+        d[x * 2 + 1] = static_cast<uint8_t>(v >> 8);
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -97,6 +125,11 @@ bool AvcodecDecoder::ReceiveOneFrame(NormalizedFrame& out) {
     out.fieldOrder = (flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? FieldOrder::kTff : FieldOrder::kBff;
   } else {
     out.fieldOrder = impl_->reportsInterlacing ? FieldOrder::kProgressive : FieldOrder::kUnknown;
+  }
+  if (out.format == PixelFormat::kXyz12) {
+    UnpackXyz12(impl_->frame, out);
+    av_frame_unref(impl_->frame);
+    return true;
   }
   const int numPlanes = NumPlanes(out.format);
   for (int p = 0; p < numPlanes; ++p) {

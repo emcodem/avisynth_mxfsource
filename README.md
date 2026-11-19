@@ -403,6 +403,13 @@ src.Trim(1200, 1299)    # worker for the chunk 1200..1299
 | yuv422p12 | `YUV422P12` | `YUV422P12` | DNxHR HQX 12-bit |
 | yuv444p10 | `YUV444P10` | `YUV444P10` | DNxHR 444 10-bit |
 | yuv444p12 | `YUV444P12` | `YUV444P12` | DNxHR 444 12-bit, ProRes 4444 / 4444 XQ |
+| xyz12 | `RGBP12` (R/G/B = X/Y/Z) | `RGB36` (R/G/B = X/Y/Z) | DCI JPEG 2000 (DCP) |
+
+DCI XYZ has no matching AviSynth+ or VapourSynth format, so the X, Y and Z
+values go out unchanged in the R, G and B planes, not converted to RGB.
+Converting them is up to the script. The frames carry `_Matrix=0`, and
+unless the descriptor says otherwise `_Primaries=10` and `_Transfer=17`
+(SMPTE ST 428-1) and `_ColorRange=0` (full).
 
 Anything else (e.g. ProRes 4444 with alpha, `yuva444p`) fails at open with
 "decoded pixel format has no ... mapping yet". For ProRes, the decoder gets

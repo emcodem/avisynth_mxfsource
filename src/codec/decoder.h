@@ -15,10 +15,12 @@ enum class PixelFormat {
   kYuv444p10,  // DNxHR 444 10-bit
   kYuv444p12,  // DNxHR 444 12-bit, ProRes 4444 (XQ) without alpha
   kUyvy422,  // packed, single plane -- e.g. raw uncompressed essence
+  kXyz12,    // 4:4:4 planar 12-bit, planes X/Y/Z -- DCI JPEG 2000 (unpacked from FFmpeg's xyz12)
 };
 
 // A decoded video frame in a host-agnostic layout. Plane 0 only is used for
-// packed formats (kUyvy422); planes 0/1/2 = Y/U/V for planar formats.
+// packed formats (kUyvy422); planes 0/1/2 = Y/U/V for planar formats
+// (X/Y/Z for kXyz12).
 // How a decoded frame's two fields are ordered in time. kUnknown when the
 // decoder doesn't say (e.g. uncompressed UYVY): callers then fall back to the
 // MXF descriptor (see MxfStreamInfo::DescriptorFieldOrder).

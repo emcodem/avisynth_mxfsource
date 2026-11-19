@@ -63,6 +63,10 @@ bool MapPixelFormat(PixelFormat fmt, int& pixelType, bool& isPackedUyvy) {
     case PixelFormat::kYuv444p12:
       pixelType = VideoInfo::CS_YUV444P12;
       return true;
+    case PixelFormat::kXyz12:
+      // No XYZ type in AviSynth+: X/Y/Z go out unchanged as R/G/B.
+      pixelType = VideoInfo::CS_RGBP12;
+      return true;
     default:
       return false;
   }
@@ -191,6 +195,10 @@ class MxfSource final : public IClip {
     PVideoFrame out = env->NewVideoFrame(vi_);
     if (isPackedUyvy_) {
       CopyUyvyAsYuy2(*frame, out);
+    } else if (vi_.IsPlanarRGB()) {
+      CopyPlane(*frame, 0, out, PLANAR_R);
+      CopyPlane(*frame, 1, out, PLANAR_G);
+      CopyPlane(*frame, 2, out, PLANAR_B);
     } else {
       CopyPlane(*frame, 0, out, PLANAR_Y);
       CopyPlane(*frame, 1, out, PLANAR_U);

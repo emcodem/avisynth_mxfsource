@@ -46,6 +46,7 @@ struct FormatInfo {
 // logical Y/U/V order with no AviSynth-style VPlaneFirst quirk to account for.
 bool MapPixelFormat(PixelFormat fmt, VSCore* core, const VSAPI* vsapi, FormatInfo& out) {
   int bitsPerSample = 8, subW = 0, subH = 0;
+  int colorFamily = cfYUV;
   switch (fmt) {
     case PixelFormat::kUyvy422:
       out.isPackedUyvy = true;
@@ -86,10 +87,16 @@ bool MapPixelFormat(PixelFormat fmt, VSCore* core, const VSAPI* vsapi, FormatInf
       bitsPerSample = 12;
       out.bytesPerSample = 2;
       break;
+    case PixelFormat::kXyz12:
+      // No XYZ family in VapourSynth: X/Y/Z go out unchanged as R/G/B.
+      colorFamily = cfRGB;
+      bitsPerSample = 12;
+      out.bytesPerSample = 2;
+      break;
     default:
       return false;
   }
-  return vsapi->queryVideoFormat(&out.format, cfYUV, stInteger, bitsPerSample, subW, subH, core) != 0;
+  return vsapi->queryVideoFormat(&out.format, colorFamily, stInteger, bitsPerSample, subW, subH, core) != 0;
 }
 
 void CopyPlanarFrame(const NormalizedFrame& src, VSFrame* dst, const VSAPI* vsapi, int bytesPerSample) {

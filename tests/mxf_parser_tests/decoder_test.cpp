@@ -295,6 +295,72 @@ void TestProresCodecTagMapping() {
   CHECK(ProresCodecTag(ul) == 0);
 }
 
+// DCI JPEG 2000 (as in a DCP) decodes to FFmpeg's packed xyz12le; it comes
+// out as three planes of plain 12-bit X/Y/Z values. Encoded with
+// libopenjpeg's cinema2k profile, which FFmpeg's decoder needs to pick XYZ.
+void TestJpeg2000DciDecodesToPlanarXyz12() {
+  const AVCodec* enc = avcodec_find_encoder_by_name("libopenjpeg");
+  if (!enc) {
+    std::cout << "SKIP TestJpeg2000DciDecodesToPlanarXyz12: no libopenjpeg encoder\n";
+    return;
+  }
+  const int width = 1998, height = 1080;
+  const uint16_t xyz[3] = {2788, 2162, 860};
+  AVCodecContext* encCtx = avcodec_alloc_context3(enc);
+  encCtx->width = width;
+  encCtx->height = height;
+  encCtx->pix_fmt = AV_PIX_FMT_XYZ12LE;
+  encCtx->time_base = {1, 24};
+  encCtx->profile = AV_PROFILE_JPEG2000_DCINEMA_2K;
+  av_opt_set(encCtx->priv_data, "cinema_mode", "2k_24", 0);
+  std::vector<uint8_t> encoded;
+  AVFrame* frame = av_frame_alloc();
+  AVPacket* pkt = av_packet_alloc();
+  if (avcodec_open2(encCtx, enc, nullptr) == 0) {
+    frame->format = AV_PIX_FMT_XYZ12LE;
+    frame->width = width;
+    frame->height = height;
+    if (av_frame_get_buffer(frame, 32) == 0) {
+      for (int y = 0; y < height; ++y) {
+        auto* row = reinterpret_cast<uint16_t*>(frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0]);
+        for (int x = 0; x < width; ++x) {
+          for (int c = 0; c < 3; ++c) row[x * 3 + c] = static_cast<uint16_t>(xyz[c] << 4);
+        }
+      }
+      frame->pts = 0;
+      avcodec_send_frame(encCtx, frame);
+      avcodec_send_frame(encCtx, nullptr);
+      while (avcodec_receive_packet(encCtx, pkt) == 0) {
+        if (encoded.empty()) encoded.assign(pkt->data, pkt->data + pkt->size);
+        av_packet_unref(pkt);
+      }
+    }
+  }
+  av_packet_free(&pkt);
+  av_frame_free(&frame);
+  avcodec_free_context(&encCtx);
+  CHECK(!encoded.empty());
+  if (encoded.empty()) return;
+
+  AvcodecDecoder decoder(CodecFamily::kJpeg2000, width, height);
+  CHECK(decoder.IsValid());
+  NormalizedFrame out;
+  CHECK(decoder.SendAndReceive(encoded, out) || decoder.SendAndReceive({}, out));
+  CHECK(out.format == PixelFormat::kXyz12);
+  CHECK(out.width == width && out.height == height);
+  for (int p = 0; p < 3; ++p) {
+    CHECK(out.planeHeight[p] == height);
+    CHECK(out.stride[p] == width * 2);
+    CHECK(out.planeData[p].size() == static_cast<size_t>(width) * 2 * height);
+    if (out.planeData[p].size() < 4) continue;
+    // Column 0 and column 1 of row 0 (flat input; lossy, so near not equal).
+    for (int x = 0; x < 2; ++x) {
+      const int v = out.planeData[p][x * 2] | (out.planeData[p][x * 2 + 1] << 8);
+      CHECK(std::abs(v - xyz[p]) < 16);
+    }
+  }
+}
+
 void TestAvcodecDecoderRejectsUnsupportedFamily() {
   AvcodecDecoder decoder(CodecFamily::kUnknown, 16, 16);
   CHECK(!decoder.IsValid());
@@ -309,6 +375,7 @@ int main() {
   TestAvcodecDecoderDnxhr444Yields444p10();
   TestProres4444DecodesAt12BitWithCodecTag();
   TestProresCodecTagMapping();
+  TestJpeg2000DciDecodesToPlanarXyz12();
   TestAvcodecDecoderRejectsUnsupportedFamily();
 
   if (g_failures == 0) {

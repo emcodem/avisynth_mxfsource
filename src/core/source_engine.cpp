@@ -499,6 +499,16 @@ OpenResult SourceEngine::Open(const std::string& path, const OpenOptions& option
     return {OpenStatus::kDecodeError, "failed to decode first frame: " + peekError};
   }
   geometry_ = ComputePictureGeometry(streamInfo_, firstFrame_->width, firstFrame_->height);
+  if (firstFrame_->format == PixelFormat::kXyz12) {
+    // DCI XYZ goes out as planar RGB holding X/Y/Z, so a YUV matrix code
+    // from the descriptor would be wrong. DCP picture descriptors usually
+    // carry no colour labels at all: fill in what DCI XYZ always is
+    // (SMPTE ST 428-1 primaries and transfer, full range).
+    streamInfo_.colorMatrix = 0;
+    if (streamInfo_.colorPrimaries < 0) streamInfo_.colorPrimaries = 10;
+    if (streamInfo_.colorTransfer < 0) streamInfo_.colorTransfer = 17;
+    if (streamInfo_.colorRange < 0) streamInfo_.colorRange = 0;
+  }
   if (!geometry_.rejectedAspect.empty()) {
     AppendLogLine(LogLevel::kWarning, "[MxfSource] " + path_ + ": " + geometry_.rejectedAspect +
                   "; not used, no _SARNum/_SARDen");
